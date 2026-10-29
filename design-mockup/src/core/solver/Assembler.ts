@@ -1,0 +1,751 @@
+import { Matrix } from '../math/Matrix';
+import { Mesh } from '../fem/Mesh';
+import { AnalysisType, getReleasedLocalDofs, getSprungLocalDofs, getBeamDistributedLoads } from '../fem/types';
+import { calculateElementStiffness, calculateTriangleStiffnessExpanded } from '../fem/Triangle';
+import { calculateQuadStiffness, calculateQuadStiffnessExpanded } from '../fem/Quad4';
+import { calculateDKTStiffness } from '../fem/DKT';
+import { calculateBeamGlobalStiffness, calculateBeamLocalStiffness, calculateDistributedLoadLocalForces, transformLocalToGlobal, calculateBeamLength, calculateBeamAngle, createTransformationMatrix } from '../fem/Beam';
+import { calculateBeamThermalLocalForces } from '../fem/ThermalLoad';
+
+/**
+ * Een schijfelement (CST of Quad4) dat niet op te bouwen is — een driehoek met
+ * oppervlakte nul, een vierhoek met detJ ≤ 0.
+ *
+ * WAAROM EEN FOUT EN GEEN OVERSLAAN. De gemengde assemblage ving dit af met een
+ * `console.warn` en rekende door zonder dat element. Dat is een gat in de
+ * stijfheid: de berekening slaagt, de krachtsverdeling hoort bij een ander
+ * model, en niets op het scherm zegt het. Hetzelfde gebeurde stil in de
+ * geometrische stijfheid van de tweede orde. Nu stopt de berekening, met het
+ * elementnummer en de hoeken erbij; de adapter (`engine.ts`) zet het
+ * plaatnummer ervoor.
+ */
+export class PlaatElementFout extends Error {
+  readonly meshElementId: number;
+  constructor(meshElementId: number, oorzaak: string, hoekenM: { x: number; y: number }[]) {
+    const hoeken = hoekenM
+      .map((h) => `(${Math.round(h.x * 1e4) / 10}, ${Math.round(h.y * 1e4) / 10})`)
+      .join(", ");
+    super(
+      `schijfelement ${meshElementId} met hoeken ${hoeken} mm is niet op te bouwen ` +
+      `(${oorzaak}). Overslaan zou een gat in de stijfheid geven en een ` +
+      'krachtsverdeling bij een ander model; de berekening stopt. Wijzig de plaat ' +
+      '(bijvoorbeeld de meshSize) zodat het rekenmesh opnieuw wordt gemaakt.',
+    );
+    this.name = 'PlaatElementFout';
+    this.meshElementId = meshElementId;
+  }
+}
+
+/**
+ * Collect only the nodes that participate in the current analysis type.
+ * For frame: nodes used by beam elements.
+ * For plane_stress/plane_strain: nodes used by triangle/quad elements.
+ * This prevents disconnected nodes from creating zero-stiffness DOFs (singular matrix).
+ */
+function getActiveNodeIds(mesh: Mesh, analysisType: AnalysisType): Set<number> {
+  const activeIds = new Set<number>();
+  if (analysisType === 'frame') {
+    for (const beam of mesh.beamElements.values()) {
+      for (const nid of beam.nodeIds) activeIds.add(nid);
+    }
+  } else if (analysisType === 'mixed_beam_plate') {
+    // Include nodes from BOTH beams and plate elements
+    for (const beam of mesh.beamElements.values()) {
+      for (const nid of beam.nodeIds) activeIds.add(nid);
+    }
+    for (const elem of mesh.elements.values()) {
+      for (const nid of elem.nodeIds) activeIds.add(nid);
+    }
+  } else {
+    for (const elem of mesh.elements.values()) {
+      for (const nid of elem.nodeIds) activeIds.add(nid);
+    }
+  }
+  return activeIds;
+}
+
+/**
+ * Build a node-ID-to-sequential-index mapping for active nodes only.
+ */
+export function buildNodeIdToIndex(mesh: Mesh, analysisType: AnalysisType): Map<number, number> {
+  const activeIds = getActiveNodeIds(mesh, analysisType);
+  const nodeIdToIndex = new Map<number, number>();
+  let index = 0;
+  for (const node of mesh.nodes.values()) {
+    if (activeIds.has(node.id)) {
+      nodeIdToIndex.set(node.id, index);
+      index++;
+    }
+  }
+  return nodeIdToIndex;
+}
+
+/** Get DOFs per node for the given analysis type. */
+export function getDofsPerNode(analysisType: AnalysisType): number {
+  if (analysisType === 'frame') return 3;  // u, v, θ
+  if (analysisType === 'plate_bending') return 3;  // w, θx, θy
+  if (analysisType === 'mixed_beam_plate') return 3;  // u, v, θ (unified for beams + plates)
+  return 2;  // u, v
+}
+
+export function assembleGlobalStiffnessMatrix(
+  mesh: Mesh,
+  analysisType: AnalysisType,
+  axialReleasedBeamIds?: Set<number>
+): Matrix {
+  const dofsPerNode = getDofsPerNode(analysisType);
+
+  // Create node ID to index mapping (active nodes only)
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
+  const numNodes = nodeIdToIndex.size;
+  const numDofs = numNodes * dofsPerNode;
+
+  const K = new Matrix(numDofs, numDofs);
+
+  if (analysisType === 'frame') {
+    // Assemble beam elements for frame analysis
+    for (const beam of mesh.beamElements.values()) {
+      const nodes = mesh.getBeamElementNodes(beam);
+      if (!nodes) continue;
+
+      const material = mesh.getMaterial(beam.materialId);
+      if (!material) continue;
+
+      const [n1, n2] = nodes;
+
+      try {
+        // Releases (Rz-scharnieren + Tx/Tz-hulzen; tension/pressure-only via
+        // axialReleasedBeamIds) zijn LOKALE vrijheidsgraden: condenseren op
+        // de lokale matrix en daarna transformeren. Voorheen werd hier op de
+        // GLOBALE matrix gecondenseerd — voor rotaties identiek (θ is
+        // invariant onder T), maar voor axiale releases van niet-horizontale
+        // staven fout (dat loste globaal-x i.p.v. de staafas). Zonder
+        // releases blijft het pad bit-identiek (calculateBeamGlobalStiffness).
+        const releasedLocalDofs = getReleasedLocalDofs(beam);
+        if (axialReleasedBeamIds?.has(beam.id)) {
+          for (const d of [0, 3]) if (!releasedLocalDofs.includes(d)) releasedLocalDofs.push(d);
+        }
+        const veren = getSprungLocalDofs(beam);
+        let Ke: Matrix;
+        if (releasedLocalDofs.length > 0 || veren.length > 0) {
+          const L = calculateBeamLength(n1, n2);
+          const angle = calculateBeamAngle(n1, n2);
+          if (L < 1e-10) throw new Error('Beam element has zero length');
+          const Kl = calculateBeamLocalStiffness(L, material.E, beam.section.A, beam.section.I);
+          if (veren.length > 0) applyEndConnections(Kl, releasedLocalDofs, veren);
+          else applyEndReleases(Kl, releasedLocalDofs);
+          const T = createTransformationMatrix(angle);
+          Ke = T.transpose().multiply(Kl.multiply(T));
+        } else {
+          Ke = calculateBeamGlobalStiffness(n1, n2, material, beam.section);
+        }
+
+        // Get global DOF indices for this beam element
+        const idx1 = nodeIdToIndex.get(n1.id)!;
+        const idx2 = nodeIdToIndex.get(n2.id)!;
+        const dofIndices = [
+          idx1 * 3,     // u1
+          idx1 * 3 + 1, // v1
+          idx1 * 3 + 2, // θ1
+          idx2 * 3,     // u2
+          idx2 * 3 + 1, // v2
+          idx2 * 3 + 2  // θ2
+        ];
+
+        // Assemble into global matrix
+        for (let i = 0; i < 6; i++) {
+          for (let j = 0; j < 6; j++) {
+            K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+          }
+        }
+
+        // Add Winkler foundation stiffness for beam on grade
+        if (beam.onGrade?.enabled && beam.onGrade.k > 0) {
+          const L = calculateBeamLength(n1, n2);
+          const k = beam.onGrade.k; // N/m² (spring stiffness per unit area)
+          const b = beam.onGrade.b ?? 1.0; // Foundation width in m (default 1.0m if not specified)
+          const kL = k * b * L; // Total spring stiffness along beam
+
+          // Vertical stiffness (primary Winkler stiffness)
+          const v1Dof = dofIndices[1]; // v1
+          const v2Dof = dofIndices[4]; // v2
+          K.addAt(v1Dof, v1Dof, kL / 2);
+          K.addAt(v2Dof, v2Dof, kL / 2);
+
+          // Small horizontal friction stiffness to prevent singularity (0.1% of vertical)
+          // This represents soil friction resistance
+          const u1Dof = dofIndices[0]; // u1
+          const u2Dof = dofIndices[3]; // u2
+          const kFriction = kL * 0.001;
+          K.addAt(u1Dof, u1Dof, kFriction / 2);
+          K.addAt(u2Dof, u2Dof, kFriction / 2);
+        }
+      } catch (e) {
+        console.warn(`Skipping beam element ${beam.id}: ${e}`);
+      }
+    }
+  } else if (analysisType === 'plate_bending') {
+    // Assemble DKT plate bending elements (9×9, 3 DOFs/node)
+    for (const element of mesh.elements.values()) {
+      const nodes = mesh.getElementNodes(element);
+      if (nodes.length !== 3) continue;
+
+      const material = mesh.getMaterial(element.materialId);
+      if (!material) continue;
+
+      const [n1, n2, n3] = nodes;
+
+      try {
+        const Ke = calculateDKTStiffness(n1, n2, n3, material, element.thickness);
+
+        // Get global DOF indices: 3 DOFs per node (w, θx, θy)
+        const dofIndices: number[] = [];
+        for (const node of nodes) {
+          const nodeIndex = nodeIdToIndex.get(node.id)!;
+          dofIndices.push(nodeIndex * 3);     // w
+          dofIndices.push(nodeIndex * 3 + 1); // θx
+          dofIndices.push(nodeIndex * 3 + 2); // θy
+        }
+
+        // Assemble 9×9 into global matrix
+        for (let i = 0; i < 9; i++) {
+          for (let j = 0; j < 9; j++) {
+            K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+          }
+        }
+      } catch (e) {
+        console.warn(`Skipping DKT element ${element.id}: ${e}`);
+      }
+    }
+  } else if (analysisType === 'mixed_beam_plate') {
+    // MIXED ANALYSIS: Assemble both beams (3 DOF/node) and plates (expanded to 3 DOF/node)
+
+    // 1. Assemble beam elements (6×6, 3 DOF/node - same as frame analysis)
+    for (const beam of mesh.beamElements.values()) {
+      const nodes = mesh.getBeamElementNodes(beam);
+      if (!nodes) continue;
+
+      const material = mesh.getMaterial(beam.materialId);
+      if (!material) continue;
+
+      const [n1, n2] = nodes;
+
+      try {
+        // Zelfde release-aanpak als het frame-pad hierboven: lokaal
+        // condenseren, dan transformeren (Tx/Tz zijn lokale DOF's).
+        const releasedLocalDofs = getReleasedLocalDofs(beam);
+        if (axialReleasedBeamIds?.has(beam.id)) {
+          for (const d of [0, 3]) if (!releasedLocalDofs.includes(d)) releasedLocalDofs.push(d);
+        }
+        const veren = getSprungLocalDofs(beam);
+        let Ke: Matrix;
+        if (releasedLocalDofs.length > 0 || veren.length > 0) {
+          const L = calculateBeamLength(n1, n2);
+          const angle = calculateBeamAngle(n1, n2);
+          if (L < 1e-10) throw new Error('Beam element has zero length');
+          const Kl = calculateBeamLocalStiffness(L, material.E, beam.section.A, beam.section.I);
+          if (veren.length > 0) applyEndConnections(Kl, releasedLocalDofs, veren);
+          else applyEndReleases(Kl, releasedLocalDofs);
+          const T = createTransformationMatrix(angle);
+          Ke = T.transpose().multiply(Kl.multiply(T));
+        } else {
+          Ke = calculateBeamGlobalStiffness(n1, n2, material, beam.section);
+        }
+
+        const idx1 = nodeIdToIndex.get(n1.id)!;
+        const idx2 = nodeIdToIndex.get(n2.id)!;
+        const dofIndices = [
+          idx1 * 3, idx1 * 3 + 1, idx1 * 3 + 2,
+          idx2 * 3, idx2 * 3 + 1, idx2 * 3 + 2
+        ];
+
+        for (let i = 0; i < 6; i++) {
+          for (let j = 0; j < 6; j++) {
+            K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+          }
+        }
+
+        // Add Winkler foundation stiffness for beam on grade
+        if (beam.onGrade?.enabled && beam.onGrade.k > 0) {
+          const L = calculateBeamLength(n1, n2);
+          const k = beam.onGrade.k;
+          const b = beam.onGrade.b ?? 1.0; // Foundation width in m (default 1.0m)
+          const kL = k * b * L;
+
+          // Vertical stiffness
+          const v1Dof = dofIndices[1];
+          const v2Dof = dofIndices[4];
+          K.addAt(v1Dof, v1Dof, kL / 2);
+          K.addAt(v2Dof, v2Dof, kL / 2);
+
+          // Horizontal friction stiffness (0.1% of vertical)
+          const u1Dof = dofIndices[0];
+          const u2Dof = dofIndices[3];
+          const kFriction = kL * 0.001;
+          K.addAt(u1Dof, u1Dof, kFriction / 2);
+          K.addAt(u2Dof, u2Dof, kFriction / 2);
+        }
+      } catch (e) {
+        console.warn(`Skipping beam element ${beam.id} in mixed analysis: ${e}`);
+      }
+    }
+
+    // 2. Assemble plate elements (EXPANDED to 3 DOF/node)
+    for (const element of mesh.elements.values()) {
+      const nodes = mesh.getElementNodes(element);
+      const material = mesh.getMaterial(element.materialId);
+      if (!material) continue;
+
+      try {
+        if (nodes.length === 4) {
+          // 4-node quad: expand 8×8 → 12×12
+          const [n1, n2, n3, n4] = nodes;
+          const Ke = calculateQuadStiffnessExpanded(n1, n2, n3, n4, material, element.thickness, 'plane_stress');
+
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 3);     // u
+            dofIndices.push(nodeIndex * 3 + 1); // v
+            dofIndices.push(nodeIndex * 3 + 2); // θ (zero stiffness)
+          }
+
+          for (let i = 0; i < 12; i++) {
+            for (let j = 0; j < 12; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        } else if (nodes.length === 3) {
+          // 3-node triangle: expand 6×6 → 9×9
+          const [n1, n2, n3] = nodes;
+          const Ke = calculateTriangleStiffnessExpanded(n1, n2, n3, material, element.thickness, 'plane_stress');
+
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 3);     // u
+            dofIndices.push(nodeIndex * 3 + 1); // v
+            dofIndices.push(nodeIndex * 3 + 2); // θ (zero stiffness)
+          }
+
+          for (let i = 0; i < 9; i++) {
+            for (let j = 0; j < 9; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        }
+      } catch (e) {
+        // HARD, niet overslaan — zie PlaatElementFout.
+        throw new PlaatElementFout(
+          element.id, e instanceof Error ? e.message : String(e), nodes);
+      }
+    }
+    // 3. Stabilize rotational DOFs for plate-only nodes (no beam connected)
+    // Plate elements expanded to 3-DOF have zero θ-stiffness; add small penalty
+    // to prevent singularity for nodes not connected to any beam
+    const beamNodeIds = new Set<number>();
+    for (const beam of mesh.beamElements.values()) {
+      for (const nid of beam.nodeIds) beamNodeIds.add(nid);
+    }
+    // Find a representative stiffness magnitude for scaling
+    let maxDiag = 0;
+    for (let i = 0; i < numDofs; i++) {
+      const d = Math.abs(K.get(i, i));
+      if (d > maxDiag) maxDiag = d;
+    }
+    const rotStab = maxDiag * 1e-6; // small stabilization
+    for (const [nodeId, nodeIndex] of nodeIdToIndex.entries()) {
+      if (!beamNodeIds.has(nodeId)) {
+        // This node has no beam connection → θ DOF has zero stiffness
+        const thetaDof = nodeIndex * 3 + 2;
+        if (Math.abs(K.get(thetaDof, thetaDof)) < 1e-20) {
+          K.addAt(thetaDof, thetaDof, rotStab);
+        }
+      }
+    }
+  } else {
+    // Assemble triangle and quad elements for plane stress/strain
+    for (const element of mesh.elements.values()) {
+      const nodes = mesh.getElementNodes(element);
+
+      const material = mesh.getMaterial(element.materialId);
+      if (!material) continue;
+
+      try {
+        if (nodes.length === 4) {
+          // 4-node quad element (8x8 stiffness)
+          const [n1, n2, n3, n4] = nodes;
+          const Ke = calculateQuadStiffness(n1, n2, n3, n4, material, element.thickness, analysisType);
+
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 2);     // u
+            dofIndices.push(nodeIndex * 2 + 1); // v
+          }
+
+          for (let i = 0; i < 8; i++) {
+            for (let j = 0; j < 8; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        } else if (nodes.length === 3) {
+          // 3-node triangle element (6x6 stiffness) — backward compatibility
+          const [n1, n2, n3] = nodes;
+          const Ke = calculateElementStiffness(n1, n2, n3, material, element.thickness, analysisType);
+
+          const dofIndices: number[] = [];
+          for (const node of nodes) {
+            const nodeIndex = nodeIdToIndex.get(node.id)!;
+            dofIndices.push(nodeIndex * 2);     // u
+            dofIndices.push(nodeIndex * 2 + 1); // v
+          }
+
+          for (let i = 0; i < 6; i++) {
+            for (let j = 0; j < 6; j++) {
+              K.addAt(dofIndices[i], dofIndices[j], Ke.get(i, j));
+            }
+          }
+        } else {
+          continue; // Skip unsupported element types
+        }
+      } catch (e) {
+        console.warn(`Skipping element ${element.id}: ${e}`);
+      }
+    }
+  }
+
+  // Add spring support stiffness to diagonal
+  for (const node of mesh.nodes.values()) {
+    const nodeIndex = nodeIdToIndex.get(node.id);
+    if (nodeIndex === undefined) continue;
+    const c = node.constraints;
+    if (analysisType === 'plate_bending') {
+      // plate_bending: DOFs are w, θx, θy
+      // DOF 0 = w (vertical) → springY
+      if (c.springY != null && c.y) {
+        K.addAt(nodeIndex * 3, nodeIndex * 3, c.springY);
+      }
+      // DOF 1,2 = θx, θy → springRot (split between both rotation DOFs)
+      if (c.springRot != null && c.rotation) {
+        K.addAt(nodeIndex * 3 + 1, nodeIndex * 3 + 1, c.springRot / 2);
+        K.addAt(nodeIndex * 3 + 2, nodeIndex * 3 + 2, c.springRot / 2);
+      }
+    } else if (dofsPerNode === 3) {
+      // frame/mixed: DOFs are u, v, θ
+      if (c.springX != null && c.x) {
+        K.addAt(nodeIndex * 3, nodeIndex * 3, c.springX);
+      }
+      if (c.springY != null && c.y) {
+        K.addAt(nodeIndex * 3 + 1, nodeIndex * 3 + 1, c.springY);
+      }
+      if (c.springRot != null && c.rotation) {
+        K.addAt(nodeIndex * 3 + 2, nodeIndex * 3 + 2, c.springRot);
+      }
+    } else if (dofsPerNode === 2) {
+      // plane_stress/plane_strain: DOFs are u, v
+      if (c.springX != null && c.x) {
+        K.addAt(nodeIndex * 2, nodeIndex * 2, c.springX);
+      }
+      if (c.springY != null && c.y) {
+        K.addAt(nodeIndex * 2 + 1, nodeIndex * 2 + 1, c.springY);
+      }
+    }
+  }
+
+  return K;
+}
+
+export function assembleForceVector(mesh: Mesh, analysisType: AnalysisType = 'plane_stress'): number[] {
+  const dofsPerNode = getDofsPerNode(analysisType);
+
+  // Create node ID to index mapping (active nodes only)
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
+  const numNodes = nodeIdToIndex.size;
+  const numDofs = numNodes * dofsPerNode;
+  const F: number[] = new Array(numDofs).fill(0);
+
+  // Add nodal forces (only for active nodes)
+  for (const node of mesh.nodes.values()) {
+    const nodeIndex = nodeIdToIndex.get(node.id);
+    if (nodeIndex === undefined) continue;
+    if (analysisType === 'plate_bending') {
+      // Plate bending: DOFs are w, θx, θy
+      // fz goes into the w DOF, rotations stay 0 unless explicit
+      F[nodeIndex * 3] = node.loads.fz ?? node.loads.fy; // use fy as transverse if fz not set
+      F[nodeIndex * 3 + 1] = 0;
+      F[nodeIndex * 3 + 2] = 0;
+    } else if (dofsPerNode === 3) {
+      F[nodeIndex * 3] = node.loads.fx;
+      F[nodeIndex * 3 + 1] = node.loads.fy;
+      F[nodeIndex * 3 + 2] = node.loads.moment ?? 0;
+    } else {
+      F[nodeIndex * 2] = node.loads.fx;
+      F[nodeIndex * 2 + 1] = node.loads.fy;
+    }
+  }
+
+  // Add equivalent nodal forces from distributed loads + thermal loads on beams
+  if (analysisType === 'frame' || analysisType === 'mixed_beam_plate') {
+    for (const beam of mesh.beamElements.values()) {
+      const material = mesh.getMaterial(beam.materialId);
+
+      // Thermische equivalente knoopkrachten (lokaal) — zie ThermalLoad.ts
+      const fThermal = material
+        ? calculateBeamThermalLocalForces(beam, material)
+        : [0, 0, 0, 0, 0, 0];
+      const hasThermal = fThermal.some(v => v !== 0);
+
+      const dLoads = getBeamDistributedLoads(beam);
+      if (dLoads.length === 0 && !hasThermal) continue;
+
+      const nodes = mesh.getBeamElementNodes(beam);
+      if (!nodes) continue;
+
+      const [n1, n2] = nodes;
+      const L = calculateBeamLength(n1, n2);
+      const angle = calculateBeamAngle(n1, n2);
+
+      // Equivalente knoopkrachten (lokaal): SOM over alle verdeelde lasten
+      // op deze staaf (enkelvoudig veld + deellasten-array). Per last exact
+      // dezelfde projectie/dispatch als voorheen inline — zie Beam.ts.
+      const localForces: number[] = [0, 0, 0, 0, 0, 0];
+      for (const dl of dLoads) {
+        const f = calculateDistributedLoadLocalForces(L, angle, dl);
+        for (let i = 0; i < 6; i++) localForces[i] += f[i];
+      }
+
+      // Thermiek optellen vóór de scharniercondensatie (consistent met stijfheid)
+      if (hasThermal) {
+        for (let i = 0; i < 6; i++) localForces[i] += fThermal[i];
+      }
+
+      // Krachtcondensatie voor releases (Rz-scharnieren + Tx/Tz-hulzen) —
+      // consistent met de gecondenseerde stijfheid, in lokale assen.
+      const releasedLocalDofs = getReleasedLocalDofs(beam);
+      const veren = getSprungLocalDofs(beam);
+      if (releasedLocalDofs.length > 0 || veren.length > 0) {
+        const material = mesh.getMaterial(beam.materialId);
+        if (material) {
+          const Kl = calculateBeamLocalStiffness(L, material.E, beam.section.A, beam.section.I);
+          if (veren.length > 0) applyEndConnections(Kl, releasedLocalDofs, veren, localForces);
+          else applyEndReleases(Kl, releasedLocalDofs, localForces);
+        }
+      }
+
+      // Transform to global coordinates
+      const globalForces = transformLocalToGlobal(localForces, angle);
+
+      // Add to force vector
+      const idx1 = nodeIdToIndex.get(n1.id)!;
+      const idx2 = nodeIdToIndex.get(n2.id)!;
+
+      F[idx1 * 3] += globalForces[0];
+      F[idx1 * 3 + 1] += globalForces[1];
+      F[idx1 * 3 + 2] += globalForces[2];
+      F[idx2 * 3] += globalForces[3];
+      F[idx2 * 3 + 1] += globalForces[4];
+      F[idx2 * 3 + 2] += globalForces[5];
+    }
+  }
+
+  return F;
+}
+
+export function getConstrainedDofs(
+  mesh: Mesh,
+  analysisType: AnalysisType = 'plane_stress'
+): { dofs: number[]; nodeIdToIndex: Map<number, number> } {
+  // Use active nodes only to match the stiffness matrix
+  const nodeIdToIndex = buildNodeIdToIndex(mesh, analysisType);
+
+  const dofsPerNode = getDofsPerNode(analysisType);
+  const dofs: number[] = [];
+
+  for (const node of mesh.nodes.values()) {
+    const nodeIndex = nodeIdToIndex.get(node.id);
+    if (nodeIndex === undefined) continue;
+    if (analysisType === 'plate_bending') {
+      // plate_bending: DOFs are w, θx, θy
+      // y constraint → w fixed (vertical displacement constrained)
+      // Spring DOFs are NOT constrained - stiffness is added to K diagonal instead
+      if (node.constraints.y && node.constraints.springY == null) dofs.push(nodeIndex * 3);
+      // rotation constraint → θx and θy fixed
+      if (node.constraints.rotation && node.constraints.springRot == null) {
+        dofs.push(nodeIndex * 3 + 1);
+        dofs.push(nodeIndex * 3 + 2);
+      }
+    } else if (dofsPerNode === 3) {
+      // Spring DOFs are NOT constrained - stiffness is added to K diagonal instead
+      if (node.constraints.x && node.constraints.springX == null) dofs.push(nodeIndex * 3);
+      if (node.constraints.y && node.constraints.springY == null) dofs.push(nodeIndex * 3 + 1);
+      if (node.constraints.rotation && node.constraints.springRot == null) dofs.push(nodeIndex * 3 + 2);
+    } else {
+      if (node.constraints.x && node.constraints.springX == null) dofs.push(nodeIndex * 2);
+      if (node.constraints.y && node.constraints.springY == null) dofs.push(nodeIndex * 2 + 1);
+    }
+  }
+
+  return { dofs, nodeIdToIndex };
+}
+
+/**
+ * Apply static condensation for beam end releases (hinges).
+ * Modifies the stiffness matrix in place.
+ * Optionally also condenses a force vector (e.g. equivalent nodal forces).
+ * releasedDofs: indices of released DOFs in the 6x6 element matrix
+ */
+export function applyEndReleases(Ke: Matrix, releasedDofs: number[], F?: number[]): void {
+  const n = 6;
+
+  // Sequentiële Gauss-eliminatie van de released DOF's. CRUCIAAL: bij het
+  // elimineren van DOF c moeten óók de rijen/kolommen van de andere nog te
+  // elimineren released DOF's bijgewerkt worden — de released DOF's zijn
+  // onderling gekoppeld (bv. K(θ1,θ2) = 2EI/L bij een dubbel scharnier).
+  // De oude variant behandelde K_cc als diagonaal en gaf een pendelstaaf
+  // daardoor NEGATIEVE dwarsstijfheid (−6EI/L³ i.p.v. exact 0).
+  const eliminated = new Set<number>();
+  // Schaal van de matrix vóór de condensatie, voor het opruimen van
+  // afrondingsresten hieronder.
+  let schaal = 0;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) schaal = Math.max(schaal, Math.abs(Ke.get(i, j)));
+  for (const c of releasedDofs) {
+    const kcc = Ke.get(c, c);
+    if (Math.abs(kcc) < 1e-20) {
+      // Geen stijfheid op dit DOF (al mechanisme) — alleen ontkoppelen.
+      for (let i = 0; i < n; i++) { Ke.set(i, c, 0); Ke.set(c, i, 0); }
+      if (F) F[c] = 0;
+      eliminated.add(c);
+      continue;
+    }
+
+    // Actief = alle DOF's die nog niet geëlimineerd zijn, behalve c zelf —
+    // dus inclusief andere released DOF's die later aan de beurt komen.
+    const active: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (i !== c && !eliminated.has(i)) active.push(i);
+    }
+
+    // Kolom/rij-waarden cachen vóór de in-place-update.
+    const col = active.map(i => Ke.get(i, c));
+    const row = active.map(j => Ke.get(c, j));
+
+    // Krachtvector eerst (gebruikt de ongewijzigde koppelingen).
+    if (F) {
+      const fc = F[c];
+      for (let a = 0; a < active.length; a++) {
+        F[active[a]] -= col[a] / kcc * fc;
+      }
+      F[c] = 0;
+    }
+
+    // K_ij -= K_ic · K_cj / K_cc voor alle actieve i, j.
+    for (let a = 0; a < active.length; a++) {
+      for (let b = 0; b < active.length; b++) {
+        Ke.addAt(active[a], active[b], -col[a] * row[b] / kcc);
+      }
+    }
+
+    // Rij en kolom van het geëlimineerde DOF op nul.
+    for (let i = 0; i < n; i++) {
+      Ke.set(i, c, 0);
+      Ke.set(c, i, 0);
+    }
+    eliminated.add(c);
+  }
+
+  // AFRONDINGSRESTEN OPRUIMEN (issue #248). Bij een staaf met aan beide
+  // einden een scharnier is de dwarsstijfheid na condensatie in exacte
+  // rekenkunde precies nul (12EI/L³ − 2·(6EI/L²)²/(4EI/L) + … = 0), maar in
+  // drijvende komma blijft er een rest van de orde 1e-18 × EA/L over. Hangt
+  // aan zo'n pendelstaaf een knoop die verder nergens dwars aan vastzit (een
+  // pendelkolom met een vrije kop), dan is dat een mechanisme, maar de
+  // stelseloplosser zag een pivot boven zijn drempel en "rekende" een
+  // verplaatsing van 1e16 mm — gemeten, zonder melding. Een term onder
+  // 1e-13 van de grootste term van deze elementmatrix is geen stijfheid maar
+  // afronding; op nul gezet meldt de oplosser het mechanisme met knoop en
+  // richting, in de solve én in de validatie (`zoekFrameMechanisme`). Echte
+  // termen liggen vele ordes hoger (12EI/L³ : EA/L = 12I/(AL²), ook voor een
+  // slanke trekstaaf ≫ 1e-10), dus aan een correct model verandert niets.
+  if (releasedDofs.length > 0 && schaal > 0) {
+    const drempel = 1e-13 * schaal;
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        const v = Ke.get(i, j);
+        if (v !== 0 && Math.abs(v) < drempel) Ke.set(i, j, 0);
+      }
+    }
+  }
+}
+
+/**
+ * Statische condensatie van staafeinden die scharnierend ÓF verend zijn
+ * aangesloten — de algemene vorm van applyEndReleases, in place op de
+ * lokale 6×6 en (optioneel) op de krachtvector.
+ *
+ * Model: op een verend DOF c zit tussen het ELEMENT-eind e_c en de KNOOP n_c
+ * een veer k (energie ½·k·(n_c − e_c)²). e_c is een inwendige onbekende en
+ * wordt weggewerkt; de plek c in de matrix is daarna van de knoop-DOF. Uit
+ * de evenwichtsvergelijking van e_c,
+ *
+ *   Σ_j K_cj·e_j + k·(e_c − n_c) = F_c   ⇒   e_c = (F_c − Σ_{j≠c} K_cj·e_j + k·n_c) / (K_cc + k),
+ *
+ * volgt voor de overige DOF's i, j (alle andere plekken, ook eerder
+ * omgezette knoop-DOF's):
+ *
+ *   K_ij ← K_ij − K_ic·K_cj/(K_cc + k)         F_i ← F_i − K_ic·F_c/(K_cc + k)
+ *   K_ic ← K_ic·k/(K_cc + k)  (en symmetrisch)  F_c ← k·F_c/(K_cc + k)
+ *   K_cc ← k·K_cc/(K_cc + k)
+ *
+ * Met k = 0 is dit precies applyEndReleases (rij en kolom c worden nul: het
+ * scharnier), met k → ∞ verandert er niets (star). De volgorde van
+ * elimineren doet er niet toe — het is Gauss-eliminatie van inwendige
+ * onbekenden — zolang elke stap álle nog aanwezige koppelingen meeneemt.
+ *
+ * Scharnieren gaan hier als k = 0 door dezelfde formules. Een staaf ZONDER
+ * veren blijft op applyEndReleases lopen (bit-identiek aan vroeger); deze
+ * routine is alleen voor staven met minstens één veer.
+ */
+export function applyEndConnections(
+  Ke: Matrix,
+  hingedDofs: number[],
+  springs: { dof: number; k: number }[],
+  F?: number[],
+): void {
+  const n = 6;
+  const stappen: { dof: number; k: number }[] = [
+    ...hingedDofs.map((dof) => ({ dof, k: 0 })),
+    ...springs.filter((s) => !hingedDofs.includes(s.dof)),
+  ];
+  for (const { dof: c, k } of stappen) {
+    const kcc = Ke.get(c, c) + k;
+    if (Math.abs(kcc) < 1e-20) {
+      // Geen stijfheid op dit DOF en geen veer: alleen ontkoppelen.
+      for (let i = 0; i < n; i++) { Ke.set(i, c, 0); Ke.set(c, i, 0); }
+      if (F) F[c] = 0;
+      continue;
+    }
+    const kcc0 = Ke.get(c, c);
+    const anderen: number[] = [];
+    for (let i = 0; i < n; i++) if (i !== c) anderen.push(i);
+    const col = anderen.map((i) => Ke.get(i, c));
+    const row = anderen.map((j) => Ke.get(c, j));
+
+    if (F) {
+      const fc = F[c];
+      for (let a = 0; a < anderen.length; a++) F[anderen[a]] -= col[a] / kcc * fc;
+      F[c] = k * fc / kcc;
+    }
+    for (let a = 0; a < anderen.length; a++) {
+      for (let b = 0; b < anderen.length; b++) {
+        Ke.addAt(anderen[a], anderen[b], -col[a] * row[b] / kcc);
+      }
+    }
+    for (let a = 0; a < anderen.length; a++) {
+      const v = col[a] * k / kcc;
+      Ke.set(anderen[a], c, v);
+      Ke.set(c, anderen[a], v);
+    }
+    Ke.set(c, c, k * kcc0 / kcc);
+  }
+}

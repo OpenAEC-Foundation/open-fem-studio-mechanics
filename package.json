@@ -1,0 +1,19 @@
+{
+  "name": "open-fem-studio-mechanics",
+  "version": "2026.44.0",
+  "description": "Open FEM Studio Mechanics — open-source finite element program (2D and 3D) for structural mechanics, without code checking.",
+  "author": "OpenAEC Foundation",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/OpenAEC-Foundation/open-fem-studio-mechanics",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "mcp:sidecar": "node scripts/mcp-sidecar.mjs",
+    "versie": "node scripts/versie.mjs",
+    "tauri:build": "node scripts/mcp-sidecar.mjs && tauri build --config src-tauri/tauri.bundel.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.1"
+  }
+}

@@ -1,0 +1,843 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   report.css — het live HTML-rapport (ReportShell + secties).
+
+   Twee lagen:
+   1. Schermweergave: een opmaakproef — losse witte vellen op papierformaat
+      (mm) met eigen slagschaduw op een grijze bureau-achtergrond, zoombaar
+      via --rpt-zoom. De verdeling over vellen maakt paginate.ts.
+   2. Print (@media print): scherm-chrome weg, elk vel wordt exact één
+      printpagina (break-after: page); marges en de voettekst komen uit de
+      dynamische @page-regel die ReportShell injecteert. Zelfde inhoud.
+
+   Opmaak-variabelen (ReportShell zet ze op .report-shell, uit de
+   reportStore): --rpt-page-w/h, --rpt-marge-boven/onder/links/rechts,
+   --rpt-basis (basislettergrootte) en --rpt-regelafstand. Alle tekstmaten
+   in dit bestand zijn afgeleid van --rpt-basis, zodat de lettergrootte-
+   slider het hele document meeschaalt.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ─── Shell-layout (scherm) ─── */
+.report-shell {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  /* Anker voor de onzichtbare meetcontainer (.rpt-meet). */
+  position: relative;
+  /* Terugval als de shell zonder inline variabelen gerenderd wordt. */
+  --rpt-page-w: 210mm;
+  --rpt-page-h: 297mm;
+  --rpt-marge-boven: 18mm;
+  --rpt-marge-onder: 20mm;
+  --rpt-marge-links: 15mm;
+  --rpt-marge-rechts: 15mm;
+  --rpt-basis: 10pt;
+  --rpt-regelafstand: 1.45;
+}
+
+.report-shell-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 6px 12px;
+  background: var(--theme-bg-lighter);
+  border-bottom: 1px solid var(--theme-border-subtle);
+  flex-shrink: 0;
+}
+
+.report-shell-info {
+  font-size: 11px;
+  color: var(--theme-text-secondary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-zoom-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--theme-text-secondary);
+}
+
+.report-zoom-control input[type="range"] {
+  width: 110px;
+  accent-color: var(--theme-accent);
+}
+
+.report-zoom-pct {
+  min-width: 34px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.report-print-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  background: var(--theme-btn-primary-bg);
+  border: none;
+  border-radius: 4px;
+  color: var(--theme-btn-primary-text);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s;
+  flex-shrink: 0;
+}
+
+.report-print-btn:hover {
+  background: var(--theme-btn-primary-hover-bg);
+}
+
+/* R5: knop "Naast je scherm" — alleen in het hoofdvenster (prop-gestuurd). */
+.report-detach-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  background: transparent;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  color: var(--theme-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+  flex-shrink: 0;
+}
+
+.report-detach-btn:hover {
+  color: var(--theme-accent);
+  border-color: var(--theme-accent);
+}
+
+/* R5: "verouderd"-balk — model gewijzigd, resultaten weggegooid. Scherm-
+   chrome: print nooit mee (zie @media print onderaan). */
+.report-stale-banner {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  background: #fef3c7;
+  color: #92400e;
+  border-bottom: 1px solid #f59e0b;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.report-scroll {
+  flex: 1;
+  overflow: auto;
+  background: #52525b;
+}
+
+/* Zoombare vellen. `zoom` (i.p.v. transform) laat de scroll-container gewoon
+   meegroeien/krimpen — geen dode witruimte bij uitzoomen.
+
+   De breedte is die van het venster, niet `fit-content`: daardoor kunnen de
+   vellen in .rpt-vellen naast elkaar gaan staan zodra ze passen. Bij 100 %
+   past op een gewoon scherm één A4 naast de zijbalk; wie uitzoomt ziet er
+   twee, drie of vier naast elkaar, zoals een tekstverwerker dat doet. Met
+   `fit-content` groeide de container mee met de inhoud en werd er nooit
+   gewikkeld. */
+.report-zoom {
+  zoom: var(--rpt-zoom, 1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 auto;
+  padding: 24px 24px 48px;
+}
+
+/* ─── Meetcontainer ───
+   Onzichtbaar maar volledig opgemaakt: hier draaien de live secties één keer,
+   op exact de tekstbreedte van het vel. paginate.ts meet hier de natuurlijke
+   breekpunten en kloont ze naar de vellen. Bewust `visibility: hidden` (niet
+   `display: none`) — anders is er niets te meten. Staat buiten .report-zoom
+   zodat de schermzoom de meting niet vervalst, en reset de sectietellers zodat
+   de nummering in de vellen bij 1 begint. */
+.rpt-meet {
+  position: absolute;
+  top: 0;
+  left: -20000px;
+  width: calc(var(--rpt-page-w) - var(--rpt-marge-links) - var(--rpt-marge-rechts));
+  visibility: hidden;
+  pointer-events: none;
+  counter-reset: rpt-sectie 0 rpt-subsectie 0;
+}
+
+/* ─── De opmaakproef: losse vellen, naast elkaar zodra ze passen ───
+   Een rij die wikkelt: op 100 % staat er één vel per rij, bij uitzoomen
+   komen er meer naast elkaar. `align-items: flex-start` zodat een korter
+   laatste vel bovenaan blijft staan in plaats van te zweven. */
+.rpt-vellen {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: flex-start;
+  gap: 8mm;
+  /* De volle breedte van de zoomcontainer, anders krimpt deze rij tot één vel
+     (de ouder centreert zijn kinderen en rekt ze niet uit) en valt er nooit
+     iets te wikkelen. Bij zoom 0,5 is die breedte in gezoomde eenheden
+     verdubbeld en passen er twee A4's naast elkaar. */
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Het vel zelf: exact papierformaat, met slagschaduw op het "bureau". */
+.rpt-vel {
+  position: relative;
+  width: var(--rpt-page-w);
+  height: var(--rpt-page-h);
+  background: #fff;
+  box-sizing: border-box;
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+/* De tekstspiegel: padding = de ingestelde marges, gelijk aan @page. */
+.rpt-vel-binnen {
+  height: 100%;
+  box-sizing: border-box;
+  padding: var(--rpt-marge-boven) var(--rpt-marge-rechts) var(--rpt-marge-onder)
+    var(--rpt-marge-links);
+  overflow: hidden;
+}
+
+/* Voetregel per vel: direct onder de tekstspiegel, in de ondermarge. */
+.rpt-vel-voet {
+  position: absolute;
+  left: var(--rpt-marge-links);
+  right: var(--rpt-marge-rechts);
+  top: calc(var(--rpt-page-h) - var(--rpt-marge-onder) + 2mm);
+  display: flex;
+  justify-content: space-between;
+  border-top: 0.2mm solid #bbb;
+  padding-top: 1mm;
+  font-size: calc(var(--rpt-basis) * 0.8);
+  color: #666;
+}
+
+.report-no-sections {
+  color: #d4d4d8;
+  font-size: 13px;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+/* Hoofdstukken sluiten doorlopend op elkaar aan (geen vel per sectie). */
+.rpt-hoofdstuk + .rpt-hoofdstuk {
+  margin-top: 9mm;
+}
+
+/* Kopblok in referentiestijl: bedrijfsregel cursief, projectblok in twee
+   kolommen, afgesloten met een lijn. */
+.rpt-kop {
+  font-size: calc(var(--rpt-basis) * 0.85);
+  color: #333;
+  border-bottom: 0.5mm solid #333;
+  padding-bottom: 1.5mm;
+  margin-bottom: 5mm;
+}
+.rpt-kop-bedrijf {
+  font-style: italic;
+  font-weight: 600;
+  margin-bottom: 1mm;
+}
+.rpt-kop-grid {
+  display: flex;
+  justify-content: space-between;
+  gap: 8mm;
+}
+.rpt-kop-regel {
+  display: flex;
+  line-height: 1.5;
+}
+.rpt-kop-label {
+  display: inline-block;
+  min-width: 30mm;
+  color: #555;
+}
+
+/* ─── Rapport-typografie (scherm én print: het document is altijd
+   zwart-op-wit, onafhankelijk van het app-thema). De meetcontainer krijgt
+   exact dezelfde typografie als het vel — anders klopt de meting niet. ─── */
+.rpt-vel,
+.rpt-meet {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: var(--rpt-basis);
+  line-height: var(--rpt-regelafstand);
+  color: #1a1a1a;
+}
+
+.rpt-doc-kind {
+  font-size: calc(var(--rpt-basis) * 0.85);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: #666;
+  margin-bottom: 2mm;
+}
+
+.rpt-project-title {
+  font-size: calc(var(--rpt-basis) * 2);
+  font-weight: 700;
+  margin: 0 0 1mm;
+  color: #111;
+}
+
+.rpt-project-location {
+  font-size: calc(var(--rpt-basis) * 1.1);
+  color: #444;
+  margin-bottom: 4mm;
+}
+
+.rpt-project-description {
+  margin-top: 5mm;
+  color: #333;
+}
+
+.rpt-h2 {
+  font-size: calc(var(--rpt-basis) * 1.3);
+  font-weight: 700;
+  margin: 0 0 3mm;
+  padding-bottom: 1.5mm;
+  border-bottom: 0.5mm solid #1a1a1a;
+  color: #111;
+}
+
+.rpt-h3 {
+  font-size: calc(var(--rpt-basis) * 1.05);
+  font-weight: 700;
+  margin: 5mm 0 2mm;
+  color: #111;
+}
+
+/* ─── Sectienummering (1, 1.1, …) ───
+   CSS-tellers over de gerenderde vellen: de registry-volgorde
+   (reportSections.ts) bepaalt via de rendervolgorde in ReportShell de
+   nummers; uitgeschakelde secties tellen automatisch niet mee. De
+   projectkop (h1) blijft ongenummerd als titelblad.
+
+   Beide tellers worden op .report-zoom aangemaakt (dus geldig over álle
+   vellen) en de h2 gebruikt `counter-set` in plaats van `counter-reset`:
+   met een reset zou een hoofdstuk dat over meerdere vellen loopt op elk
+   volgend vel een NIEUWE subteller krijgen (de kop staat daar niet meer bij)
+   en zou de nummering terugspringen naar x.1. */
+.report-zoom {
+  counter-reset: rpt-sectie 0 rpt-subsectie 0;
+}
+
+.rpt-h2 {
+  counter-increment: rpt-sectie;
+  counter-set: rpt-subsectie 0;
+}
+
+.rpt-h2::before {
+  content: counter(rpt-sectie);
+  margin-right: 2.5mm;
+}
+
+.rpt-h3 {
+  counter-increment: rpt-subsectie;
+}
+
+.rpt-h3::before {
+  content: counter(rpt-sectie) "." counter(rpt-subsectie);
+  margin-right: 2mm;
+}
+
+/* Voorwerk-kop: dezelfde opmaak, maar zonder nummer en zonder de tellers te
+   raken. De inhoudsopgave zelf is geen hoofdstuk (net zomin als het
+   titelblad), dus hoofdstuk 1 blijft het eerste inhoudelijke hoofdstuk. */
+.rpt-h2.rpt-h2-vrij {
+  counter-increment: none;
+  counter-set: none;
+}
+
+.rpt-h2.rpt-h2-vrij::before {
+  content: none;
+}
+
+/* ─── Inhoudsopgave-sectie ───
+   Regels met nummer, titel, stippellijn en paginanummer. Op scherm is elke
+   regel een knop die naar het hoofdstuk springt; in de print is het gewoon
+   tekst (geen randen, geen achtergrond). */
+.rpt-toc-lijst {
+  margin-top: 2mm;
+}
+
+.rpt-toc-regel {
+  display: flex;
+  align-items: baseline;
+  gap: 2mm;
+  width: 100%;
+  margin: 0;
+  padding: 0.7mm 0;
+  background: transparent;
+  border: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rpt-toc-regel:hover {
+  color: #000;
+}
+
+.rpt-toc-nummer {
+  min-width: 9mm;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.rpt-toc-titel {
+  flex-shrink: 0;
+}
+
+/* De stippellijn: een lege span die uitvult; `align-self: baseline` legt zijn
+   onderrand precies op de tekstbasislijn. */
+.rpt-toc-stippel {
+  flex: 1;
+  min-width: 5mm;
+  align-self: baseline;
+  border-bottom: 0.2mm dotted #999;
+}
+
+.rpt-toc-pagina {
+  min-width: 6mm;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* Subsecties: ingesprongen, iets kleiner en lichter. */
+.rpt-toc-niveau3 {
+  padding-left: 8mm;
+  font-size: calc(var(--rpt-basis) * 0.95);
+  color: #333;
+}
+
+.rpt-toc-niveau3 .rpt-toc-nummer {
+  min-width: 11mm;
+  font-weight: 400;
+}
+
+.rpt-note {
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #555;
+  margin: 0 0 3mm;
+}
+
+/*
+ * Een belastinggeval dat in de doorgerekende combinaties niet meetelt, of
+ * eigen gewicht zonder blijvend geval (lib/combinatieBeheer). Rood, ook op
+ * papier: de last van zo'n geval telt in elke toets als nul.
+ */
+.rpt-melding-fout {
+  color: #b91c1c;
+}
+
+/*
+ * Een rij die wel in de tabel hoort maar niet is doorgerekend — een
+ * belastingcombinatie die dit model niet nodig heeft (zie
+ * lib/combinatieSelectie). Gedempt, met "niet gebruikt" achter de naam en de
+ * reden in de noot eronder; de factoren blijven leesbaar, want ze zijn niet
+ * fout — ze zijn alleen niet toegepast. Weglaten zonder spoor zou het rapport
+ * onnavolgbaar maken.
+ */
+.rpt-rij-gedempt td {
+  color: #777;
+  font-style: italic;
+}
+
+.rpt-empty-note {
+  font-size: var(--rpt-basis);
+  color: #555;
+  font-style: italic;
+  border: 1px dashed #bbb;
+  padding: 4mm;
+  margin: 4mm 0 0;
+}
+
+/* Metadata-tabel in de projectkop */
+.rpt-meta-table {
+  border-collapse: collapse;
+  margin-top: 4mm;
+}
+
+.rpt-meta-table th {
+  text-align: left;
+  font-weight: 600;
+  color: #555;
+  padding: 1mm 8mm 1mm 0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.rpt-meta-table td {
+  padding: 1mm 0;
+  color: #1a1a1a;
+}
+
+/* De scheefstandafleiding bij de uitgangspunten.
+   Vaste letterbreedte omdat de regels van `scheefstandToelichting` op hun
+   symbool zijn uitgelijnd (phi_0 = …, alpha_h = …); in een proportioneel
+   lettertype valt die uitlijning weg. Dezelfde keuze maakt de PDF-uitdraai,
+   die deze regels in `style_mono()` zet. */
+.rpt-scheefstand {
+  font-family: "Consolas", "Liberation Mono", ui-monospace, monospace;
+  font-size: calc(var(--rpt-basis) * 0.85);
+  line-height: 1.35;
+}
+
+.rpt-scheefstand-wit {
+  height: 1.5mm;
+}
+
+/* Een regel die met "!" begint is een waarschuwing uit de norm-afleiding —
+   zelfde rood als een niet-voldoende unity check, zodat zij niet tussen de
+   tussenwaarden verdwijnt. Ook dat volgt de PDF, die deze regels in C_FAIL zet. */
+.rpt-scheefstand-waarschuwing {
+  color: #b91c1c;
+}
+
+/* Gegevens-/resultaattabellen — referentiestijl: dunne randen, lichtgrijze
+   kopregel, compacte regelafstand; getallen rechts via .rpt-num per cel. */
+.rpt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: calc(var(--rpt-basis) * 0.9);
+  line-height: calc(var(--rpt-regelafstand) * 0.93);
+}
+
+.rpt-table th,
+.rpt-table td {
+  border: 0.15mm solid #999;
+  padding: 1mm 2mm;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rpt-table thead th {
+  background: #f2f2f2;
+  font-weight: 600;
+}
+
+/* ─── Figuren: één conventie voor alle rapportfiguren ───
+   .rpt-figuur          figuurblok (breekt bij print niet over een paginarand)
+   .rpt-figuur-svg      de tekening zelf (gecentreerd, past binnen het vel)
+   .rpt-figuur-bijschrift  vet, gecentreerd bijschrift ÓNDER de figuur
+   (referentiestijl — zie bv. de omhullende-figuren). */
+.rpt-figuur {
+  margin: 0 0 5mm;
+}
+
+.rpt-figuur-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 150mm;
+  margin: 0 auto;
+}
+
+.rpt-figuur-bijschrift {
+  text-align: center;
+  font-weight: 700;
+  font-size: calc(var(--rpt-basis) * 0.95);
+  color: #111;
+  margin: 1mm 0 0;
+}
+
+.rpt-num {
+  text-align: right !important;
+  font-variant-numeric: tabular-nums;
+}
+
+.rpt-uc-fail {
+  color: #b91c1c;
+  font-weight: 700;
+}
+
+.rpt-status-ok {
+  color: #15803d;
+}
+
+.rpt-status-fail {
+  color: #b91c1c;
+  font-weight: 700;
+}
+
+.rpt-skipped ul {
+  margin: 0;
+  padding-left: 5mm;
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #444;
+}
+
+.rpt-skipped li {
+  margin-bottom: 1mm;
+}
+
+/* ─── R2: invoersecties ─── */
+
+/* Koptekst-regel (ProjectSection): op scherm een subtiel invoerveld dat
+   eruitziet als de gedrukte regel; bij print rendert alleen de tekst
+   (.rpt-print-only). Leeg veld → placeholder op scherm, niets in de print. */
+.rpt-header-input {
+  display: block;
+  width: 100%;
+  border: none;
+  border-bottom: 1px dashed transparent;
+  background: transparent;
+  font-family: inherit;
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #555;
+  padding: 0 0 1mm;
+  margin-bottom: 3mm;
+  outline: none;
+}
+
+.rpt-header-input::placeholder {
+  color: #b5b5b5;
+  font-style: italic;
+}
+
+.rpt-header-input:hover,
+.rpt-header-input:focus {
+  border-bottom-color: #b5b5b5;
+}
+
+.rpt-header-line {
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #555;
+  padding-bottom: 1mm;
+  margin-bottom: 3mm;
+}
+
+/* Print-varianten: op scherm verborgen, in de print zichtbaar (en andersom). */
+.rpt-print-only {
+  display: none;
+}
+
+/* Profielen & doorsneden: per profiel een blok met tekening + tabel. */
+.rpt-profile-block {
+  margin-bottom: 6mm;
+}
+
+.rpt-profile-body {
+  display: flex;
+  gap: 10mm;
+  align-items: flex-start;
+}
+
+.rpt-profile-sketch {
+  flex-shrink: 0;
+}
+
+.rpt-section-sketch {
+  display: block;
+  width: 96mm;
+  height: auto;
+}
+
+.rpt-profile-props th {
+  min-width: 28mm;
+}
+
+/* Belastinggevallen: blok per geval. */
+.rpt-loadcase-block {
+  margin-bottom: 5mm;
+}
+
+.rpt-h3-tag {
+  font-weight: 400;
+  font-size: calc(var(--rpt-basis) * 0.85);
+  color: #666;
+  margin-left: 2mm;
+}
+
+/* ─── R3: resultaatsecties ─── */
+
+/* Constructieschets: modifier op .rpt-figuur-svg — iets ruimer, max. één vel. */
+.rpt-schema-svg {
+  max-height: 165mm;
+  margin-top: 2mm;
+}
+
+/* Combinatie-keuze (scherm-chrome; de print toont .rpt-print-only-regel). */
+.rpt-scope {
+  margin: 0 0 3mm;
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #555;
+}
+
+.rpt-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 2mm;
+}
+
+.rpt-scope-select {
+  font-family: inherit;
+  font-size: calc(var(--rpt-basis) * 0.9);
+  color: #1a1a1a;
+  background: #fff;
+  border: 0.2mm solid #999;
+  border-radius: 1mm;
+  padding: 0.8mm 1.5mm;
+}
+
+/* Krachtsverdeling: de figuren gebruiken de generieke .rpt-figuur-klassen
+   (zie boven) — geen sectie-eigen figuurstijlen meer. */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Print — zelfde inhoud, app-chrome weg. De @page-regel (formaat, de
+   INGESTELDE marges, voettekst met paginanummers) injecteert ReportShell
+   dynamisch, zodat print en scherm dezelfde tekstspiegel hebben.
+
+   Kern: één schermvel = exact één printpagina. Elk .rpt-vel krijgt
+   `break-after: page` en houdt zichzelf bijeen; de paginering heeft de
+   inhoud al op de beschikbare teksthoogte afgestemd (met een kleine
+   veiligheidsmarge, zie paginate.ts). Wat je op scherm ziet komt er dus zo
+   uit de printer.
+   ═══════════════════════════════════════════════════════════════════════ */
+@media print {
+  /* App-chrome volledig uit de printflow. */
+  .titlebar,
+  .ribbon-container,
+  .document-bar,
+  .status-bar,
+  .toast-host,
+  .left-panel,
+  .right-panel,
+  .detached-dock-bar,
+  .report-sidebar,
+  .report-sidebar-collapsed,
+  .report-shell-toolbar,
+  .report-stale-banner,
+  .report-sync-waiting {
+    display: none !important;
+  }
+
+  /* Vaste-hoogte app-layout loslaten zodat de vellen de printflow vormen. */
+  html,
+  body,
+  #root {
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+
+  .content,
+  .main-view,
+  .report-detached-wrap,
+  .report-preview,
+  .report-shell,
+  .report-scroll {
+    display: block !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    background: #fff !important;
+  }
+
+  .report-zoom {
+    zoom: 1 !important;
+    display: block !important;
+    width: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* De meetcontainer is puur gereedschap — nooit op papier. */
+  .rpt-meet {
+    display: none !important;
+  }
+
+  .rpt-vellen {
+    display: block !important;
+    gap: 0 !important;
+  }
+
+  /* Eén vel = één printpagina. Maat en marges komen uit @page, dus het vel
+     zelf verliest zijn schermafmetingen; de paginering heeft de inhoud al
+     op die pagina afgestemd. */
+  .rpt-vel {
+    width: auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    box-shadow: none !important;
+    overflow: visible !important;
+    background: #fff !important;
+    break-after: page;
+    break-inside: avoid;
+  }
+
+  .rpt-vel:last-child {
+    break-after: auto;
+  }
+
+  .rpt-vel-binnen {
+    height: auto !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  /* De paginanummers komen in print uit de @page-margin-boxes; de
+     scherm-voetregel zou midden op de pagina belanden. */
+  .rpt-vel-voet {
+    display: none !important;
+  }
+
+  .rpt-kop {
+    margin-bottom: 4mm;
+  }
+
+  /* Binnen een vel breekt niets meer af — de paginering deed dat al. */
+  .rpt-hoofdstuk,
+  .rpt-block,
+  .rpt-figuur,
+  .rpt-profile-block,
+  .rpt-loadcase-block,
+  .rpt-table tr {
+    break-inside: avoid;
+  }
+
+  /* De inhoudsopgave-regels zijn op scherm knoppen; op papier tekst. */
+  .rpt-toc-regel {
+    cursor: default;
+    color: #1a1a1a !important;
+  }
+
+  /* Scherm-chrome in de secties (koptekst-invoerveld) → tekstvariant. */
+  .rpt-screen-only {
+    display: none !important;
+  }
+
+  .rpt-print-only {
+    display: block;
+  }
+
+  /* Tabelkop herhalen wanneer een lange tabel tóch over pagina's breekt. */
+  .rpt-table thead {
+    display: table-header-group;
+  }
+
+  .report-no-sections {
+    color: #555;
+  }
+}

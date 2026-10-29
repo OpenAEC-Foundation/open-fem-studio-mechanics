@@ -1,0 +1,55 @@
+name: Bug report
+description: Something does not work or gives a wrong result
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! A wrong result is the most valuable kind of bug: please include the model
+        (`.ifcfem` file) and, if you can, the value you expected and where it comes from (hand
+        calculation, textbook, other software).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the attached model
+        2. Calculate
+        3. Look at the moment in member 3
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result and its source
+      description: For a calculation error, the expected value and how it was obtained.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Shown in the title bar and under File → About.
+      placeholder: "2026.44.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Model, screenshots, logs
+      description: Drag the `.ifcfem` file (zipped if needed) and screenshots in here.

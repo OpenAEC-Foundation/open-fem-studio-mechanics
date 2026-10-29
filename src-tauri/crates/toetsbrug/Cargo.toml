@@ -1,0 +1,30 @@
+[package]
+name = "toetsbrug"
+version = "2026.44.0"
+edition = "2021"
+description = "Normtoetsing als JSON-in/JSON-uit, zodat de browser dezelfde rekenkern bereikt als de desktop-app"
+license = "AGPL-3.0-or-later"
+
+# Bewust een eigen crate en geen binary in het Tauri-pakket: daar zou hij als
+# tweede uitvoerbaar bestand naast de app staan, en de bundler pakte hem dan
+# als hoofdprogramma — de installer bevatte de toetsbrug in plaats van de app.
+#
+# Lib + bin, om dezelfde reden als bij `openaec-mcp-server`: de
+# opdrachtafhandeling (`behandel`) staat in het libdeel zodat een test erbij
+# kan zonder een proces te starten. De drie-wegen-verificatie voor beton
+# vergelijkt die functie met de MCP-server en met de rekengang achter het
+# Tauri-command.
+[lib]
+name = "toetsbrug"
+path = "src/lib.rs"
+
+[[bin]]
+name = "toetsbrug"
+path = "src/main.rs"
+
+
+[dependencies]
+openaec-native-fem = { path = "../native-fem", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+steel-profiles = { path = "../steel-profiles" }

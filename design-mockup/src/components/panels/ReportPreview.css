@@ -1,0 +1,409 @@
+/* ReportPreview — zijbalk (sectie-toggles) naast het live HTML-rapport.
+   De weergave van het rapport zelf (vellen, zoom, print) zit in
+   components/report/report.css. */
+
+/* ─── R5: losgekoppeld rapportvenster ─── */
+.report-detached-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Dunne statusbalk zolang er nog geen snapshot van het hoofdvenster is. */
+.report-sync-waiting {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+  background: var(--theme-bg-lighter);
+  color: var(--theme-text-secondary);
+  border-bottom: 1px solid var(--theme-border);
+}
+
+.report-preview {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  /* .main-view centreert kinderen (align-items: center) — zonder stretch
+     groeit het rapport naar content-hoogte en scrolt de hele view mee. */
+  align-self: stretch;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--theme-bg);
+}
+
+/* ─── Zijbalk met sectie-toggles ─── */
+.report-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--theme-bg-lighter);
+  border-right: 1px solid var(--theme-border);
+  overflow: hidden;
+}
+
+.report-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 28px;
+  padding: 0 4px 0 12px;
+  border-bottom: 1px solid var(--theme-border);
+  flex-shrink: 0;
+}
+
+.report-sidebar-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--theme-text);
+}
+
+.report-sidebar-toggle {
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--theme-text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.12s;
+}
+
+.report-sidebar-toggle:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+
+.report-sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+.report-sidebar-hint {
+  font-size: 11px;
+  color: var(--theme-text-secondary);
+  margin: 0 0 12px;
+  line-height: 1.4;
+}
+
+.report-section-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.report-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  font-size: 12px;
+  color: var(--theme-text);
+  border-radius: 3px;
+  transition: background 0.12s;
+  /* Markering van de sectie die in beeld is (IntersectionObserver-light in
+     ReportShell): een dun streepje links, geen kleurbom. */
+  border-left: 2px solid transparent;
+}
+
+.report-section-toggle:hover {
+  background: var(--theme-hover);
+}
+
+.report-section-toggle.is-actief {
+  border-left-color: var(--theme-accent);
+  background: var(--theme-hover);
+}
+
+.report-section-toggle input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--theme-accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* De sectienaam is tegelijk de sprong-link van de inhoudsopgave. */
+.report-section-link {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-section-link:hover:not(:disabled) {
+  color: var(--theme-accent);
+  text-decoration: underline;
+}
+
+.report-section-link:disabled {
+  color: var(--theme-text-secondary);
+  cursor: default;
+  opacity: 0.6;
+}
+
+/*
+ * Een sectie die dit model niet kan vullen (geen beton, geen platen — zie
+ * lib/sectieRelevantie). Hij blijft in de lijst staan, want de zijbalk is een
+ * bedieningspaneel: een schakelaar die verdwijnt laat iemand ernaar zoeken.
+ * Gedempt en niet aanklikbaar, met de reden in de tooltip — dezelfde greep als
+ * een overgeslagen belastingcombinatie in de projectboom. De cursor is `help`
+ * en niet `not-allowed`: er valt hier iets te lezen, niets te forceren.
+ */
+.report-section-toggle.is-nvt {
+  opacity: 0.55;
+  cursor: help;
+}
+
+.report-section-toggle.is-nvt input[type="checkbox"],
+.report-section-toggle.is-nvt .report-section-link {
+  cursor: help;
+}
+
+/* De aanduiding achter de naam: klein en kleurloos, zoals de badge van een
+   overgeslagen combinatie in de projectboom. */
+.report-section-nvt {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--theme-text-faint);
+  padding: 1px 5px;
+  border: 1px solid var(--theme-border);
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.report-reset-btn {
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid var(--theme-border);
+  color: var(--theme-text-secondary);
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.12s;
+  width: 100%;
+}
+
+.report-reset-btn:hover {
+  border-color: var(--theme-accent);
+  color: var(--theme-accent);
+  background: var(--theme-hover);
+}
+
+/* ─── Blok "Opmaak": live sliders voor marges en typografie ─── */
+.report-sidebar-kop {
+  margin: 18px 0 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--theme-border);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--theme-text);
+}
+
+/* De eerste blokkop staat bovenaan de zijbalk — daar hoort geen scheidslijn. */
+.report-sidebar-kop-eerste {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* ─── Rapporttype: voorinstelling van de sectiekeuze ─── */
+.report-type-keuze {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.report-type-knop {
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--theme-text-secondary);
+  background: transparent;
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.report-type-knop:hover {
+  border-color: var(--theme-accent);
+  color: var(--theme-accent);
+}
+
+.report-type-knop.is-actief {
+  background: var(--theme-accent);
+  border-color: var(--theme-accent);
+  color: var(--theme-btn-primary-text);
+}
+
+.report-detail-keuze {
+  margin-bottom: 4px;
+}
+
+/* ─── Uitgebreide uitvoer per staaf ───
+   Hoort bij het toetsingsblok, dus geen eigen scheidslijn: een kopregel met
+   de "alle staven"-knop ernaast, daaronder dezelfde vinkjeslijst als de
+   secties (die deelt .report-section-list/.report-section-toggle). */
+.report-staaf-keuze {
+  margin-top: 10px;
+}
+
+.report-staaf-keuze-kop {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.report-staaf-alles {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--theme-accent);
+  cursor: pointer;
+}
+
+.report-staaf-alles:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+.report-staaf-alles:disabled {
+  color: var(--theme-text-secondary);
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Het hele rijtje is klikbaar (label), vandaar de cursor op de rij zelf. */
+.report-staaf-toggle {
+  cursor: pointer;
+}
+
+.report-staaf-naam {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.report-opmaak {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.report-opmaak-slider {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 2px 8px;
+  font-size: 11px;
+  color: var(--theme-text-secondary);
+}
+
+.report-opmaak-label {
+  grid-column: 1;
+}
+
+.report-opmaak-waarde {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  min-width: 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--theme-text);
+}
+
+.report-opmaak-slider input[type="range"] {
+  grid-column: 1;
+  width: 100%;
+  margin: 0;
+  accent-color: var(--theme-accent);
+}
+
+/* Keuzelijst in het opmaakblok (diepte van de inhoudsopgave). */
+.report-opmaak-keuze {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--theme-text-secondary);
+}
+
+.report-opmaak-keuze select {
+  width: 100%;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--theme-text);
+  background: var(--theme-bg);
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.report-opmaak-keuze select:hover {
+  border-color: var(--theme-accent);
+}
+
+/* Ingeklapte verticale tab */
+.report-sidebar-collapsed {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  flex-shrink: 0;
+  background: var(--theme-bg-lighter);
+  border: none;
+  border-right: 1px solid var(--theme-border);
+  color: var(--theme-text-secondary);
+  cursor: pointer;
+  padding: 8px 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.report-sidebar-collapsed:hover {
+  color: var(--theme-text);
+  background: var(--theme-hover);
+}
+
+.report-sidebar-collapsed span {
+  writing-mode: vertical-lr;
+  transform: rotate(180deg);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}

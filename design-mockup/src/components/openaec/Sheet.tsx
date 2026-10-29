@@ -1,0 +1,38 @@
+/**
+ * Sheet — right-docked side panel. Slides in from the right edge.
+ *
+ * Used by the Grids dialog and load editors so the user doesn't lose
+ * sight of the canvas while configuring.
+ */
+import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import "./Sheet.css";
+
+interface Props {
+  open: boolean;
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  className?: string;
+}
+
+export default function Sheet({ open, title, onClose, children, className }: Props) {
+  const { t } = useTranslation("common");
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <div className={`oa-sheet${className ? ` ${className}` : ""}`}>
+      <div className="oa-sheet-header">
+        <span className="oa-sheet-title">{title}</span>
+        <button className="oa-sheet-close" onClick={onClose} aria-label={t("close")}>×</button>
+      </div>
+      <div className="oa-sheet-body">{children}</div>
+    </div>
+  );
+}

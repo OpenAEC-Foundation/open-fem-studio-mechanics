@@ -1,0 +1,478 @@
+//! `open_fem_3d_staalhal_maken` — een hal van staal of hout als 3D-raamwerk met één
+//! aanroep: model (projectbestand), en desgewenst meteen doorgerekend.
+//!
+//! WAT HIER GEBEURT EN WAT NIET
+//! Deze module bouwt geen hal en rekent geen staaf. De keten is:
+//!   1. sidecar `staalhal_maken` — de generator van de wizard in de app
+//!      (`design-mockup/src/components/openFem3d/wizards/staalhal.ts`) en,
+//!      met `reken`, de rekenverzoeken per belastinggeval en per
+//!      standaardcombinatie (dezelfde `buildOpenFem3DSolveRequest` als de app);
+//!   2. hier: elk verzoek door `open_fem_3d::solve`, dezelfde vastgezette
+//!      3D-kern als het Tauri-command en de tool `solve_open_fem_3d`;
+//!   3. sidecar `staalhal_uitwerken` — reactiesommen, evenwicht en
+//!      verplaatsingen.
+//! De parameters van de hal worden in de sidecar gelezen, met dezelfde poort
+//! als in de app: een onbekend veld of een verkeerd type is een fout, nooit
+//! een stille standaardwaarde. Het schema hieronder is daar de spiegel van
+//! (zie de test `schema_spiegelt_de_veldpoort_van_de_generator`).
+
+use openaec_mcp_server::sidecar::{self, SidecarOpties};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use crate::fem_tools::van_sidecar;
+use crate::RpcError;
+
+pub(crate) const TOOL: &str = "open_fem_3d_staalhal_maken";
+
+pub(crate) fn is_staalhal_tool(naam: &str) -> bool {
+    naam == TOOL
+}
+
+// ── Schema ──────────────────────────────────────────────────────────────────
+
+const STAALSOORTEN: [&str; 5] = ["S235", "S275", "S355", "S420", "S460"];
+const HOUTSOORTEN: [&str; 13] = [
+    "C14", "C16", "C18", "C20", "C22", "C24", "C27", "C30", "C35",
+    "GL24h", "GL28h", "GL32h", "GL36h",
+];
+const BETONKLASSEN: [&str; 14] = [
+    "C12/15", "C16/20", "C20/25", "C25/30", "C30/37", "C35/45", "C40/50", "C45/55", "C50/60",
+    "C55/67", "C60/75", "C70/85", "C80/95", "C90/105",
+];
+
+fn maat(standaard: f64, max: f64, beschrijving: &str) -> Value {
+    json!({ "type": "number", "exclusiveMinimum": 0, "maximum": max, "default": standaard, "description": beschrijving })
+}
+
+fn last(standaard: f64, beschrijving: &str) -> Value {
+    json!({ "type": "number", "minimum": 0, "maximum": 100, "default": standaard, "description": beschrijving })
+}
+
+fn profielkeuze(profiel: &str, rol: &str) -> Value {
+    let materialen = [STAALSOORTEN.as_slice(), HOUTSOORTEN.as_slice()].concat();
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": format!("{rol}: catalogusprofiel in staal of rechthoekig houtprofiel b×h in mm."),
+        "properties": {
+            "profiel": { "type": "string", "minLength": 1, "default": profiel,
+                "description": "Staalcatalogus, bijv. \"HEA 450\", of rechthoekig hout, bijv. \"160x400\" (b×h mm)." },
+            "materiaal": { "type": "string", "enum": materialen, "default": "S235" },
+            "profielEind": { "type": "string",
+                "description": "Optioneel: eindprofiel van een verlopende staaf (issue #73), I/H naar I/H uit de staalcatalogus (gerekend als gelast I-profiel). Alleen bij de kolommen (van de voet naar de kop) en de spantliggers (van de goot naar het midden van de overspanning, aan beide zijden gelijk; vraagt een even aantal gordingvelden). Bij gording, randligger en verband geweigerd. Leeg of weggelaten = prismatisch." }
+        }
+    })
+}
+
+/// Het strikte schema van de halparameters: dezelfde velden, standaardwaarden
+/// en grenzen als `leesStaalhalInvoer` in de generator. Gedeeld met
+/// `gui_build_3d_steel_hall`, zodat de app en de MCP-tool één vocabulaire
+/// hebben.
+pub(crate) fn hal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "default": {},
+        "description": "Parameters van de hal. Alle lengtes in mm; ontbrekende velden krijgen de standaardwaarde (samen: de voorbeeldhal 60 × 30 m). Assen: x langs de hal, y dwars (overspanning), z omhoog, peil 0 = z 0.",
+        "properties": {
+            "lengteMm": maat(60000.0, 500000.0, "Lengte van de hal (x), mm."),
+            "breedteMm": maat(30000.0, 500000.0, "Totale breedte van de hal (y), mm."),
+            "aantalOverspanningen": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1,
+                "description": "Aantal gelijke overspanningen dwars op de hal. Elke grens krijgt een kolomlijn en een dakknoop; 1 behoudt de enkele overspanning." },
+            "spantafstandMm": maat(6000.0, 500000.0, "Grootste h.o.h.-afstand van de spanten, mm. Aantal vakken = ⌈lengte/spantafstand⌉, de werkelijke afstand lengte/aantal. Niet samen met aantalVakken."),
+            "aantalVakken": { "type": "integer", "minimum": 1, "maximum": 100,
+                "description": "Aantal vakken tussen de spanten (aantal spanten = vakken + 1). Niet samen met spantafstandMm." },
+            "goothoogteMm": maat(8000.0, 60000.0, "Goothoogte (bovenkant kolom, lage zijde bij een lessenaarsdak), mm boven peil."),
+            "dak": {
+                "type": "object",
+                "additionalProperties": false,
+                "default": { "type": "zadeldak" },
+                "description": "Daktype. Ontbreken nokhoogte en helling, dan geldt helling 1 : 10.",
+                "properties": {
+                    "type": { "type": "string", "enum": ["zadeldak", "lessenaarsdak", "platdak"], "default": "zadeldak" },
+                    "nokhoogteMm": { "type": "number", "exclusiveMinimum": 0, "maximum": 60000,
+                        "description": "Zadeldak: nokhoogte; lessenaarsdak: hoogte aan de hoge zijde (y = breedte); mm boven peil. Niet samen met hellingGraden." },
+                    "hellingGraden": { "type": "number", "exclusiveMinimum": 0, "maximum": 60,
+                        "description": "Dakhelling in graden, in plaats van nokhoogteMm." }
+                }
+            },
+            "gordingafstandMm": maat(2500.0, 500000.0, "Grootste gordingafstand, horizontaal gemeten, mm. Bij een zadeldak valt de nok op een gording."),
+            "profielen": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Profielen per groep: staal S235–S460 uit de catalogus of hout C14–C35/GL24h–GL36h met rechthoekige b×h-doorsnede.",
+                "properties": {
+                    "kolom": profielkeuze("HEA 450", "Kolommen (90° gedraaid: lijf in het spantvlak)"),
+                    "spantligger": profielkeuze("IPE 600", "Spantliggers"),
+                    "gording": profielkeuze("IPE 160", "Gordingen (scharnierend van spant tot spant)"),
+                    "randligger": profielkeuze("HEA 160", "Randliggers langs de goten (scharnierend)"),
+                    "verband": profielkeuze("CHS 88.9x4", "Dak- en wandverbanden (scharnierende kruizen)")
+                }
+            },
+            "kolomvoet": { "type": "string", "enum": ["ingeklemd", "scharnierend"], "default": "ingeklemd",
+                "description": "Op vaste opleggingen: inklemming of scharnier. Op het balkrooster: star of met een eindscharnier (My, Mz) op de poer." },
+            "verbanden": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "vakken": {
+                        "oneOf": [
+                            { "type": "string", "enum": ["kopvakken", "alle", "geen"] },
+                            { "type": "array", "items": { "type": "integer", "minimum": 1 }, "description": "Vaknummers, 1 = eerste vak." }
+                        ],
+                        "default": "kopvakken"
+                    },
+                    "dak": { "type": "boolean", "default": true, "description": "Dakverband: kruis in elk gordingveld van de gekozen vakken." },
+                    "wanden": { "type": "boolean", "default": true, "description": "Wandverband: kruis in beide langsgevels van de gekozen vakken. Verplicht bij scharnierende kolomvoeten." },
+                    "kopgevels": { "type": "boolean", "default": false, "description": "Kruisverband in beide kopgevelvlakken, tussen de kolomvoeten en tegenoverliggende gootknopen." },
+                    "trekAlleen": { "type": "boolean", "default": false, "description": "Dak-, wand- en kopgevelverbanden alleen op trek laten werken; de 3D-kern bepaalt per belastinggeval de actieve diagonalen." }
+                }
+            },
+            "fundering": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Vaste opleggingen onder de kolommen, of een betonnen balkrooster op palen (hal en rooster rekenen samen).",
+                "properties": {
+                    "type": { "type": "string", "enum": ["opleggingen", "balkrooster"], "default": "opleggingen" },
+                    "balkBreedteMm": maat(400.0, 5000.0, "Breedte funderingsbalk, mm."),
+                    "balkHoogteMm": maat(600.0, 5000.0, "Hoogte funderingsbalk, mm."),
+                    "betonklasse": { "type": "string", "enum": BETONKLASSEN, "default": "C20/25" },
+                    "dwarsbalken": { "type": "string", "enum": ["elkSpant", "kopspanten"], "default": "elkSpant",
+                        "description": "Dwarsbalken onder elk spant of alleen onder de kopspanten; langsbalken liggen altijd onder beide kolomlijnen." },
+                    "diepteMm": { "type": "number", "minimum": 0, "maximum": 20000, "default": 800,
+                        "description": "Diepte van de systeemlijn (hart balk) onder peil, mm. Groter dan 0: een betonnen poer verbindt kolomvoet en rooster." },
+                    "paalKzKnPerMm": { "type": "number", "exclusiveMinimum": 0, "maximum": 1000000, "default": 100,
+                        "description": "Verticale veerstijfheid per paal, kN/mm." },
+                    "paalHorizontaal": { "type": "string", "enum": ["veren", "statischBepaald"], "default": "veren",
+                        "description": "veren: horizontale veer per paal (paalKhKnPerMm); statischBepaald: u_x en u_y vast in de eerste paal, u_y in de laatste paal van kolomlijn y = 0." },
+                    "paalKhKnPerMm": { "type": "number", "exclusiveMinimum": 0, "maximum": 1000000, "default": 5,
+                        "description": "Horizontale veerstijfheid per paal, kN/mm (bij paalHorizontaal = veren)." },
+                    "paalAfstandMm": { "type": "number", "minimum": 500, "maximum": 500000, "default": 6000,
+                        "description": "Grootste h.o.h.-afstand van de palen langs een balk; onder elke kolom staat altijd een paal." }
+                }
+            },
+            "lasten": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Lasten in kN/m² horizontale projectie. Belastinggevallen: 1 Permanent (G), 2 Sneeuw (S), 3 Wind dwars (+Y), 4 Wind langs (+X), 5 Eigen gewicht; bij dakgebruik > 0 ook 6 Dakgebruik (Q, categorie H).",
+                "properties": {
+                    "dakafwerkingKnM2": last(0.3, "Dakafwerking (G), op de gordingen."),
+                    "sneeuwKnM2": last(0.56, "Sneeuw (S), op de gordingen."),
+                    "dakgebruikKnM2": last(0.0, "Optionele dakgebruikslast Q, categorie H, op de gordingen per m² horizontale projectie. Nul laat het geval weg."),
+                    "wind": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "bron": { "type": "string", "enum": ["handmatig", "stuwdruk"], "default": "handmatig",
+                                "description": "handmatig: de drie drukken hieronder; stuwdruk: q_p(z = nokhoogte) uit NEN-EN 1991-1-4 met c_pe,10 van tabel 7.1 (zones D/E) en cDak op het hele dak." },
+                            "drukKnM2": last(0.64, "Druk op de loefgevel (wind dwars op de kolommen y = 0, wind langs op de kopgevel)."),
+                            "zuigingKnM2": last(0.4, "Zuiging op de lijgevel (kolommen y = breedte)."),
+                            "dakZuigingKnM2": last(0.48, "Opwaartse zuiging op het hele dak (in het geval wind dwars)."),
+                            "windgebied": { "type": "string", "enum": ["I", "II", "III"], "default": "II" },
+                            "terreincategorie": { "type": "string", "enum": ["0", "I", "II", "III", "IV"], "default": "III" },
+                            "cDak": { "type": "number", "minimum": 0, "maximum": 5, "default": 0.6,
+                                "description": "Vormfactor voor de opwaartse zuiging op het dak (bij bron stuwdruk)." }
+                        }
+                    }
+                }
+            },
+            "eigenGewicht": { "type": "boolean", "default": true,
+                "description": "Het vaste geval \"Eigen gewicht\" (id 5) en eigen gewicht aan: ρ·A·g per staaf, ook voor rooster en poeren." },
+            "projectnaam": { "type": "string", "default": "", "description": "Leeg: \"Staalhal <lengte> × <breedte> m\"." }
+        }
+    })
+}
+
+const BESCHRIJVING: &str = "Maak een stalen hal als 3D-raamwerk (spanten, gordingen, randliggers, dak- en wandverbanden, lasten G/S/W dwars/W langs, optioneel dakgebruik Q en eigen gewicht), eventueel op een betonnen balkrooster op palen. Geeft het projectbestand (.ifcfem-inhoud, te openen in Open FEM Studio of met gui_load_model), een samenvatting (aantallen, maten, staafnummers per groep) en waarschuwingen. Met `reken: true` rekent dezelfde 3D-kern als solve_open_fem_3d elk belastinggeval en elke standaardcombinatie (de RESULTATEN, volgens `analyse`, zonder scheefstand), en komen per geval de reactiesommen, het evenwicht, de grootste verplaatsing, de zijverplaatsing van de goot en de paalreacties terug. Dezelfde generator als de wizard \"Stalen hal…\" in de app.";
+
+pub(crate) fn tool_definitions() -> Vec<Value> {
+    #[allow(unused_mut)]
+    let mut def = json!({
+        "name": TOOL,
+        "description": BESCHRIJVING,
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "hal": hal_schema(),
+                "reken": { "type": "boolean", "default": false,
+                    "description": "Meteen doorrekenen met de 3D-kern (per belast geval en per standaardcombinatie)." },
+                "analyse": { "type": "string", "enum": ["linear", "p-delta"], "default": "linear",
+                    "description": "De RESULTATEN: eerste orde (linear, zoals het projectbestand) of tweede orde (p-delta), zonder scheefstand." },
+                "gevolgklasse": { "type": "string", "enum": ["CC1", "CC2", "CC3"], "default": "CC2",
+                    "description": "Gevolgklasse voor de factoren van de standaardcombinaties (NEN-EN 1990 NB)." },
+                "stramien": { "type": "boolean", "default": true,
+                    "description": "Het stramien van de hal (spanten, gevels, levels) in het projectbestand." },
+                "detail": { "type": "string", "enum": ["samenvatting", "volledig"], "default": "samenvatting",
+                    "description": "volledig: ook alle reacties en verplaatsingen per geval." },
+                "timeout_s": { "type": "integer", "minimum": 1, "maximum": 600,
+                    "description": "Tijdslimiet per sidecar-aanroep in seconden." }
+            }
+        }
+    });
+    vec![def]
+}
+
+// ── Uitvoering ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Argumenten {
+    #[serde(default)]
+    hal: Option<Value>,
+    #[serde(default)]
+    reken: bool,
+    #[serde(default)]
+    analyse: Option<String>,
+    #[serde(default)]
+    gevolgklasse: Option<String>,
+    #[serde(default)]
+    stramien: Option<bool>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+}
+
+fn argumentfout(melding: impl Into<String>) -> RpcError {
+    let melding = melding.into();
+    RpcError {
+        code: -32602,
+        message: format!("[ARGUMENT_ONGELDIG] {melding}"),
+        data: Some(json!({
+            "error_code": "ARGUMENT_ONGELDIG",
+            "melding": melding,
+            "remedie": "Vergelijk de aanroep met het inputSchema uit `tools/list`; onbekende velden worden geweigerd.",
+        })),
+    }
+}
+
+fn rekenfout(melding: impl Into<String>) -> RpcError {
+    let melding = melding.into();
+    RpcError {
+        code: -32000,
+        message: format!("[MODEL_ONOPLOSBAAR] {melding}"),
+        data: Some(json!({
+            "error_code": "MODEL_ONOPLOSBAAR",
+            "melding": melding,
+            "remedie": "Controleer profielen, kolomvoeten en verbanden; een hal zonder wandverband op scharnieren is een mechanisme.",
+        })),
+    }
+}
+
+async fn roep(op: &str, payload: Value, timeout_s: Option<u64>) -> Result<Value, RpcError> {
+    let opties = SidecarOpties::uit_omgeving();
+    sidecar::roep_aan(op, payload, &opties, timeout_s)
+        .await
+        .map(|uit| uit.result)
+        .map_err(van_sidecar)
+}
+
+pub(crate) async fn dispatch(naam: &str, args: Value) -> Result<Value, RpcError> {
+    if naam != TOOL {
+        return Err(RpcError::method_not_found(naam));
+    }
+    let a: Argumenten = serde_json::from_value(args)
+        .map_err(|e| argumentfout(format!("De argumenten van `{TOOL}` deugen niet: {e}.")))?;
+    let detail = a.detail.as_deref().unwrap_or("samenvatting");
+    if !matches!(detail, "samenvatting" | "volledig") {
+        return Err(argumentfout("`detail` moet \"samenvatting\" of \"volledig\" zijn."));
+    }
+    let volledig = detail == "volledig";
+    let hal = a.hal.unwrap_or_else(|| json!({}));
+    let reken = json!({
+        "analyse": a.analyse.as_deref().unwrap_or("linear"),
+        "gevolgklasse": a.gevolgklasse.as_deref().unwrap_or("CC2"),
+    });
+
+    let mut maken = json!({ "hal": hal, "stramien": a.stramien.unwrap_or(true) });
+    if a.reken {
+        maken["reken"] = reken.clone();
+        // Zonder normtoetsing: de sidecar rekent alleen de resultaten.
+        {
+            maken["toetsen"] = json!(false);
+        }
+    }
+    let gemaakt = roep("staalhal_maken", maken, a.timeout_s).await?;
+    let mut uit = Map::new();
+    for sleutel in ["project", "parameters", "samenvatting", "waarschuwingen"] {
+        uit.insert(sleutel.to_owned(), gemaakt.get(sleutel).cloned().unwrap_or(Value::Null));
+    }
+    if !a.reken {
+        return Ok(Value::Object(uit));
+    }
+
+    // ── Rekenen: elk verzoek door dezelfde 3D-kern als solve_open_fem_3d ──
+    let verzoeken = lees_rekenverzoeken(&gemaakt["rekenverzoeken"], "rekenverzoeken")?;
+    let aantal_verzoeken = verzoeken.len();
+    let mut resultaten = Map::new();
+    for (sleutel, naam, uitkomst) in reken_alle(verzoeken).await? {
+        let waarde = uitkomst.map_err(|e| rekenfout(format!("De 3D-kern weigerde de hal: {naam} ({sleutel}): {e}")))?;
+        resultaten.insert(sleutel, waarde);
+    }
+
+    let mut per_geval_volledig = Vec::new();
+    if volledig {
+        for (sleutel, r) in &resultaten {
+            if let Some(id) = sleutel.strip_prefix("geval:") {
+                per_geval_volledig.push(json!({
+                    "id": id.parse::<i64>().unwrap_or_default(),
+                    "reacties": r["reactions"],
+                    "verplaatsingen": r["displacements"],
+                }));
+            }
+        }
+    }
+
+    let mut uitwerken = json!({ "hal": gemaakt["parameters"], "reken": reken, "resultaten": Value::Object(resultaten) });
+    {
+        uitwerken["toetsen"] = json!(false);
+    }
+    let uitgewerkt = roep("staalhal_uitwerken", uitwerken, a.timeout_s).await?;
+
+    let mut berekening = Map::new();
+    berekening.insert("analyse".to_owned(), uitgewerkt["reken"]["analyse"].clone());
+    berekening.insert("gevolgklasse".to_owned(), uitgewerkt["reken"]["gevolgklasse"].clone());
+    berekening.insert("aantal_berekeningen".to_owned(), json!(aantal_verzoeken));
+    berekening.insert("gevallen".to_owned(), uitgewerkt["gevallen"].clone());
+    berekening.insert("combinaties".to_owned(), uitgewerkt["combinaties"].clone());
+    berekening.insert("grenzen_ter_vergelijking".to_owned(), uitgewerkt["grenzen"].clone());
+    if volledig {
+        berekening.insert("per_geval".to_owned(), Value::Array(per_geval_volledig));
+    }
+
+    uit.insert("berekening".to_owned(), Value::Object(berekening));
+    Ok(Value::Object(uit))
+}
+
+/// Eén rekenverzoek van de sidecar: sleutel, naam en het 3D-contract.
+pub(crate) type Rekenverzoek = (String, String, open_fem_3d::SolveRequest3D);
+
+/// De rekenverzoeken van de sidecar (`rekenverzoeken` of `toetsverzoeken`),
+/// gelezen op het contract van de 3D-kern. Ook gebruikt door de IFC-import.
+pub(crate) fn lees_rekenverzoeken(lijst: &Value, veld: &str) -> Result<Vec<Rekenverzoek>, RpcError> {
+    lijst
+        .as_array()
+        .ok_or_else(|| RpcError::tool_exec(format!("de sidecar leverde geen {veld}")))?
+        .iter()
+        .map(|v| {
+            let sleutel = v["sleutel"].as_str().unwrap_or_default().to_owned();
+            let naam = v["naam"].as_str().unwrap_or_default().to_owned();
+            serde_json::from_value(v["verzoek"].clone())
+                .map(|verzoek| (sleutel.clone(), naam, verzoek))
+                .map_err(|e| RpcError::tool_exec(format!("{veld} {sleutel} past niet op het 3D-contract: {e}")))
+        })
+        .collect()
+}
+
+/// Hoeveel berekeningen tegelijk: de app start ze allemaal tegelijk; hier
+/// hoogstens zoveel als er kernen zijn, en niet meer dan dit (geheugen van de
+/// tweede orde op een grote hal).
+const MAX_TEGELIJK: usize = 4;
+
+/// Rekent elk verzoek met `open_fem_3d::solve` — dezelfde kern als
+/// `solve_open_fem_3d` — een paar tegelijk, en geeft de uitkomsten in de
+/// volgorde van de verzoeken: per verzoek het resultaat als JSON of de
+/// melding van de kern. De kern is een pure functie, dus de volgorde van
+/// rekenen verandert geen getal. Ook gebruikt door de IFC-import.
+pub(crate) async fn reken_alle(verzoeken: Vec<Rekenverzoek>) -> Result<Vec<(String, String, Result<Value, String>)>, RpcError> {
+    tokio::task::spawn_blocking(move || {
+        let aantal = verzoeken.len();
+        let draden = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, MAX_TEGELIJK)
+            .min(aantal.max(1));
+        let wachtrij: Vec<Mutex<Option<Rekenverzoek>>> = verzoeken.into_iter().map(|v| Mutex::new(Some(v))).collect();
+        let uitkomsten: Vec<Mutex<Option<(String, String, Result<Value, String>)>>> =
+            (0..aantal).map(|_| Mutex::new(None)).collect();
+        let volgende = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..draden {
+                s.spawn(|| loop {
+                    let i = volgende.fetch_add(1, Ordering::Relaxed);
+                    if i >= aantal {
+                        break;
+                    }
+                    let (sleutel, naam, verzoek) =
+                        wachtrij[i].lock().expect("wachtrij").take().expect("elk verzoek één keer");
+                    let uitkomst = open_fem_3d::solve(verzoek)
+                        .and_then(|r| serde_json::to_value(r).map_err(|e| format!("resultaat niet naar JSON: {e}")));
+                    *uitkomsten[i].lock().expect("uitkomst") = Some((sleutel, naam, uitkomst));
+                });
+            }
+        });
+        uitkomsten
+            .into_iter()
+            .map(|u| u.into_inner().expect("uitkomst").expect("elk verzoek gerekend"))
+            .collect()
+    })
+    .await
+    .map_err(|e| RpcError::tool_exec(format!("3D-kern kon niet worden afgerond: {e}")))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// De velden van één `export const NAAM = [...] as const;` uit de generator.
+    fn velden_uit_bron(bron: &str, naam: &str) -> BTreeSet<String> {
+        let start = bron
+            .find(&format!("export const {naam} = ["))
+            .unwrap_or_else(|| panic!("{naam} staat niet (meer) in staalhal.ts"));
+        let rest = &bron[start..];
+        let blok = &rest[rest.find('[').unwrap() + 1..rest.find("] as const;").expect("niet gesloten")];
+        blok.split('"').skip(1).step_by(2).map(str::to_owned).collect()
+    }
+
+    fn sleutels(schema: &Value) -> BTreeSet<String> {
+        schema["properties"].as_object().expect("properties").keys().cloned().collect()
+    }
+
+    /// Het schema is de spiegel van de invoerpoort van de generator
+    /// (`design-mockup/src/components/openFem3d/wizards/staalhal.ts`): elk
+    /// niveau noemt precies de velden die de poort kent. Een veld dat aan één
+    /// kant bijkomt valt hier op, zodat het schema nooit iets belooft dat de
+    /// poort weigert, of andersom.
+    #[test]
+    fn schema_spiegelt_de_veldpoort_van_de_generator() {
+        let pad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../design-mockup/src/components/openFem3d/wizards/staalhal.ts");
+        let bron = std::fs::read_to_string(&pad).unwrap_or_else(|e| panic!("{} niet leesbaar: {e}", pad.display()));
+        let hal = hal_schema();
+        let p = &hal["properties"];
+        assert_eq!(sleutels(&hal), velden_uit_bron(&bron, "STAALHAL_VELDEN"));
+        assert_eq!(sleutels(&p["dak"]), velden_uit_bron(&bron, "STAALHAL_DAK_VELDEN"));
+        assert_eq!(sleutels(&p["profielen"]), velden_uit_bron(&bron, "STAALHAL_PROFIEL_GROEPEN"));
+        for groep in velden_uit_bron(&bron, "STAALHAL_PROFIEL_GROEPEN") {
+            assert_eq!(sleutels(&p["profielen"]["properties"][&groep]), velden_uit_bron(&bron, "STAALHAL_PROFIEL_VELDEN"), "{groep}");
+        }
+        assert_eq!(sleutels(&p["verbanden"]), velden_uit_bron(&bron, "STAALHAL_VERBAND_VELDEN"));
+        assert_eq!(sleutels(&p["fundering"]), velden_uit_bron(&bron, "STAALHAL_FUNDERING_VELDEN"));
+        assert_eq!(sleutels(&p["lasten"]), velden_uit_bron(&bron, "STAALHAL_LASTEN_VELDEN"));
+        assert_eq!(sleutels(&p["lasten"]["properties"]["wind"]), velden_uit_bron(&bron, "STAALHAL_WIND_VELDEN"));
+    }
+
+    /// `additionalProperties: false` op ELK objectniveau van het schema.
+    #[test]
+    fn schema_is_strikt_op_elk_niveau() {
+        fn loop_na(pad: &str, schema: &Value, gezien: &mut usize) {
+            if schema.get("properties").is_some() {
+                *gezien += 1;
+                assert_eq!(schema["additionalProperties"], json!(false), "{pad} is niet strikt");
+                for (k, v) in schema["properties"].as_object().unwrap() {
+                    loop_na(&format!("{pad}.{k}"), v, gezien);
+                }
+            }
+        }
+        let mut gezien = 0;
+        loop_na("inputSchema", &tool_definitions()[0]["inputSchema"], &mut gezien);
+        // invoer, hal, dak, profielen + 5 groepen, verbanden, fundering, lasten, wind
+        assert_eq!(gezien, 13);
+    }
+
+}

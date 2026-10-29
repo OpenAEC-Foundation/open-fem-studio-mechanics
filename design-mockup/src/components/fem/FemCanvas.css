@@ -1,0 +1,1094 @@
+/* FEM canvas — v2 */
+
+.fem-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--theme-bg);
+  overflow: hidden;
+}
+
+.fem-canvas-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Grid layer */
+.fem-grid-layer { pointer-events: none; }
+.fem-grid-minor { stroke: rgba(217, 119, 6, 0.08); stroke-width: 0.5; }
+.fem-grid-major { stroke: rgba(217, 119, 6, 0.18); stroke-width: 1; }
+
+/* Model elements */
+.fem-member {
+  stroke: var(--theme-accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  cursor: pointer;
+}
+.fem-member:hover { stroke-width: 4; }
+.fem-member.selected { stroke: var(--theme-accent-hover); stroke-width: 4; filter: drop-shadow(0 0 4px var(--theme-accent)); }
+.fem-member-preview {
+  stroke: var(--theme-accent);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  opacity: 0.6;
+  pointer-events: none;
+}
+/* Hoeksnap (#53): de richting ligt vast — vol in de accentkleur. */
+.fem-member-preview.hoek {
+  stroke-width: 2.5;
+  stroke-dasharray: none;
+  opacity: 1;
+}
+.fem-hoek-label {
+  fill: var(--theme-accent);
+  font: 600 11px/1 "Inter", system-ui, sans-serif;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+/* Ortho (#53): gestippelde hulplijn door het beginpunt langs de vaste as. */
+.fem-ortho-lijn {
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  opacity: 0.7;
+  stroke-dasharray: 4 4;
+  pointer-events: none;
+}
+
+.fem-node-snap-halo {
+  fill: rgba(217, 119, 6, 0.18);
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  pointer-events: none;
+}
+.fem-node-sel-halo {
+  fill: rgba(217, 119, 6, 0.35);
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+
+.fem-hover-cross {
+  pointer-events: none;
+}
+.fem-hover-cross line {
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+}
+.fem-hover-cross circle {
+  fill: var(--theme-accent);
+}
+.fem-node {
+  fill: var(--theme-bg-lighter);
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+}
+.fem-node-label {
+  font: 600 11px/1 "Inter", system-ui, sans-serif;
+  fill: var(--theme-text);
+}
+.fem-support {
+  fill: rgba(217, 119, 6, 0.7);
+  stroke: var(--theme-text);
+  stroke-width: 1;
+}
+.fem-support-ground {
+  stroke: var(--theme-text);
+  stroke-width: 1.5;
+}
+/* Inklemlijn: dikkere lijn die direct op de knoop aansluit (inklemming en
+   de vaste zijde van een rotatieveer). */
+.fem-support-vast {
+  stroke: var(--theme-text);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+.fem-load-arrow {
+  stroke: rgba(220, 38, 38, 0.85);
+  stroke-width: 1.5;
+  marker-end: url(#arrow);
+}
+.fem-load-vec {
+  stroke: rgba(220, 38, 38, 0.85);
+  stroke-width: 1.5;
+  fill: none;
+  pointer-events: none;
+}
+.fem-load-marker-fill {
+  fill: rgba(220, 38, 38, 0.95);
+  stroke: none;
+}
+.fem-load-thermal {
+  fill: rgba(220, 38, 38, 0.55);
+  stroke: rgba(220, 38, 38, 0.9);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.fem-load-text {
+  font: 500 10.5px/1 "JetBrains Mono", monospace;
+  fill: rgba(220, 38, 38, 0.95);
+  text-anchor: middle;
+  pointer-events: none;
+}
+/* Static parts of the q-label (q=, →, kN/m) — never clickable. */
+.fem-load-text-static {
+  font: 500 10.5px/1 "JetBrains Mono", monospace;
+  fill: rgba(220, 38, 38, 0.95);
+  text-anchor: middle;
+  pointer-events: none;
+}
+/* Clickable VALUE portions of the q-label — click → focus the matching
+   input in the right Properties panel. Underline + cursor cue on hover. */
+.fem-load-text-clickable {
+  pointer-events: auto;
+  cursor: text;
+  text-decoration: underline;
+  text-decoration-thickness: 0.5px;
+  text-decoration-color: rgba(220, 38, 38, 0.45);
+  text-underline-offset: 2px;
+}
+.fem-load-text-clickable:hover {
+  fill: rgba(220, 38, 38, 1);
+  text-decoration-color: rgba(220, 38, 38, 1);
+  text-decoration-thickness: 1px;
+}
+
+/* Line-load group — auto-scaled q-arrows + clickable trapezoid hit-region. */
+.fem-lineload-group { cursor: pointer; }
+.fem-lineload-hit {
+  fill: rgba(220, 38, 38, 0.05);
+  stroke: none;
+  pointer-events: auto;
+}
+.fem-lineload-group:hover .fem-lineload-hit {
+  fill: rgba(220, 38, 38, 0.15);
+}
+.fem-lineload-group.selected .fem-lineload-hit {
+  fill: rgba(220, 38, 38, 0.22);
+}
+.fem-lineload-tip {
+  fill: none;
+  stroke: rgba(220, 38, 38, 0.55);
+  stroke-width: 1.2;
+  pointer-events: none;
+}
+.fem-lineload-group:hover .fem-lineload-tip,
+.fem-lineload-group.selected .fem-lineload-tip {
+  stroke: rgba(220, 38, 38, 1);
+  stroke-width: 1.8;
+}
+.fem-lineload-group.selected .fem-load-vec {
+  stroke: rgba(220, 38, 38, 1);
+  stroke-width: 2;
+}
+
+/* Puntlast — pijl staat boven de (gestapelde) q-lastband; een stippellijn
+   verbindt het echte aangrijpingspunt met de opgetilde pijlkop. */
+.fem-pointload-group { cursor: pointer; }
+.fem-load-leader {
+  stroke: rgba(220, 38, 38, 0.55);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  fill: none;
+  pointer-events: none;
+}
+/* Aangrijpingspunt van een puntlast op een vrije positie op de staaf. */
+.fem-pointload-dot {
+  fill: rgba(220, 38, 38, 0.95);
+  stroke: none;
+  pointer-events: none;
+}
+/* Onzichtbare, brede klikzone langs de pijlschacht. */
+.fem-pointload-hit {
+  stroke: transparent;
+  /* 18 px: de pijl ligt vaak op een staaf en was met 12 px een smal doel. */
+  stroke-width: 18;
+  fill: none;
+  pointer-events: stroke;
+}
+.fem-pointload-group.selected .fem-load-vec {
+  stroke: rgba(220, 38, 38, 1);
+  stroke-width: 2.5;
+}
+.fem-pointload-group.selected .fem-load-leader {
+  stroke: rgba(220, 38, 38, 1);
+}
+
+/* Plates — translucent fill below beams */
+.fem-plates-layer { pointer-events: visiblePainted; }
+.fem-plate {
+  fill: rgba(217, 119, 6, 0.12);
+  stroke: rgba(217, 119, 6, 0.45);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  cursor: pointer;
+}
+.fem-plate:hover { fill: rgba(217, 119, 6, 0.18); }
+.fem-plate.selected {
+  fill: rgba(217, 119, 6, 0.22);
+  stroke: var(--theme-accent);
+  stroke-width: 2;
+  stroke-dasharray: none;
+}
+/* Openingen in een plaat: de omtrek van het gat (het vlak zelf is uitgespaard via evenodd) */
+.fem-plate-opening {
+  fill: none;
+  stroke: rgba(217, 119, 6, 0.7);
+  stroke-width: 1.2;
+}
+/* Opening in aanbouw (slepen met het openinggereedschap) */
+.fem-opening-preview {
+  fill: rgba(217, 119, 6, 0.08);
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+}
+
+/* Spring supports — drawn as zig-zag / circular */
+.fem-spring {
+  stroke: var(--theme-text);
+  stroke-width: 1.4;
+  fill: none;
+}
+.fem-spring-label {
+  font: 500 9.5px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text-secondary);
+}
+
+/* Snap-hover beam highlight (when subnode / line-load tool is active) */
+.fem-member.snap {
+  stroke: var(--theme-accent-hover, var(--theme-accent));
+  stroke-width: 4;
+  filter: drop-shadow(0 0 4px var(--theme-accent));
+}
+
+/* Transform tools (move/copy/rotate/mirror) — anchor → cursor preview */
+.fem-transform-preview line {
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+  pointer-events: none;
+}
+.fem-transform-preview circle {
+  fill: var(--theme-accent);
+  pointer-events: none;
+}
+
+/* Dimensions */
+.fem-dim {
+  stroke: var(--theme-text-secondary);
+  stroke-width: 0.8;
+  stroke-dasharray: 4 2;
+}
+.fem-dim-text {
+  font: 500 10px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text-secondary);
+  text-anchor: middle;
+}
+
+/* Axes */
+.fem-axis-x { stroke: #16a34a; stroke-width: 1.5; }
+.fem-axis-z { stroke: #2563eb; stroke-width: 1.5; }
+.fem-axis-label {
+  font: 600 10px/1 "Inter", system-ui, sans-serif;
+}
+.fem-axis-label.fem-axis-x { fill: #16a34a; }
+.fem-axis-label.fem-axis-z { fill: #2563eb; }
+
+/* HUD overlays */
+.fem-hud {
+  position: absolute;
+  z-index: 5;
+  pointer-events: auto;
+}
+.fem-hud-tl {
+  top: 10px;
+  left: 10px;
+  /* Kolom: tool-chip bovenaan, assenstelsel-widget eronder. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.fem-hud-tr { top: 10px; right: 10px; }
+.fem-hud-bl { bottom: 10px; left: 10px; }
+.fem-hud-br { bottom: 10px; right: 10px; }
+/* Gecentreerde meldingen blijven binnen het canvas, ook bij een smal venster
+   of bredere terugvalletters: nooit breder dan het canvas min 2 × 8 px. */
+.fem-hud-tc { top: 10px; left: 50%; transform: translateX(-50%); max-width: calc(100% - 16px); }
+.fem-hud-tc .fem-hud-card { flex-wrap: wrap; }
+.fem-hud-bc-results {
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.fem-hud-bc-results .fem-hud-btn {
+  min-width: 26px;
+  font-weight: 600;
+  border: 1px solid var(--theme-border);
+  background: var(--theme-bg);
+}
+.fem-hud-bc-results .fem-hud-btn:hover {
+  border-color: var(--theme-accent);
+}
+.fem-hud-bc-results .fem-hud-btn.active {
+  border-color: var(--theme-accent);
+  background: var(--theme-accent);
+  color: var(--theme-accent-text, white);
+}
+
+.fem-hud-success {
+  border-color: var(--theme-accent);
+  box-shadow: 0 0 0 1px var(--theme-accent-soft), 0 1px 3px rgba(0,0,0,0.1);
+}
+.fem-hud-error {
+  border-color: var(--theme-danger-color, #DC2626);
+  color: var(--theme-danger-color, #DC2626);
+}
+
+.fem-hud-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--theme-bg-lighter);
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: 500 11px/1 "Inter", system-ui, sans-serif;
+  color: var(--theme-text);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  backdrop-filter: blur(8px);
+}
+.fem-hud-mono { font-family: "JetBrains Mono", monospace; }
+.fem-hud-muted { color: var(--theme-text-secondary); }
+.fem-hud-strong { font-weight: 600; color: var(--theme-accent); }
+
+.fem-hud-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--theme-text-secondary);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 2px;
+  font: inherit;
+}
+.fem-hud-btn:hover {
+  color: var(--theme-accent);
+  background: var(--theme-hover);
+}
+.fem-hud-btn.active {
+  color: var(--theme-accent-text, white);
+  background: var(--theme-accent);
+}
+.fem-hud-btn-pill {
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+}
+
+/* ── Solver results overlay ───────────────────────────────────────────── */
+.fem-results-overlay { pointer-events: none; }
+
+/* Internal-force diagrams (M/V/N lines drawn perpendicular to beams) */
+.fem-diagram-fill { fill-opacity: 0.15; stroke: none; }
+.fem-diagram-line { stroke-width: 1.5; fill: none; }
+/* M (buigend moment) — blauw */
+.fem-diagram-M.fem-diagram-fill { fill: #2563eb; }
+.fem-diagram-M.fem-diagram-line { stroke: #1d4ed8; }
+/* V (dwarskracht) — groen */
+.fem-diagram-V.fem-diagram-fill { fill: #10b981; }
+.fem-diagram-V.fem-diagram-line { stroke: #047857; }
+/* N (normaalkracht) — oranje */
+.fem-diagram-N.fem-diagram-fill { fill: #f59e0b; }
+.fem-diagram-N.fem-diagram-line { stroke: #d97706; }
+/* Snedetekens: het afschuifteken in de V-lijn en het buigteken in de M-lijn.
+   Ze horen bij hun eigen diagram, dus ze krijgen de kleur van de DIAGRAMLIJN
+   (niet van het lichtere vlak) — hetzelfde patroon als de waarde-labels.
+   De lijndikte wordt per teken meegegeven en schaalt mee met de tekenmaat;
+   hier staat alleen de terugval voor als die ontbreekt. */
+.fem-diagram-teken {
+  fill: none;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.fem-diagram-M.fem-diagram-teken { stroke: #1d4ed8; }
+.fem-diagram-V.fem-diagram-teken { stroke: #047857; }
+/* θ (hoekverdraaiing) — paars; vervormingsgrootheid, dus bewust een andere
+   kleurfamilie dan de drie snedekrachten hierboven. */
+.fem-diagram-R.fem-diagram-fill { fill: #8b5cf6; }
+.fem-diagram-R.fem-diagram-line { stroke: #6d28d9; }
+/* EI (buigstijfheidsverloop bij fysisch niet-lineair beton) — leisteen.
+   De gestreepte referentielijn is de ONGESCHEURDE EI₀; het dichte vlak de
+   werkelijk gerekende stijfheid per segment. */
+.fem-diagram-EI.fem-diagram-fill { fill: #0f766e; }
+.fem-diagram-EI.fem-diagram-line { stroke: #0f766e; stroke-width: 2; }
+.fem-diagram-EI-ref {
+  stroke: #0f766e;
+  stroke-width: 1.25;
+  stroke-dasharray: 6 4;
+  opacity: 0.7;
+  fill: none;
+}
+
+.fem-deflected {
+  fill: none;
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+  opacity: 0.95;
+}
+
+.fem-reaction-arrow {
+  stroke: var(--theme-danger-color, #DC2626);
+  stroke-width: 2;
+  fill: none;
+}
+.fem-reaction-marker-fill {
+  fill: var(--theme-danger-color, #DC2626);
+  stroke: none;
+}
+.fem-reaction-label {
+  font: 600 12.5px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-danger-color, #DC2626);
+  text-anchor: middle;
+}
+.fem-reaction-sublabel {
+  font: 500 9px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-danger-color, #DC2626);
+  text-anchor: middle;
+  opacity: 0.75;
+}
+
+.fem-force-label {
+  font: 500 12.5px/1.1 "JetBrains Mono", monospace;
+  fill: var(--theme-text);
+  text-anchor: middle;
+}
+
+/* Waarde-labels op de extreme punten van een krachtsdiagram (piek + hoeken).
+   Kleur volgt het diagram-type; lichte halo zodat het leesbaar blijft boven
+   het gevulde diagram-vlak. */
+.fem-diagram-value {
+  font: 700 12.5px/1 "JetBrains Mono", monospace;
+  paint-order: stroke;
+  stroke: var(--theme-bg, #fff);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+/* Knoopwaarden-label (ux / uz in mm) — subvinkje onder Verplaatsing. */
+.fem-node-disp-label {
+  font: 600 12px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-accent);
+}
+.fem-diagram-value.fem-diagram-M { fill: #1d4ed8; }
+.fem-diagram-value.fem-diagram-V { fill: #047857; }
+.fem-diagram-value.fem-diagram-N { fill: #d97706; }
+.fem-diagram-value.fem-diagram-R { fill: #6d28d9; }
+.fem-diagram-value.fem-diagram-EI { fill: #0f766e; }
+/* Referentiewaarde-label bij de gestreepte EI₀-lijn: zelfde kleur, lichter,
+   zodat het als achtergrondinformatie leest en niet als uitkomst. */
+.fem-diagram-value.fem-diagram-EI-reflabel {
+  fill: #0f766e;
+  opacity: 0.75;
+  font-weight: 500;
+}
+
+.fem-result-label-bg {
+  fill: var(--theme-bg-lighter);
+  fill-opacity: 0.85;
+  stroke: var(--theme-border);
+  stroke-width: 0.5;
+}
+
+.fem-scale-label {
+  font: 500 10px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text-secondary);
+}
+
+/* ── Stramien (structural grid) ─────────────────────────────────────── */
+/* Streep-stip zoals stramien- en hartlijnen op een constructietekening
+   (issue #103): lange streep, tussenruimte, stip, tussenruimte, in
+   schermpixels. Hetzelfde patroon als 3D: lib/stramienStreepStip.ts
+   (test-stramien-streepstip.mjs houdt ze gelijk). */
+.fem-stramien-line {
+  stroke: #ffb000;
+  stroke-width: 1;
+  opacity: 0.35;
+  stroke-dasharray: 16 4 2 4;
+}
+.fem-stramien-bubble {
+  fill: var(--theme-bg);
+  stroke: #ffb000;
+  stroke-width: 1.5;
+}
+.fem-stramien-label {
+  font: 600 11px/1 "Inter", system-ui, sans-serif;
+  fill: #ffb000;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+/* Peilmaat (absolute Z-elevation) links en rechts van elk niveau. 12,5 px
+   (issue #48; was 10,5): leesbaar en aan te wijzen bij elke zoomstand. De
+   lettergrootte staat ook in lib/peilmaat.ts (PEILMAAT_FONT_PX) voor het
+   klikvlak. */
+.fem-stramien-elev {
+  font: 500 12.5px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text-secondary);
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+.fem-stramien-elev-left  { text-anchor: end; }
+.fem-stramien-elev-right { text-anchor: start; }
+
+/* Peilmaat-driehoekje op de niveaulijn (bouwkundige conventie). */
+.fem-peil-driehoek {
+  fill: var(--theme-text-secondary);
+  stroke: none;
+  pointer-events: none;
+}
+
+/* Klikbare peilmaat (issue #48): het vlak achter tekst en driehoekje is het
+   klikvlak; bij hover en zolang de invoer open staat krijgt het de
+   accentrand van de maatlijnlabels. */
+.fem-peilmaat-vlak {
+  fill: transparent;
+  stroke: none;
+  pointer-events: none;
+}
+.fem-peilmaat.bewerkbaar { cursor: pointer; }
+.fem-peilmaat.bewerkbaar .fem-peilmaat-vlak { pointer-events: all; }
+.fem-peilmaat.bewerkbaar:hover .fem-peilmaat-vlak,
+.fem-peilmaat.actief .fem-peilmaat-vlak {
+  fill: var(--theme-accent-soft, var(--theme-hover));
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+}
+.fem-peilmaat.bewerkbaar:hover .fem-stramien-elev,
+.fem-peilmaat.actief .fem-stramien-elev { fill: var(--theme-text); }
+.fem-peilmaat.bewerkbaar:hover .fem-peil-driehoek,
+.fem-peilmaat.actief .fem-peil-driehoek { fill: var(--theme-accent); }
+
+/* Melding in een invoer-popover (bv. "er ligt al een niveau op …"). */
+.fem-popover-fout { color: var(--theme-danger-color); font-size: 11px; }
+
+/* + button for adding a new stramien axis from the canvas. */
+.fem-stramien-plus { cursor: pointer; pointer-events: auto; }
+.fem-stramien-plus circle {
+  fill: var(--theme-bg-lighter);
+  stroke: #ffb000;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 2;
+  transition: fill 0.1s, stroke-dasharray 0.1s;
+}
+.fem-stramien-plus text {
+  font: 600 16px/1 "Inter", system-ui, sans-serif;
+  fill: #ffb000;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+.fem-stramien-plus:hover circle {
+  fill: #ffb000;
+  stroke-dasharray: none;
+}
+.fem-stramien-plus:hover text {
+  fill: var(--theme-bg);
+}
+
+/* − button to remove a stramien axis. Subtler than +, red-ish on hover. */
+.fem-stramien-minus { cursor: pointer; pointer-events: auto; opacity: 0.4; }
+.fem-stramien-minus circle {
+  fill: var(--theme-bg-lighter);
+  stroke: var(--theme-text-secondary);
+  stroke-width: 1;
+}
+.fem-stramien-minus text {
+  font: 700 12px/1 "Inter", system-ui, sans-serif;
+  fill: var(--theme-text-secondary);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+.fem-stramien-minus:hover {
+  opacity: 1;
+}
+.fem-stramien-minus:hover circle {
+  fill: #dc2626;
+  stroke: #dc2626;
+}
+.fem-stramien-minus:hover text {
+  fill: white;
+}
+
+/* ── Dimensions (maatvoering) between stramien axes ─────────────────── */
+.fem-dim-line {
+  stroke: var(--theme-text-secondary);
+  stroke-width: 0.8;
+}
+/* Snijpunt maatlijn × stramienlijn: open cirkeltje. De vulling is de
+   canvas-achtergrond zodat de maatlijn er niet doorheen loopt. */
+.fem-dim-knoop {
+  fill: var(--theme-bg);
+  stroke: var(--theme-text-secondary);
+  stroke-width: 1.1;
+}
+/* Achtergrond van het maat-label — volledig dekkend zodat de tekst leesbaar
+   blijft waar hij over de maatlijn of een stramienlijn valt. */
+.fem-dim-label-bg {
+  fill: var(--theme-bg);
+  stroke: var(--theme-border);
+  stroke-width: 0.5;
+}
+.fem-dim-text {
+  font: 500 10.5px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+/* Clickable dim-label group → opens popover to edit the distance. */
+.fem-dim-label-group { cursor: pointer; pointer-events: auto; }
+.fem-dim-label-group:hover .fem-dim-label-bg {
+  fill: var(--theme-accent-soft, var(--theme-hover));
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+}
+
+/* ── Assenstelsel-widget (linksboven): +X, +Z en My+ boogpijl ───────── */
+.fem-coord-widget {
+  background: var(--theme-bg);
+}
+
+/* ── Unity-check-badges op staafmidden (klik → toetsingspaneel) ─────── */
+.fem-uc-badge {
+  cursor: pointer;
+}
+.fem-uc-badge-text {
+  font: 700 11.5px/1 "JetBrains Mono", monospace;
+  fill: #ffffff;
+  text-anchor: middle;
+  pointer-events: none;
+}
+.fem-uc-badge rect {
+  stroke: var(--theme-bg);
+  stroke-width: 1.5;
+}
+.fem-uc-badge:hover rect {
+  stroke: var(--theme-accent);
+}
+
+/* ── Maatgevende positie uit het toetsingspaneel (issue #41) ─────────── */
+.fem-maatgevend-ring {
+  fill: none;
+  stroke: var(--theme-accent);
+  stroke-width: 2.5;
+}
+.fem-maatgevend-kruis {
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+}
+.fem-maatgevend-label {
+  fill: var(--theme-surface);
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+}
+.fem-maatgevend-tekst {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  fill: var(--theme-text);
+  text-anchor: middle;
+}
+
+/* ── Drag ghost preview ─────────────────────────────────────────────── */
+.fem-node-ghost {
+  fill: var(--theme-accent);
+  fill-opacity: 0.45;
+  stroke: var(--theme-accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 2 2;
+}
+.fem-member-ghost {
+  stroke: var(--theme-accent);
+  stroke-width: 2;
+  opacity: 0.5;
+  stroke-dasharray: 4 3;
+}
+
+/* ── Box-select rubber-band ─────────────────────────────────────────── */
+/* CAD: venster (van links naar rechts) doorgetrokken; crossing (van rechts
+   naar links) gestippeld met een lichtere vulling. Kleuren per thema. */
+.fem-box-select {
+  fill: var(--theme-select-window-fill);
+  stroke: var(--theme-select-window-stroke);
+  stroke-width: 1;
+}
+.fem-box-select.crossing {
+  fill: var(--theme-select-crossing-fill);
+  stroke: var(--theme-select-crossing-stroke);
+  stroke-dasharray: 5 3;
+}
+
+/* ── Axis-lock helper line (G + X / Z) ──────────────────────────────── */
+.fem-axis-lock {
+  stroke: #ffb000;
+  stroke-width: 1;
+  opacity: 0.6;
+  stroke-dasharray: 4 4;
+}
+
+/* ── Right-click context menu ───────────────────────────────────────── */
+.fem-context-menu {
+  position: absolute;
+  z-index: 100;
+  background: var(--theme-bg-lighter);
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+}
+.fem-context-menu button {
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--theme-text);
+  font: 400 12px/1.4 "Inter", system-ui, sans-serif;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.fem-context-menu button:hover {
+  background: rgba(255, 176, 0, 0.10);
+  color: var(--theme-accent);
+}
+
+/* ── Scharnierbolletje op de staaf ───────────────────────────────────── */
+/* Een klein OPEN cirkeltje net naast de knoop, aan de kant waar de
+   rotatie-release zit. Open (gevuld met de achtergrondkleur) zodat de
+   staaflijn er zichtbaar onderdoor loopt — dat leest als "hier is de
+   verbinding onderbroken". */
+.fem-scharnier {
+  fill: var(--theme-bg);
+  stroke: var(--theme-text);
+  stroke-width: 1.3;
+}
+
+/* ── Profielnaam langs de staaf ──────────────────────────────────────── */
+/* Klein en gedempt: het is een aanduiding, geen resultaat. Meegedraaid met
+   de staaf en altijd leesbaar (nooit ondersteboven) — zie renderProfielLabel. */
+.fem-beam-profiel {
+  fill: var(--theme-text-secondary);
+  font: 500 9px/1 "Inter", system-ui, sans-serif;
+  letter-spacing: 0.2px;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+}
+
+/* ── Kipsteunen langs de staaf (issue #40) ───────────────────────────── */
+/* Tekstkleur, zoals de scharnierbolletjes: staven en opleggingen staan al in
+   de accentkleur, en een symbool van een paar pixels in dezelfde kleur valt
+   tegen de staaflijn weg. Gevuld = een steun op een opgegeven positie; open =
+   een steun die uit de kipsteunafstand van hout volgt; het vorkje is de gaffel
+   die de toets aan een staafeind aanneemt. De maatketting (een hulplijn, geen
+   deel van het model) staat wel in de accentkleur, zoals de andere maten. */
+.fem-kipsteun {
+  fill: var(--theme-text);
+  stroke: var(--theme-bg);
+  stroke-width: 0.8;
+  stroke-linejoin: round;
+}
+.fem-kipsteun-open {
+  fill: var(--theme-bg);
+  stroke: var(--theme-text);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+}
+.fem-kipsteun-gaffel {
+  fill: none;
+  stroke: var(--theme-text);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  /* Een dunne lijn is met de muis niet te raken; de tooltip hoort er wel bij. */
+  pointer-events: stroke;
+}
+.fem-kipveld-lijn {
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  fill: none;
+}
+.fem-kipveld-tekst {
+  fill: var(--theme-accent);
+  font: 600 10px/1 "Inter", system-ui, sans-serif;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+.fem-kipveld-bijschrift {
+  fill: var(--theme-text-secondary);
+  font: 500 9px/1 "Inter", system-ui, sans-serif;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+/* ── Maat intypen tijdens het tekenen van een staaf ──────────────────── */
+.fem-maat-punt {
+  fill: var(--theme-bg);
+  stroke: var(--theme-accent);
+  stroke-width: 1.6;
+}
+.fem-maat-label {
+  fill: var(--theme-accent);
+  font: 600 11px/1 "Inter", system-ui, sans-serif;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+/* ── Modelcontrole (paneel rechtsonder) ──────────────────────────────── */
+.fem-controle-kaart {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  max-width: 460px;
+  padding: 6px 8px;
+}
+.fem-controle-kaart.fout {
+  border-color: #dc2626;
+}
+.fem-controle-kop {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--theme-text);
+  font: 600 11px/1.3 "Inter", system-ui, sans-serif;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+.fem-controle-merk {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #dc2626;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.fem-controle-kaart:not(.fout) .fem-controle-merk {
+  background: var(--theme-accent);
+  color: var(--theme-bg);
+}
+.fem-controle-chevron {
+  margin-left: auto;
+  opacity: 0.6;
+}
+.fem-controle-lijst {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.fem-controle-regel {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font: 400 11px/1.4 "Inter", system-ui, sans-serif;
+  color: var(--theme-text);
+  border-left: 2px solid #dc2626;
+  padding-left: 6px;
+}
+.fem-controle-regel.waarschuwing {
+  border-left-color: var(--theme-accent);
+  opacity: 0.85;
+}
+.fem-controle-tekst {
+  flex: 1;
+}
+.fem-controle-fix {
+  flex-shrink: 0;
+  background: var(--theme-accent);
+  border: 1px solid var(--theme-accent);
+  border-radius: 3px;
+  color: var(--theme-bg);
+  font: 600 10px/1 "Inter", system-ui, sans-serif;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.fem-controle-fix:hover {
+  filter: brightness(1.08);
+}
+.fem-controle-alles {
+  align-self: flex-end;
+  margin-top: 2px;
+}
+
+/* ── Verlopende staaf: de omtrek van de doorsnede (ontwerp 15-09-2026) ────
+   Alleen een staaf met een eindprofiel krijgt deze wig; een prismatische
+   staaf blijft precies de lijn die hij altijd was. De vulling is licht en de
+   rand dun, zodat de systeemlijn, de scharnierbolletjes en de
+   snedekrachtendiagrammen er doorheen blijven staan. */
+.fem-member-verloop {
+  fill: var(--theme-accent);
+  fill-opacity: 0.12;
+  stroke: var(--theme-accent);
+  stroke-opacity: 0.55;
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+
+/* ── Aanzicht op ware grootte (issue #45) ────────────────────────────────
+   Het vlak is DEKKEND (de achtergrond van het tekenvlak met een zweem van de
+   materiaalkleur), zodat een ligger die over een kolom ligt de kolomlijnen
+   daar afdekt. Lijnen in de tekstkleur van het thema: de materiaalkleuren
+   zijn licht in elk thema en gaan op een donker tekenvlak alleen als tint. De
+   systeemlijn wordt een dunne streep-stippellijn (hartlijn), in de
+   accentkleur, en blijft de lijn waarmee je selecteert en sleept. */
+.fem-aanzicht-vlak {
+  fill: color-mix(in srgb, var(--theme-text) 6%, var(--theme-bg));
+  stroke: none;
+}
+.fem-aanzicht-hout .fem-aanzicht-vlak {
+  fill: color-mix(in srgb, var(--theme-hout-vlak) 32%, var(--theme-bg));
+}
+.fem-aanzicht-beton .fem-aanzicht-vlak {
+  fill: color-mix(in srgb, var(--theme-beton-vlak) 30%, var(--theme-bg));
+}
+.fem-aanzicht-contour {
+  stroke: var(--theme-text);
+  stroke-width: 1.2;
+  stroke-linecap: square;
+}
+.fem-aanzicht-staaf.geselecteerd .fem-aanzicht-contour {
+  stroke: var(--theme-accent);
+  stroke-width: 1.8;
+}
+.fem-aanzicht-zichtbaar {
+  stroke: var(--theme-text);
+  stroke-width: 0.8;
+  stroke-opacity: 0.8;
+}
+.fem-aanzicht-verborgen {
+  stroke: var(--theme-text-secondary);
+  stroke-width: 0.8;
+  stroke-dasharray: 5 3;
+}
+.fem-aanzicht-lamel {
+  stroke: var(--theme-text-secondary);
+  stroke-width: 0.5;
+  stroke-opacity: 0.7;
+}
+.fem-aanzicht-wapening {
+  stroke: var(--theme-text);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.fem-aanzicht-beugel {
+  stroke: var(--theme-text-secondary);
+  stroke-width: 0.6;
+}
+.fem-member.systeemlijn {
+  stroke-width: 1.2;
+  stroke-dasharray: 14 3 2 3;
+}
+.fem-member.systeemlijn:hover { stroke-width: 2; }
+.fem-member.systeemlijn.selected,
+.fem-member.systeemlijn.snap { stroke-width: 2.2; }
+
+/* ── Venster Zichtbaarheid (issue #47) ──────────────────────────────────── */
+/* Staafnummer "(3)" naast de profielnaam: cursief en gedempt, zoals in de
+   constructieschets van het rapport. */
+.fem-beam-nummer {
+  fill: var(--theme-text-secondary);
+  font: italic 600 10px/1 "Inter", system-ui, sans-serif;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+}
+/* Profielbreedte b bij het aanzicht, aan de andere kant dan de profielnaam. */
+.fem-aanzicht-breedte {
+  fill: var(--theme-text-secondary);
+  font: 500 9px/1 "JetBrains Mono", monospace;
+  dominant-baseline: central;
+  paint-order: stroke;
+  stroke: var(--theme-bg);
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+}
+/* "Belastingwaarden" uit: de pijlen blijven, de getallen niet. */
+.fem-loads-layer.zonder-waarden .fem-load-text,
+.fem-loads-layer.zonder-waarden .fem-load-text-static { display: none; }
+
+/* ── Profielen in kleur (lib/profielKleur.ts) ─────────────────────────────
+   De profielkleur vervangt de accentkleur van de staaflijn; voorbij acht
+   profielen komt de lijnsoort erbij (streep, stip). De selectie en de
+   snap-markering gaan voor, en met het aanzicht aan houdt de systeemlijn haar
+   eigen streep-stippellijn. */
+.fem-member.profielkleur { stroke: var(--fem-profielkleur); }
+.fem-member.profielkleur:not(.systeemlijn) { stroke-dasharray: var(--fem-profielstreep, none); }
+.fem-member.profielkleur.selected { stroke: var(--theme-accent-hover); }
+.fem-member.profielkleur.snap { stroke: var(--theme-accent-hover, var(--theme-accent)); }
+
+/* Rechtsonder één kolom: legenda boven, modelcontrole onder. Nooit hoger dan
+   het tekenvlak min de kaarten rechtsboven (aantallen, zoom). */
+.fem-hud-kolom {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-height: calc(100% - 96px);
+}
+.fem-hud-kolom > .profiel-legenda { flex: 0 1 auto; }
+.fem-hud-kolom > .fem-controle-kaart { flex: 0 0 auto; }
+
+/* Een q-waarde direct op het tekenvlak bewerken (#52): het veld staat op de
+   plek van het getal, met de eenheid en wat een negatieve waarde betekent. */
+.fem-q-bewerking {
+  position: absolute;
+  z-index: 20;
+  transform: translate(-6px, -24px);
+  padding: 5px 7px;
+  border: 1px solid var(--theme-accent);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
+  color: var(--theme-text);
+  font: 500 11px/1.3 "Inter", system-ui, sans-serif;
+}
+.fem-q-bewerking-rij { display: flex; align-items: center; gap: 5px; }
+.fem-q-bewerking-naam { font-weight: 600; }
+.fem-q-bewerking input {
+  width: 68px;
+  padding: 2px 5px;
+  border: 1px solid var(--theme-border);
+  border-radius: 3px;
+  background: var(--theme-bg);
+  color: var(--theme-text);
+  font: 600 12px/1.2 "JetBrains Mono", ui-monospace, monospace;
+}
+.fem-q-bewerking input:focus-visible { outline: 2px solid var(--theme-accent); outline-offset: 1px; }
+.fem-q-bewerking input[aria-invalid="true"] { border-color: var(--theme-danger-color); outline-color: var(--theme-danger-color); }
+.fem-q-bewerking-eenheid { color: var(--theme-text-muted); }
+.fem-q-bewerking-hint { margin-top: 3px; color: var(--theme-text-muted); font-size: 10px; white-space: nowrap; }

@@ -1,0 +1,259 @@
+import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+
+// @ts-expect-error process is a nodejs global
+const host = process.env.TAURI_DEV_HOST;
+
+const hier = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * De Rust-rekenkern (`toetsbrug`, JSON in/uit) bereikbaar maken vanuit de browser.
+ *
+ * In de desktop-app roept de frontend de kern aan via Tauri; in een gewone
+ * browser bestaat dat niet. Deze plug-in geeft de dev-server een eindpunt
+ * (`/api/toetsing`) dat dezelfde rekenkern aanroept.
+ *
+ * De bridge en Tauri-commands gebruiken dezelfde Rust-rekenkern, dus er ontstaat
+ * geen tweede implementatie: één rekenkern, twee manieren om hem te bereiken.
+ * Bouwen met `cargo build -p toetsbrug` in src-tauri; een nieuwere release-
+ * of debugbinary wordt per verzoek gekozen. (Met `--bin`
+ * zoekt cargo de binary in het hoofdpakket en faalt met "no bin target named
+ * toetsbrug in default-run packages"; `-p` wijst het juiste pakket aan.)
+ */
+function toetsbrug(): Plugin {
+  // @ts-expect-error process is a nodejs global
+  const binary = process.platform === "win32" ? "toetsbrug.exe" : "toetsbrug";
+  const release = resolve(hier, "../src-tauri/target/release", binary);
+  const debug = resolve(hier, "../src-tauri/target/debug", binary);
+
+  return {
+    name: "openaec-toetsbrug",
+    configureServer(server) {
+      server.middlewares.use("/api/toetsing", (req, res) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ fout: "alleen POST" }));
+          return;
+        }
+        // Choose per request: a Rust rebuild must take effect without restarting Vite.
+        const exe = existsSync(debug) && (!existsSync(release) || statSync(debug).mtimeMs > statSync(release).mtimeMs)
+          ? debug : release;
+        if (!existsSync(exe)) {
+          res.statusCode = 503;
+          res.setHeader("content-type", "application/json");
+          res.end(
+            JSON.stringify({
+              fout:
+                "De rekenkern is nog niet gebouwd. Draai in src-tauri: " +
+                "cargo build -p toetsbrug (of cargo build --release -p toetsbrug)",
+            }),
+          );
+          return;
+        }
+
+        const bodyChunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
+        req.on("end", () => {
+          const kind = spawn(exe, [], { stdio: ["pipe", "pipe", "pipe"] });
+          const outputChunks: Buffer[] = [];
+          const errorChunks: Buffer[] = [];
+          kind.stdout.on("data", (chunk: Buffer) => outputChunks.push(chunk));
+          kind.stderr.on("data", (chunk: Buffer) => errorChunks.push(chunk));
+          kind.on("error", (e) => {
+            res.statusCode = 500;
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ fout: `rekenkern start niet: ${e.message}` }));
+          });
+          kind.on("close", (code) => {
+            res.setHeader("content-type", "application/json");
+            if (outputChunks.length > 0) {
+              // De brug schrijft ook fouten als JSON, dus afsluitcode 1 mét
+              // inhoud is een nette foutmelding en geen crash.
+              res.statusCode = code === 0 ? 200 : 400;
+              res.end(Buffer.concat(outputChunks));
+            } else {
+              res.statusCode = 500;
+              res.end(
+                JSON.stringify({ fout: Buffer.concat(errorChunks).toString() || `rekenkern stopte met code ${code}` }),
+              );
+            }
+          });
+          kind.stdin.end(Buffer.concat(bodyChunks));
+        });
+      });
+    },
+  };
+}
+
+/**
+ * Doorsnedemotor bereikbaar maken vanuit de browser — voor de profieleditor.
+ *
+ * De eigenschappen van een eigen doorsnede (samenstelling uit lamellen, of een
+ * catalogusprofiel met een gat) komen uit dezelfde Rust-motor die ook de
+ * profieldatabase heeft gegenereerd (`doorsnedemotor`, JSON-in/JSON-uit).
+ * Zelfde patroon als de toetsbrug hierboven: één rekenkern, geen tweede
+ * implementatie in TypeScript. Bouwen met
+ * `cargo build --release -p section-properties --bin doorsnedemotor` in src-tauri.
+ *
+ * De motor leest een JSON-array van geometrieën op stdin en schrijft een
+ * JSON-array met eigenschappen op stdout; een fout gaat naar stderr met
+ * afsluitcode 2. Dit eindpunt vertaalt dat naar `{ fout }` met status 400.
+ */
+function doorsnedemotor(): Plugin {
+  const exe = resolve(
+    hier,
+    "../src-tauri/target/release",
+    // @ts-expect-error process is a nodejs global
+    process.platform === "win32" ? "doorsnedemotor.exe" : "doorsnedemotor",
+  );
+
+  return {
+    name: "openaec-doorsnedemotor",
+    configureServer(server) {
+      server.middlewares.use("/api/doorsnede", (req, res) => {
+        res.setHeader("content-type", "application/json");
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ fout: "alleen POST" }));
+          return;
+        }
+        if (!existsSync(exe)) {
+          res.statusCode = 503;
+          res.end(
+            JSON.stringify({
+              fout:
+                "De doorsnedemotor is nog niet gebouwd. Draai in src-tauri: " +
+                "cargo build --release -p section-properties --bin doorsnedemotor",
+            }),
+          );
+          return;
+        }
+
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          const kind = spawn(exe, [], { stdio: ["pipe", "pipe", "pipe"] });
+          let uit = "";
+          let fout = "";
+          kind.stdout.on("data", (d) => (uit += d));
+          kind.stderr.on("data", (d) => (fout += d));
+          kind.on("error", (e) => {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ fout: `doorsnedemotor start niet: ${e.message}` }));
+          });
+          kind.on("close", (code) => {
+            if (code === 0 && uit) {
+              res.statusCode = 200;
+              res.end(uit);
+            } else {
+              res.statusCode = code === 2 ? 400 : 500;
+              res.end(
+                JSON.stringify({
+                  fout: fout.trim() || `doorsnedemotor stopte met code ${code}`,
+                }),
+              );
+            }
+          });
+          kind.stdin.end(body);
+        });
+      });
+    },
+  };
+}
+
+/**
+ * Dezelfde 3D-Rustadapter als de desktop-app, bereikbaar in de devbrowser.
+ * Parameters: pluginnaam, URL-route en binarynaam (zonder .exe). Twee kernen:
+ * open-fem-3d (Open FEM 3D, /api/openFem3d/solve) en frame3d-solver
+ * (3D-raamwerkomgeving frame3d, /api/frame3d/solve).
+ */
+function rust3dSolver(pluginNaam: string, route: string, binaryNaam: string): Plugin {
+  // Tijdens ontwikkeling kan de debug-kern recenter zijn dan een bestaande
+  // release-kern. Gebruik het nieuwste contract; anders vallen nieuwe
+  // staafbelastingen in de browser stil terug op een verouderde binary.
+  // @ts-expect-error process is a nodejs global
+  const binary = process.platform === "win32" ? `${binaryNaam}.exe` : binaryNaam;
+  const release = resolve(hier, "../src-tauri/target/release", binary);
+  const debug = resolve(hier, "../src-tauri/target/debug", binary);
+  const exe = existsSync(debug) && (!existsSync(release) || statSync(debug).mtimeMs > statSync(release).mtimeMs)
+    ? debug : release;
+  return {
+    name: pluginNaam,
+    configureServer(server) {
+      server.middlewares.use(route, (req, res) => {
+        res.setHeader("content-type", "application/json");
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end(JSON.stringify({ fout: "alleen POST" }));
+          return;
+        }
+        if (!existsSync(exe)) {
+          res.statusCode = 503;
+          res.end(JSON.stringify({ fout: "De 3D-rekenkern is nog niet gebouwd." }));
+          return;
+        }
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          const child = spawn(exe, [], { stdio: ["pipe", "pipe", "pipe"] });
+          let output = "";
+          let error = "";
+          child.stdout.on("data", (data) => (output += data));
+          child.stderr.on("data", (data) => (error += data));
+          child.on("error", (cause) => {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ fout: `3D-rekenkern start niet: ${cause.message}` }));
+          });
+          child.on("close", (code) => {
+            res.statusCode = code === 0 && output ? 200 : code === 1 ? 400 : 500;
+            res.end(output || JSON.stringify({ fout: error.trim() || `3D-rekenkern stopte met code ${code}` }));
+          });
+          child.stdin.end(body);
+        });
+      });
+    },
+  };
+}
+
+
+// https://vite.dev/config/
+export default defineConfig(async () => ({
+  plugins: [
+    react(), toetsbrug(), doorsnedemotor(),
+    rust3dSolver("open-fem-3d-solver", "/api/openFem3d/solve", "open-fem-3d"),
+    rust3dSolver("open-fem-frame3d-solver", "/api/frame3d/solve", "frame3d-solver"),
+  ],
+
+  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+  //
+  // 1. prevent Vite from obscuring rust errors
+  clearScreen: false,
+  // 2. tauri expects a fixed port, fail if that port is not available
+  server: {
+    port: 1440,
+    strictPort: true,
+    host: host || false,
+    hmr: host
+      ? {
+          protocol: "ws",
+          host,
+          port: 1421,
+        }
+      : undefined,
+    watch: {
+      // De desktop-app en de editor kunnen in verschillende mount namespaces draaien;
+      // polling pikt ook wijzigingen op die geen inotify-event doorgeven.
+      usePolling: true,
+      interval: 300,
+      // 3. tell Vite to ignore watching `src-tauri`
+      // 4. ignore the ts-rs generated types — `cargo test` rewrites them on
+      //    every run, which would otherwise cause an HMR flicker storm.
+      ignored: ["**/src-tauri/**", "**/src/lib/types/**"],
+    },
+  },
+}));

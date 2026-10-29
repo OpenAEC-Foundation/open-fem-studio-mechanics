@@ -1,0 +1,132 @@
+/**
+ * rekenInstellingen — de "versie" van alles buiten het model zelf dat de
+ * uitkomst van een berekening bepaalt.
+ *
+ * WAAROM DIT BESTAAT
+ * Resultaten en unity checks werden alleen gewist als knopen, staven,
+ * opleggingen, lasten of platen veranderden. Na een wijziging van een
+ * combinatiefactor, het type van een belastinggeval, het eigen gewicht, de
+ * scheefstand, het analysetype of de segmentlengte bleven de oude UC-badges en
+ * "Berekend om" gewoon staan. Gemeten in de draaiende app: Q-factor in 6.10b van
+ * 1,5 naar 3,0 — badges ongewijzigd; pas na Berekenen hout 0,39 → 0,56. Het
+ * rapport en de IFC-export kregen de oude getallen naast de nieuwe
+ * uitgangspunten.
+ *
+ * Er waren TWEE invalidatie-effecten (in `App.tsx` en in `useFemStore.ts`) met
+ * elk een eigen, handgeschreven lijst afhankelijkheden, en beide misten
+ * dezelfde velden. Een derde lijst naast die twee zou dezelfde fout opnieuw
+ * mogelijk maken. Daarom één versie die beide effecten lezen.
+ *
+ * WAAROM EEN NIEUW VELD NIET VERGETEN KAN WORDEN
+ * `VELDEN` is een `Record<keyof RekenInstellingen, true>`: voeg je een veld
+ * toe aan de interface zonder het hier te noemen, dan compileert dit bestand
+ * niet meer. En elke aanroeper moet elk veld opgeven, want ze zijn verplicht.
+ *
+ * Een wijziging die de uitkomst NIET verandert (bijvoorbeeld een andere naam
+ * van een belastinggeval) kan hier ook een nieuwe versie geven. Dat kost
+ * hooguit een herberekening; een vergeten veld kost een verkeerde UC.
+ */
+import type { Analysetype, LoadCase } from "../components/fem/femTypes";
+import type { LoadCombination } from "../components/fem/solver/combinations";
+import type { ScheefstandBron } from "./scheefstandNorm";
+import type { KruipInvoerProject } from "./kruipInvoer";
+
+/** Alles buiten de modelgeometrie en de lasten dat de uitkomst bepaalt. */
+export interface RekenInstellingen {
+  /** Type per geval bepaalt de standaardcombinaties en waar het eigen gewicht landt. */
+  loadCases: readonly LoadCase[];
+  /** De factoren per combinatie (6.10a/b, 6.14b–6.16b). */
+  combinations: readonly LoadCombination[];
+  selfWeightEnabled: boolean;
+  analysetype: Analysetype;
+  axialMaterialLoadPath?: readonly number[];
+  /** Segmentlengte van de fysisch niet-lineaire betonberekening. */
+  betonSegmentLengteMm: number;
+  /**
+   * φ(∞,t₀) van het project (art. 3.1.4), of `null` als hij niet is opgegeven.
+   * Hij bepaalt via 5.8.6(4)/(7.20) de effectieve elasticiteitsmodulus en
+   * daarmee ELKE betonstijfheid; een wijziging moet de resultaten dus laten
+   * vervallen, net als de segmentlengte.
+   */
+  betonKruipcoefficient: number | null;
+  /**
+   * De projectinvoer voor φ(∞,t₀) volgens bijlage B (RH, t₀, cementklasse),
+   * of `null` als bijlage B uit staat. Zonder opgegeven φ bepaalt zij de
+   * kruipcoëfficiënt van elke betonstaaf, dus een wijziging laat de
+   * resultaten vervallen.
+   */
+  betonKruipInvoer: KruipInvoerProject | null;
+  scheefstandEnabled: boolean;
+  scheefstandNoemer: number;
+  scheefstandRichting: 1 | -1;
+  scheefstandBron: ScheefstandBron;
+  scheefstandHoogteM: number | null;
+  scheefstandAantalElementen: number | null;
+  /** 3D (issue #212): handmatige m_X en m_Y, en de torsievarianten van 5.3.2(10). */
+  scheefstandAantalX: number | null;
+  scheefstandAantalY: number | null;
+  scheefstandTorsie: boolean;
+  /** 2D en 3D (issue #199, fase 3): de eigen scheefstand per losse kolom in de UGT-toets. */
+  scheefstandEigenKolom: boolean;
+  /** 2D (issue #199, fase 4): hout in de UGT-toets volgens NEN-EN 1995-1-1 (E_d, boogimperfectie). */
+  houtToetsEN1995: boolean;
+  /**
+   * Gevolgklasse, CC1/CC2/CC3: de klasse waarmee de standaardcombinaties
+   * rekenen (in de app die uit de projectinstellingen). Volgens NEN-EN 1990 NB
+   * tabel NB.4/NB.5 bepaalt zij de partiële factoren, en de staalkern krijgt
+   * haar als `consequence_class`; een wijziging laat de resultaten vervallen.
+   * `null` = niet ingesteld.
+   */
+  gevolgklasse: string | null;
+  /**
+   * Nationale bijlage, vandaag alleen "NL": de bijlage waarmee de rekenkernen
+   * toetsen. Zij bepaalt de nationaal bepaalde parameters — γ_M, k_cr, de
+   * doorbuigingsgrenzen, de dekkingseisen, de kipmethode — en gaat als
+   * `bijlage` mee in elke toetsinvoer. Een wijziging laat de resultaten dus
+   * vervallen, net als bij de gevolgklasse. `null` = niet ingesteld; de kern
+   * houdt dan de enige gevulde bijlage aan.
+   */
+  nationaleBijlage: string | null;
+}
+
+/** Elk veld van `RekenInstellingen` — zie de kop voor waarom dit een Record is. */
+const VELDEN: Record<keyof RekenInstellingen, true> = {
+  loadCases: true,
+  combinations: true,
+  selfWeightEnabled: true,
+  analysetype: true,
+  axialMaterialLoadPath: true,
+  betonSegmentLengteMm: true,
+  betonKruipcoefficient: true,
+  betonKruipInvoer: true,
+  scheefstandEnabled: true,
+  scheefstandNoemer: true,
+  scheefstandRichting: true,
+  scheefstandBron: true,
+  scheefstandHoogteM: true,
+  scheefstandAantalElementen: true,
+  scheefstandAantalX: true,
+  scheefstandAantalY: true,
+  scheefstandTorsie: true,
+  scheefstandEigenKolom: true,
+  houtToetsEN1995: true,
+  gevolgklasse: true,
+  nationaleBijlage: true,
+};
+
+/** De veldnamen, voor tests die elk veld afzonderlijk willen wijzigen. */
+export const REKENINSTELLINGEN_VELDEN = Object.keys(VELDEN) as (keyof RekenInstellingen)[];
+
+/**
+ * Een tekst die verandert zodra één van de instellingen verandert. Maps (de
+ * factoren van een combinatie) worden als gesorteerde paren geschreven, zodat
+ * de volgorde waarin factoren zijn gezet niet meetelt.
+ */
+export function rekenInstellingenVersie(instellingen: RekenInstellingen): string {
+  const geordend = REKENINSTELLINGEN_VELDEN.map((k) => [k, instellingen[k]] as const);
+  return JSON.stringify(geordend, (_sleutel, waarde) =>
+    waarde instanceof Map
+      ? [...waarde.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      : waarde,
+  );
+}

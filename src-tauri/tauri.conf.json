@@ -1,0 +1,104 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Open FEM Studio Mechanics",
+  "version": "2026.44.0",
+  "identifier": "org.openaec.fem-studio-mechanics",
+  "build": {
+    "frontendDist": "../design-mockup/dist",
+    "devUrl": "http://localhost:1440",
+    "beforeDevCommand": "cd design-mockup && npm run dev",
+    "beforeBuildCommand": "cd design-mockup && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Open FEM Studio Mechanics",
+        "label": "main",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 600,
+        "decorations": false,
+        "resizable": true,
+        "fullscreen": false,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; connect-src 'self' https://nominatim.openstreetmap.org http://localhost:* ws://localhost:1440 ws://127.0.0.1:1440 ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "msi",
+      "nsis",
+      "deb",
+      "appimage",
+      "app",
+      "dmg"
+    ],
+    "windows": {
+      "wix": {
+        "version": "26.42.0"
+      },
+      "nsis": {
+        "installerHooks": "./windows/installer-hooks.nsh"
+      },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      }
+    },
+    "resources": [
+      "WebView2Loader.dll"
+    ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "ifcfem"
+        ],
+        "name": "OpenFEMStudioMechanics.Project",
+        "description": "Open FEM Studio Mechanics-project",
+        "role": "Editor",
+        "rank": "Alternate",
+        "mimeType": "application/x-ifcfem",
+        "exportedType": {
+          "identifier": "org.openaec.fem-studio-mechanics.ifcfem",
+          "conformsTo": [
+            "public.json"
+          ]
+        }
+      },
+      {
+        "ext": [
+          "ifcfem2d"
+        ],
+        "name": "OpenFEMStudioMechanics.Project2D",
+        "description": "Open FEM Studio Mechanics 2D-project (oudere extensie)",
+        "role": "Editor",
+        "rank": "Alternate",
+        "mimeType": "application/x-ifcfem2d",
+        "exportedType": {
+          "identifier": "org.openaec.fem-studio-mechanics.ifcfem2d",
+          "conformsTo": [
+            "public.json"
+          ]
+        }
+      }
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "OpenAEC Foundation",
+    "copyright": "© 2026 OpenAEC Foundation. AGPL-3.0-or-later",
+    "category": "Productivity",
+    "shortDescription": "Finite element program for structural mechanics (2D and 3D)",
+    "longDescription": "Open FEM Studio Mechanics — open-source finite element program (2D and 3D) for structural mechanics, without code checking. Part of the OpenAEC Foundation portfolio."
+  },
+  "plugins": {}
+}

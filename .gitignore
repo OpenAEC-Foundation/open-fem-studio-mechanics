@@ -1,0 +1,9 @@
+node_modules/
+dist/
+__pycache__/
+/src-tauri/target
+/src-tauri/gen
+# The MCP server binary for the installer (built by scripts/mcp-sidecar.mjs)
+src-tauri/binaries/
+# Unaccepted insta snapshots
+*.snap.new

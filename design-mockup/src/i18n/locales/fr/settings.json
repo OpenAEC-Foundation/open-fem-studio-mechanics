@@ -1,0 +1,150 @@
+{
+  "title": "Paramètres",
+  "resetToDefaults": "Rétablir les valeurs par défaut",
+  "resetConfirm": "Voulez-vous vraiment rétablir tous les paramètres à leurs valeurs par défaut ?",
+  "tabs": {
+    "general": "Général",
+    "appearance": "Apparence",
+    "calculation": "Calcul",
+    "aiAssistant": "Assistant IA (MCP)",
+    "editor": "Éditeur",
+    "files": "Fichiers",
+    "shortcuts": "Raccourcis",
+    "plugins": "Extensions",
+    "about": "À propos"
+  },
+  "general": {
+    "application": "Application",
+    "language": "Langue",
+    "startup": "Démarrage",
+    "restoreSession": "Restaurer la dernière session au démarrage",
+    "checkUpdates": "Vérifier automatiquement les mises à jour",
+    "author": "Auteur",
+    "authorName": "Nom de l'auteur"
+  },
+  "appearance": {
+    "theme": "Thème",
+    "themeDescription": "Choisissez un thème de couleurs pour l'application.",
+    "light": "Clair",
+    "dark": "Sombre",
+    "blueprint": "Blueprint",
+    "highContrastDark": "Contraste élevé sombre",
+    "highContrastLight": "Contraste élevé clair",
+    "font": "Police",
+    "uiFontSize": "Taille de police de l'interface"
+  },
+  "calculation": {
+    "engine": "Moteur de calcul",
+    "solver": "Solveur",
+    "automatic": "Automatique (recommandé)",
+    "automaticDescription": "Open FEM sélectionne automatiquement un solveur disponible qui prend en charge l'analyse complète.",
+    "manualDescription": "{{solver}} est utilisé lorsqu'il prend en charge l'analyse demandée.",
+    "available": "Disponible",
+    "unavailable": "Pas encore inclus",
+    "license": "Licence",
+    "version": "Version",
+    "supports": "Prend en charge",
+    "adapterPending": "L'adaptateur Rust est enregistré et devient sélectionnable lorsqu'il est livré avec l'application.",
+    "analysis": {
+      "linear": "linéaire",
+      "p-delta": "second ordre P-Δ",
+      "material-nonlinear": "matériel non linéaire"
+    },
+    "elements": {
+      "frame": "ossature",
+      "plate": "plaque",
+      "solid": "volume"
+    }
+  },
+  "editor": {
+    "general": "Général",
+    "wordWrap": "Retour à la ligne",
+    "lineNumbers": "Afficher les numéros de ligne",
+    "minimap": "Afficher la minimap",
+    "indentation": "Indentation",
+    "tabSize": "Taille des tabulations",
+    "insertSpaces": "Insérer des espaces au lieu de tabulations",
+    "nSpaces": "{{count}} espaces"
+  },
+  "files": {
+    "autoSave": "Enregistrement automatique",
+    "autoSaveOption": "Enregistrement automatique",
+    "off": "Désactivé",
+    "afterDelay": "Après un délai",
+    "onFocusChange": "Au changement de focus",
+    "onWindowChange": "Au changement de fenêtre",
+    "encoding": "Encodage des fichiers",
+    "defaultEncoding": "Encodage par défaut",
+    "backup": "Sauvegarde",
+    "autoBackup": "Créer des sauvegardes automatiques"
+  },
+  "shortcuts": {
+    "placeholder": "La configuration des raccourcis apparaîtra ici."
+  },
+  "plugins": {
+    "placeholder": "La gestion des extensions apparaîtra ici."
+  },
+  "library": {
+    "title": "Bibliothèque",
+    "subtitle": "Bibliothèque — référence en lecture seule. Les valeurs proviennent de la base de profils et des tableaux normatifs (EN 338 / EN 14080) ; la modification n'est pas possible ici.",
+    "tabSections": "Profilés acier",
+    "tabMaterials": "Matériaux",
+    "search": "Rechercher…",
+    "noResults": "Aucun résultat pour ce filtre.",
+    "colName": "Nom",
+    "colA": "A [mm²]",
+    "colIy": "Iy [×10⁶ mm⁴]",
+    "colDims": "h × b × tw × tf [mm]",
+    "colFy": "fy [N/mm²]",
+    "colE": "E [N/mm²]",
+    "colEmean": "E₀,mean [N/mm²]",
+    "steelGroup": "Nuances d'acier (EN 1993)",
+    "timberGroup": "Classes de résistance du bois (EN 338 / EN 14080)"
+  },
+  "aiAssistant": {
+    "title": "Pilotage par un assistant IA",
+    "allow": "Autoriser le pilotage par un assistant IA (MCP)",
+    "allowDescription": "Après une nouvelle installation, le pilotage est activé. Vous pouvez le désactiver ici ; ce choix est conservé après une mise à jour. Un assistant IA comme Claude Desktop ou Claude Code peut alors piloter l'application via le serveur MCP fourni : créer des modèles, calculer, vérifier et produire des rapports. Seuls les programmes de cet ordinateur atteignent le canal, avec une clé renouvelée à chaque démarrage. Le choix s'applique immédiatement et est conservé ; Enregistrer ou Annuler n'y change rien.",
+    "statusActive": "Actif sur le port {{poort}}",
+    "statusOff": "Désactivé",
+    "statusFailed": "Non démarré : {{fout}}",
+    "statusEnv": "Activé pour cette session au démarrage (par un assistant IA via gui_start_app, ou avec OPENAEC_GUI_CONTROL=1) ; le paramètre enregistré est désactivé, le canal sera donc désactivé au prochain démarrage.",
+    "stopSession": "Désactiver maintenant",
+    "statusBrowser": "Disponible uniquement dans l'application de bureau.",
+    "busy": "En cours…",
+    "connect": "Connecter un assistant IA",
+    "server": "Serveur MCP",
+    "serverMissing": "Le serveur MCP ({{naam}}) est introuvable.",
+    "serverSearched": "Recherché dans :",
+    "serverHint": "L'installateur place le serveur à côté de l'application. Dans une version de développement : cargo build --release -p openaec-mcp-server.",
+    "claudeDesktop": "Claude Desktop",
+    "claudeDesktopDescription": "Ajoute l'entrée « {{naam}} » à {{config}}. Les autres serveurs et paramètres restent en place ; une copie de sauvegarde est d'abord créée à côté du fichier.",
+    "claudeDesktopButton": "Ajouter à Claude Desktop",
+    "result": {
+      "aangemaakt": "{{config}} créé avec l'entrée pour Open FEM Studio.",
+      "toegevoegd": "Ajouté à {{config}}.",
+      "bijgewerkt": "Mis à jour dans {{config}}.",
+      "ongewijzigd": "Déjà configuré dans {{config}} ; rien n'a changé."
+    },
+    "backup": "Copie de sauvegarde : {{pad}}",
+    "restart": "Redémarrez Claude Desktop pour charger le serveur.",
+    "folderCreated": "Le dossier de Claude Desktop n'existait pas encore. Claude Desktop est-il installé ?",
+    "duplicate": "Attention : {{namen}} démarre le même serveur ; Claude Desktop affichera alors les outils deux fois. Supprimez vous-même cette entrée si elle n'est plus utile.",
+    "failed": "Non ajouté : {{fout}}",
+    "invalidJson": "{{config}} n'est pas un JSON valide : erreur à la ligne {{regel}}, colonne {{kolom}}. Le fichier n'a pas été modifié.",
+    "claudeCode": "Claude Code",
+    "claudeCodeDescription": "Exécutez cette commande dans un terminal :",
+    "otherClients": "Autres clients MCP",
+    "otherClientsDescription": "Ajoutez ce fragment à la configuration MCP du client :",
+    "copy": "Copier",
+    "copied": "Copié",
+    "startApp": "Si l'application n'est pas encore lancée, un assistant peut la démarrer avec l'outil gui_start_app ; le canal n'est alors activé que pour cette session. Si elle est déjà ouverte, ce paramètre doit être activé."
+  },
+  "about": {
+    "appName": "Open FEM Studio",
+    "version": "Version",
+    "framework": "Framework",
+    "license": "Licence",
+    "description": "Une application modèle pour créer des applications de bureau multiplateformes avec Tauri."
+  }
+}

@@ -1,0 +1,921 @@
+/**
+ * projectFile.ts — serialize / deserialize the FEM model to a JSON file
+ * (.ifcfem extension; older .ifcfem2d files open as well) + native dialog + IO via Tauri plugins, with a browser
+ * fallback (Blob download / file-input) when running in a plain web context.
+ */
+import type {
+  Node, Beam, Support, Plate, Load, LoadCase, StructuralGrid,
+} from "../components/fem/femTypes";
+import { analysetypeUitBestand } from "../components/fem/femTypes";
+import type { LoadCombination } from "../components/fem/solver/combinations";
+import {
+  GEVOLGKLASSEN, type CombinatieSoort, type Gevolgklasse,
+} from "../components/fem/solver/normcombinaties";
+import { BIJLAGEN_GEVULD, STANDAARD_BIJLAGE, type NationaleBijlageCode } from "../lib/normAanduidingen";
+import type { EigenDoorsnede } from "../lib/profieleditor/types";
+import type { KruipInvoerProject } from "../lib/kruipInvoer";
+import type { EigenCltOpbouw } from "../lib/profieleditor/cltOpbouwenStore";
+import { parseOpenFem3DModel, type OpenFem3DModel } from "../components/openFem3d/openFem3dModel";
+import { hasOpenFem3DNativeFields } from "../components/openFem3d/openFem3dNativeModel";
+import {
+  parseOpenFem3DStandaardViewsUitRapport, parseOpenFem3DViewSets,
+  type OpenFem3DStandaardViewId, type OpenFem3DViewSet,
+} from "../components/openFem3d/openFem3dViewSets";
+
+export const PROJECT_FILE_EXT = "ifcfem";
+/** Oudere extensie: zulke bestanden openen nog steeds; nieuw opslaan gebeurt als .ifcfem. */
+/**
+ * Resultatenbestand (issue #87): IFC4 met model en resultaten, plus het
+ * projectbestand als IfcText. Geen projectbestand — Opslaan schrijft er nooit
+ * naartoe; Openen laadt het ingebedde project en toont de resultaten.
+ */
+export const RESULTATEN_FILE_EXT = "ifcfemresults";
+
+export const LEGACY_PROJECT_FILE_EXTS: readonly string[] = ["ifcfem2d"];
+/** Alle extensies die Openen en de lijst met recente bestanden als project herkennen. */
+export const PROJECT_FILE_EXTS: readonly string[] = [PROJECT_FILE_EXT, ...LEGACY_PROJECT_FILE_EXTS];
+
+/** "Opslaan als" stelt voor een bestand met de oude extensie de nieuwe voor. */
+export function voorgesteldeProjectnaam(pad: string | null | undefined): string {
+  if (!pad) return `project.${PROJECT_FILE_EXT}`;
+  for (const oud of LEGACY_PROJECT_FILE_EXTS) {
+    if (pad.toLowerCase().endsWith(`.${oud}`)) return pad.slice(0, -oud.length) + PROJECT_FILE_EXT;
+  }
+  return pad;
+}
+/**
+ * Versiegeschiedenis:
+ *  1 — model + loadCases + solver-toggles.
+ *  2 — + belastingcombinaties (`combinations`, factors als object omdat een
+ *      Map niet JSON-serialiseerbaar is) en stramien (`structuralGrid`).
+ *      `Beam.checkConfig` reist automatisch mee met de beams-array.
+ *      Later binnen v2 toegevoegd (optioneel, dus geen versie-bump):
+ *      scheefstand-instellingen (`scheefstandEnabled`, `scheefstandNoemer`,
+ *      `scheefstandRichting`) — ontbreken ze, dan laadt het bestand met
+ *      scheefstand uit (noemer 200, richting +x).
+ *      Daarna, óók optioneel: de normberekening van φ (`scheefstandBron`,
+ *      `scheefstandHoogteM`, `scheefstandAantalElementen`). Ontbreekt
+ *      `scheefstandBron`, dan geldt "vast" en rekent het bestand met de
+ *      noemer hierboven — dus precies zoals het altijd deed. Een oudere
+ *      versie van de app die deze drie velden niet kent leest hetzelfde
+ *      bestand ook zo; de noemer blijft daarom altijd meegeschreven.
+ *      Eveneens optioneel binnen v2: plaat-rekenvelden op `Plate`
+ *      (`thickness`, `E`, `nu`, `rho`, `meshSize`) — reizen automatisch mee
+ *      met de plates-array (zoals `Beam.checkConfig`); ontbreken ze, dan
+ *      vult het laden de PLATE_DEFAULTS aan (20 mm / 210000 N/mm² / 0,3 /
+ *      7850 kg/m³ / 500 mm — zie femTypes.withPlateDefaults).
+ *      Polygonplaten (P4.2, optioneel — geen versie-bump): `Plate.nodeIds`
+ *      mag n ≥ 3 hoeken bevatten en `Plate.meshCache` draagt dan het
+ *      gecachete CDT-rekenmesh (platte data + geometrie-signatuur, zie
+ *      femTypes.PlaatMeshCache); randlasten op polygonranden gebruiken
+ *      `Load.edgeIndex` i.p.v. de benoemde `Load.edge`. Beide velden reizen
+ *      automatisch mee met de bestaande arrays; oude bestanden zonder deze
+ *      velden laden ongewijzigd, en een bestand met verouderde cache wordt
+ *      bij het openen door het canvas geregenereerd (signatuurcontrole).
+ *      Stap 2 van het platenspoor (september 2026, optioneel — geen
+ *      versie-bump): `Plate.meshType` ("driehoeken" | "vierhoeken"; ontbreekt
+ *      = de standaard voor de vorm, dus dezelfde getallen als voorheen),
+ *      `Plate.openingen` (polygonen in mm binnen de omtrek) en in de
+ *      meshcache `quads`, `meshSoort` en `openingEdgeNodeIndices`. De
+ *      handtekening van een cache zonder openingen en zonder keuze is
+ *      ongewijzigd, zodat bestaande caches geldig blijven.
+ *      Vervolg op stap 2 (september 2026, optioneel — geen versie-bump):
+ *      `Load.openingId` — een randlast of een puntlast op een plaatrand mag op
+ *      de rand van een OPENING staan in plaats van op de omtrek. Het veld
+ *      draagt het id van die `PlaatOpening`; `Load.edgeIndex` telt dan langs de
+ *      hoeken van die opening en `startFrac`/`endFrac`/`posFrac` vanaf
+ *      openingshoek j. Reist automatisch mee met de loads-array, precies zoals
+ *      `Load.edgeIndex`. ONTBREEKT het veld — elk bestaand bestand — dan staat
+ *      de last op de omtrek en verandert er geen enkel getal. Een oudere versie
+ *      van de app die het veld niet kent, zou de last op de OMTREK leggen; dat
+ *      is de reden dat het bestandsformaat verder ongewijzigd blijft maar de
+ *      huidige app zo'n adres nooit stil verschuift: hier weigert elke route
+ *      (engine, modelcontrole, MCP-poort) een opening die niet bestaat.
+ *      Stap 3 van het platenspoor (september 2026, optioneel — geen
+ *      versie-bump): `Plate.materiaal` (dezelfde grammatica als
+ *      `Beam.material`: staalsoort, betonklasse, houtsterkteklasse,
+ *      "CLT <klasse> <opbouw>" of "VRIJ:…") en `Plate.hoofdrichting` (hoek in
+ *      graden voor een richtingsafhankelijk materiaal). Ontbreken ze — elk
+ *      bestaand bestand — dan rekent de plaat isotroop met haar losse E, ν en
+ *      ρ, precies zoals voorheen. Staat er WEL een materiaal, dan komen E, ν
+ *      en ρ daaruit en vult het laden ze niet meer met de staaldefaults aan
+ *      (zie femTypes.withPlateDefaults); een los ingevuld veld blijft de
+ *      expliciete overschrijving. Een oudere versie van de app negeert het
+ *      materiaalveld en leest de plaat dan met haar eigen E/ν/ρ of, als die
+ *      ontbreken, met de staaldefaults — dat verschil is zichtbaar in het
+ *      rapport (materiaal en E-bron staan erin) en niet stil.
+ *      Issue #14 (september 2026, optioneel — geen versie-bump):
+ *      `Plate.cltG12` met `Plate.cltG12Bron`, of `Plate.cltG12Bovengrens`, de
+ *      G₁₂-keuze van een kruislaaghouten plaat. Ontbreken ze bij elke andere
+ *      plaat, dan verandert er niets. Een kruislaaghouten plaat uit een ouder
+ *      bestand draagt geen van beide en wordt bij het rekenen GEWEIGERD met
+ *      de reden en de twee uitwegen — er wordt geen G₁₂ aangenomen.
+ *      Bewust geen automatische aanvulling bij het laden: dat zou de
+ *      niet-gereduceerde bovengrens stil tot keuze van de gebruiker maken.
+ *      Issue #15 (september 2026, optioneel — geen versie-bump):
+ *      `Plate.klimaatklasse` (1/2/3) van een houten plaat voor de plaattoets.
+ *      Ontbreekt hij, dan toetst de app met klimaatklasse 1 en zegt dat;
+ *      stijfheid en spanningen veranderen niet.
+ *      Issue #25 (september 2026, optioneel — geen versie-bump):
+ *      `Plate.wapening` van een betonplaat: de aanwezige wapening per
+ *      richting en zijde (Ø + h.o.h. of mm²/m, dekking), staalsoort en
+ *      milieuklasse. Ontbreekt zij, dan toetst de app zoals voorheen en meldt
+ *      dat de aanwezige wapening niet is ingevoerd.
+ *      Eveneens optioneel binnen v2: `analysetype` (drie standen) en
+ *      `betonSegmentLengteMm`. `nonlinearEnabled` BLIJFT geschreven worden en
+ *      blijft leidend zolang `analysetype` ontbreekt — zie
+ *      `analysetypeUitBestand` in femTypes. Een bestand van vóór het
+ *      analysetype laadt daardoor onveranderd (true → 2e orde P-Δ, false →
+ *      1e orde), en een nieuw bestand blijft leesbaar in een oudere versie
+ *      van de app, want die leest alleen de booleaan.
+ *      Eveneens optioneel binnen v2 (geen versie-bump): `Load.omschrijving` —
+ *      de vrije naam die de gebruiker aan een last geeft ("sneeuw op
+ *      overstek"). Reist automatisch mee met de loads-array, precies zoals
+ *      `Load.edgeIndex` en `Beam.checkConfig`. Een bestand zónder het veld
+ *      laadt ongewijzigd (de omschrijving is dan simpelweg leeg) en een
+ *      oudere versie van de app negeert het veld bij het lezen, want die
+ *      leest de lasten ook als geheel. Het veld is documentatie: er verschuift
+ *      geen enkel rekengetal door.
+ *      Eveneens optioneel binnen v2 (geen versie-bump): `eigenCltOpbouwen` —
+ *      de namen die de gebruiker aan zijn CLT-vloeropbouwen gaf. Puur
+ *      bijschrift: de opbouw zelf staat in de profielnaam van de staaf, dus
+ *      een bestand zonder dit veld rekent identiek door.
+ *      Eveneens optioneel binnen v2 (september 2026, geen versie-bump):
+ *      `combinations[].standaard` — het kenmerk van een standaardcombinatie
+ *      (sleutel, soort, gevolgklasse) — en `idTellers` voor belastinggevallen
+ *      en combinaties. Een oudere versie van de app negeert beide velden; de
+ *      factoren zelf staan er gewoon in.
+ *      Bij het OPENEN — in de app en via de MCP-weg — vervangt
+ *      `openCombinatieStaat` (lib/combinatieBeheer) de standaardcombinaties van
+ *      versie 0.3.11 en ouder door de huidige standaardset, herkend op naam en
+ *      factorpatroon en NIET op het ontbreken van tellers, met een melding en
+ *      ongedaan maken. Eigen combinaties blijven staan en worden gecontroleerd.
+ *      Eveneens optioneel (september 2026, geen versie-bump):
+ *      `combinatiesVervangenBijOpenen` — de tekst van die melding, zodat het
+ *      rapport ook in een latere sessie vermeldt dat de combinaties bij het
+ *      openen zijn vervangen. Puur bijschrift: er rekent niets mee.
+ *      Eveneens optioneel binnen v2 (oktober 2026, issue #196, geen
+ *      versie-bump): `combinations[].bevestigdeFactoren` — de eigen factoren
+ *      die de gebruiker met "Behoud eigen factoren" bewust heeft bevestigd
+ *      ({ caseId: factor }). Een bevestiging, geen rekenwaarde: de factoren
+ *      zelf staan ongewijzigd in `factors`, en de berekening hangt alleen
+ *      daarvan af. Een oudere uitgave laat het veld daarom stil vallen zonder
+ *      dat er één getal verschuift; zij meldt de afwijkende factor dan weer als
+ *      FOUT (zoals vóór dit veld), en na opslaan in die uitgave is de
+ *      bevestiging weg en vraagt deze uitgave opnieuw om haar — de veilige
+ *      kant. Daarom geen hogere versie: die zou een oudere uitgave een bestand
+ *      laten weigeren dat zij precies goed rekent.
+ *      Eveneens optioneel binnen v2 (september 2026, geen versie-bump):
+ *      `Beam.profileEnd` — het eindprofiel van een verlopende staaf; `profile`
+ *      is dan het beginprofiel. Reist automatisch mee met de beams-array.
+ *      Ontbreekt het veld, dan is de staaf prismatisch en rekent het bestand
+ *      exact zoals voorheen; een oudere versie van de app negeert het veld en
+ *      rekent de staaf prismatisch met het beginprofiel (zie femTypes.Beam).
+ *  3 — optioneel `model3d` met aparte knopen en staven in meters. Alleen een
+ *      bestand dat werkelijk 3D-geometrie bevat krijgt versie 3, zodat een
+ *      oudere app het weigert in plaats van de 3D-geometrie stil te verliezen.
+ *      Een zuiver 2D-project blijft versie 2.
+ *      Optioneel binnen `model3d` (oktober 2026, geen versie-bump):
+ *      `tensionOnlyFitAfterPermanent` en `tensionOnlyCrossRule`, de
+ *      modelinstellingen voor trek-alleen staven (alleen `true` wordt
+ *      bewaard). Een oudere uitgave slaat ze over en rekent de verbanden
+ *      spanningsloos in de onvervormde stand en zonder kruisregel.
+ *      Eveneens binnen `model3d` (oktober 2026, issue #80, geen versie-bump):
+ *      een lijnlast in een globale richting, `memberLoads[]` met
+ *      `globalDirection`, `qStart`, `qEnd` en eventueel `perProjection` in
+ *      plaats van qy/qz. Een eerdere uitgave valt daar niet stil overheen: zij
+ *      eist vier eindige lokale componenten en weigert het bestand met een
+ *      melding. Een bestand zonder globale lijnlast is byte-gelijk aan voorheen.
+ *  4 — `model3d.loadPanels`: belastingvlakken die hun oppervlaktelast naar de
+ *      liggers afdragen. Om dezelfde reden als bij 3: een uitgave zonder
+ *      belastingvlakken zou de lijst bij het lezen overslaan en dus rekenen
+ *      ZONDER die lasten. Alleen een bestand dat werkelijk belastingvlakken
+ *      bevat krijgt versie 4; een 3D-project zonder blijft versie 3 en een
+ *      bestand van versie 3 laadt ongewijzigd.
+ *  5 — `model3d.beams[].bedding`: staven op bedding (Winkler, issue #106).
+ *      Om dezelfde reden als bij 4: een uitgave zonder bedding (2026.39.2 en
+ *      ouder) zou het veld bij het lezen stil overslaan en dus rekenen ZONDER
+ *      de grond, of met alleen de grond als oplegging weigeren te rekenen; na
+ *      opslaan was de bedding weg. Alleen een bestand met minstens één staaf
+ *      op bedding krijgt versie 5 (ook met belastingvlakken); een 3D-project
+ *      zonder bedding houdt versie 3 of 4, en bestanden van versie 3 en 4
+ *      laden ongewijzigd.
+ *  6 — `model3d.beams[].profileNameEnd`: verlopende 3D-staven (issue #73).
+ *      Een uitgave zonder verloop leest de staaf veld voor veld en zou het
+ *      eindprofiel stil laten vallen: de staaf rekende dan prismatisch met het
+ *      beginprofiel, en na opslaan was het verloop weg. Alleen een bestand met
+ *      minstens één verlopende staaf krijgt versie 6 (ook met bedding of
+ *      belastingvlakken); de rest houdt versie 3, 4 of 5 en bestanden van die
+ *      versies laden ongewijzigd.
+ *  7 — `model3d.plates[].bedding`: platen op bedding (Winkler, issue #107).
+ *      Om dezelfde reden als bij 5: een uitgave van versie 5 of 6 kent wel de
+ *      staafbedding maar niet die van een plaat; zij zou het veld bij het
+ *      lezen stil overslaan en de vloer rekenen ZONDER de grond (of met alleen
+ *      de grond als oplegging weigeren te rekenen). Alleen een bestand met
+ *      minstens één plaat op bedding krijgt versie 7 (ook met verlopende staven,
+ *      staven op bedding of belastingvlakken); zonder plaatbedding blijft het
+ *      3, 4, 5 of 6.
+ * 10 — `beams[].tensionOnly`: trek-alleen staven in het 2D-model (issue #234).
+ *      Een eerdere uitgave zou het veld stil overslaan en een kruisverband
+ *      met beide schoren actief rekenen (de trekschoor ongeveer de helft van
+ *      de kracht). Alleen een bestand met minstens één trek-alleen 2D-staaf
+ *      krijgt versie 10; zonder blijft het 2 (of de 3D-versie).
+ * 11 — native Rust-3D-route in `model3d`: `volumes` (Tet4/Hex8),
+ *      `volumeBodyLoads`, `volumeFaceLoads`, `plateEdgeLoads`,
+ *      `materialLoadPath`, `volumeBackend`/`volumeMaterialKinematics`/
+ *      `volumeThreads`/`volumeResidualTolerance`, `beams[].axialOnly`/
+ *      `nonlinearLaw` en `plates[].membraneOnly`/`membraneEMpa`/
+ *      `membranePoisson`/`modulusCurve`/`nonlinearLaw`/`maxCellSizeM`/
+ *      `reinforcement`/`threeLayer` (formaat van het ontwikkelspoor
+ *      `frame3d`). Alleen een bestand met zo'n veld krijgt versie 11; bestanden
+ *      van het ontwikkelspoor (versie 3) laden ongewijzigd. De frame3d-vorm van
+ *      `plates[].edgeSupports` (vier randtypen in plaatassen) wordt bij het
+ *      lezen omgezet naar de globale Open FEM 3D-vorm.
+ *  8 — `model3d.analysisMaterials`: gekozen E en ν per materiaal voor de
+ *      ruimtelijke analyse (issue #62). Een oudere uitgave zou de instelling
+ *      stil overslaan en met een andere stijfheid rekenen. Alleen een 3D-model
+ *      met zulke instellingen krijgt versie 8; overige bestanden behouden
+ *      hun eerdere versienummer.
+ * v1-bestanden blijven leesbaar: de v2-velden zijn optioneel en ontbrekende
+ * velden krijgen bij het laden de bestaande defaults (defaultCombinations()
+ * en DEFAULT_STRUCTURAL_GRID in useFemStore.loadProjectState).
+ */
+/**
+ * Het formaat-id dat deze uitgave in elk bestand schrijft (`format`).
+ *
+ * Tot en met uitgave 2026.39.1 schreef de app een ander id, zie
+ * `LEGACY_PROJECT_FORMAT_IDS`. De lezer accepteert beide, dus elk ouder
+ * bestand blijft openen. Andersom niet: 2026.39.1 en ouder kennen dit id niet
+ * en weigeren een bestand van deze uitgave met "Onbekend bestandsformaat",
+ * ook een zuiver 2D-bestand met versie 2.
+ */
+export const PROJECT_FORMAT_ID = "open-fem-studio-v2";
+/** Formaat-id's van eerdere uitgaven die de lezer blijft accepteren. */
+export const LEGACY_PROJECT_FORMAT_IDS = ["open-fem2d-studio-v2"] as const;
+/** Elk formaat-id dat deze uitgave kan lezen. */
+export type ProjectFormatId = typeof PROJECT_FORMAT_ID | (typeof LEGACY_PROJECT_FORMAT_IDS)[number];
+
+/** Kan deze uitgave een bestand met dit formaat-id lezen? */
+export function isProjectFormatId(waarde: unknown): waarde is ProjectFormatId {
+  return waarde === PROJECT_FORMAT_ID
+    || (LEGACY_PROJECT_FORMAT_IDS as readonly unknown[]).includes(waarde);
+}
+
+/**
+ * Versie van zuivere 2D-bestanden. Binnen dezelfde formaat-id las een eerdere
+ * uitgave zo'n bestand; sinds het nieuwe formaat-id (hierboven) geldt dat niet
+ * meer voor 2026.39.1 en ouder.
+ */
+export const PROJECT_FORMAT_VERSION = 2;
+/** 3D-data vereist een versie die eerdere uitgaven weigeren. */
+export const PROJECT_FORMAT_VERSION_3D = 3;
+/** Belastingvlakken in het 3D-model: eerdere uitgaven moeten weigeren, niet stil overslaan. */
+export const PROJECT_FORMAT_VERSION_3D_LOAD_PANELS = 4;
+/** Staven op bedding in het 3D-model: eerdere uitgaven moeten weigeren, niet de grond stil laten vallen. */
+export const PROJECT_FORMAT_VERSION_3D_BEDDING = 5;
+/** Verlopende 3D-staven: eerdere uitgaven moeten weigeren, niet het verloop stil laten vallen. */
+export const PROJECT_FORMAT_VERSION_3D_TAPERED = 6;
+/** Platen op bedding in het 3D-model (#107): een uitgave van versie 5 of 6 moet weigeren, niet de vloer zonder grond rekenen. */
+export const PROJECT_FORMAT_VERSION_3D_PLATE_BEDDING = 7;
+/** Afwijkende analyse-E of ν per 3D-materiaal: oude lezers moeten weigeren. */
+export const PROJECT_FORMAT_VERSION_3D_ANALYSIS_MATERIALS = 8;
+/** Gevel- en dakpanelen zonder stijfheid; oudere lezers mogen ze niet stil negeren. */
+export const PROJECT_FORMAT_VERSION_3D_ENVELOPE_PANELS = 9;
+/**
+ * Trek-alleen staven in het 2D-model (issue #234). Een eerdere uitgave zou het
+ * veld stil overslaan en beide schoren van een kruisverband als gewone staaf
+ * rekenen — de getrokken schoor kreeg dan ongeveer de helft van de kracht.
+ */
+export const PROJECT_FORMAT_VERSION_2D_TENSION_ONLY = 10;
+/**
+ * Onderdelen van de native Rust-3D-route in `model3d` (volumes, volume- en
+ * plaatrandlasten, axiale staven, materiaalwetten, membraanplaten, FNL-
+ * lastpad; zie openFem3dNativeModel). Een uitgave zonder die route zou ze
+ * stil overslaan en het model anders rekenen.
+ */
+export const PROJECT_FORMAT_VERSION_3D_NATIVE = 11;
+/**
+ * Metselwerkwanden met lateien in het 3D-model (#97). Een eerdere uitgave zou
+ * `masonry` stil overslaan en de wand als isotrope betonplaat rekenen: dan
+ * werkt zij als hoge ligger mee met de funderingsbalk.
+ */
+export const PROJECT_FORMAT_VERSION_3D_MASONRY = 12;
+/** De hoogste versie die deze uitgave kan lezen. */
+export const PROJECT_FORMAT_VERSION_MAX = PROJECT_FORMAT_VERSION_3D_MASONRY;
+
+/** JSON-vorm van één belastingcombinatie: `factors` als { caseId: factor }. */
+export interface ProjectFileCombination {
+  id: number;
+  name: string;
+  type: "uls" | "sls";
+  formula: string;
+  factors: Record<string, number>;
+  /** Kenmerk van een standaardcombinatie; ontbreekt bij een eigen combinatie. */
+  standaard?: { sleutel: string; soort: string; gevolgklasse: string; bijlage?: string };
+  /**
+   * Bewust gekozen eigen factoren, { caseId: factor } (issue #196); zie
+   * `LoadCombination.bevestigdeFactoren`. Ontbreekt = niets bevestigd.
+   */
+  bevestigdeFactoren?: Record<string, number>;
+}
+
+const SOORTEN: readonly CombinatieSoort[] = ["6.10a", "6.10b", "6.14b", "6.15b", "6.16b"];
+
+/** LoadCombination[] (Map-factoren) → JSON-serialiseerbare vorm. */
+export function combinationsToFile(combos: LoadCombination[]): ProjectFileCombination[] {
+  return combos.map((c) => ({
+    id: c.id,
+    name: c.name,
+    type: c.type,
+    formula: c.formula,
+    factors: Object.fromEntries([...c.factors].map(([caseId, f]) => [String(caseId), f])),
+    ...(c.standaard ? { standaard: { ...c.standaard } } : {}),
+    ...(c.bevestigdeFactoren && Object.keys(c.bevestigdeFactoren).length > 0
+      ? { bevestigdeFactoren: Object.fromEntries(Object.entries(c.bevestigdeFactoren)) }
+      : {}),
+  }));
+}
+
+/**
+ * De bevestiging uit het bestand, of `undefined` als er geen (bruikbare) is.
+ * Een onleesbare regel valt weg in plaats van het bestand te weigeren: een
+ * bevestiging is geen rekenwaarde, en zonder haar meldt de app de afwijkende
+ * factor gewoon weer als FOUT — de veilige kant, en niet stil.
+ */
+function bevestigingUitBestand(raw: unknown): Record<number, number> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const uit: Record<number, number> = {};
+  for (const [sleutel, f] of Object.entries(raw as Record<string, unknown>)) {
+    const id = Number(sleutel);
+    if (Number.isInteger(id) && typeof f === "number" && Number.isFinite(f) && f !== 0) uit[id] = f;
+  }
+  return Object.keys(uit).length > 0 ? uit : undefined;
+}
+
+/**
+ * Het kenmerk uit het bestand, of `undefined` als het ontbreekt of niet klopt.
+ * Een onleesbaar kenmerk maakt de combinatie een EIGEN combinatie: dan past de
+ * app haar niet aan, en dat is de veilige kant van de vergissing.
+ */
+function kenmerkUitBestand(raw: unknown): LoadCombination["standaard"] {
+  if (!raw || typeof raw !== "object") return undefined;
+  const k = raw as Record<string, unknown>;
+  if (typeof k.sleutel !== "string") return undefined;
+  if (!SOORTEN.includes(k.soort as CombinatieSoort)) return undefined;
+  if (!GEVOLGKLASSEN.includes(k.gevolgklasse as Gevolgklasse)) return undefined;
+  // De bijlage van de set (normnaad, september 2026). Ontbreekt het veld, dan
+  // is het bestand van vóór de naad en kon het alleen met NL rekenen. Een code
+  // die deze uitgave niet kent, maakt het kenmerk onleesbaar — dezelfde
+  // veilige kant als hierboven: dan is het een eigen combinatie, en de
+  // bijlage van het project zelf wordt bij het openen geweigerd.
+  if (k.bijlage !== undefined && !(BIJLAGEN_GEVULD as readonly unknown[]).includes(k.bijlage)) {
+    return undefined;
+  }
+  return {
+    sleutel: k.sleutel,
+    soort: k.soort as CombinatieSoort,
+    gevolgklasse: k.gevolgklasse as Gevolgklasse,
+    bijlage: (k.bijlage as NationaleBijlageCode | undefined) ?? STANDAARD_BIJLAGE,
+  };
+}
+
+/**
+ * Een projectbestand dat niet gelezen KAN worden zonder te raden. Eigen
+ * fouttype zodat de openroute hem van een JSON-syntaxfout onderscheidt; de
+ * `redenen` staan ook in `message`, zodat de bestaande melding "Kan bestand
+ * niet openen" ze zonder verdere bewerking toont.
+ */
+export class ProjectBestandFout extends Error {
+  readonly redenen: string[];
+
+  constructor(redenen: string[]) {
+    super(redenen.join(" "));
+    this.redenen = redenen;
+    this.name = "ProjectBestandFout";
+  }
+}
+
+/**
+ * JSON-vorm → LoadCombination[] met Map-factoren (caseId weer numeriek).
+ * `undefined` in → `undefined` uit, zodat de aanroeper bij v1-bestanden op
+ * de bestaande defaults kan terugvallen.
+ *
+ * TWEE STILLE VERVORMINGEN zijn hier weggehaald (basisaudit ruw 29):
+ *
+ *  - `type: c.type === "sls" ? "sls" : "uls"` maakte van ELKE andere waarde
+ *    een UGT-combinatie. Een tikfout ("als") of een hoofdletterverschil
+ *    ("SLS") verplaatste een combinatie van de bruikbaarheids- naar de
+ *    uiterste grenstoestand, waarna de doorbuigingstoets zijn BGT-combinatie
+ *    kwijt was en de UGT-omhullende er een combinatie bij kreeg.
+ *  - `Number(f)` maakte van een factor met een DECIMALE KOMMA ("1,5") — de
+ *    voor de hand liggende handbewerking in een Nederlands bestand — stil
+ *    `NaN`, dat vervolgens de hele combinatie in gaat.
+ *
+ * Allebei worden ze nu geweigerd met de combinatienaam en het gelezen
+ * kenmerk erbij. Niets wordt hersteld of geraden: "1,5" zou ook 15 kunnen
+ * zijn, en welke grenstoestand "als" was is niet uit te maken.
+ */
+export function combinationsFromFile(
+  raw: ProjectFileCombination[] | undefined,
+): LoadCombination[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const redenen: string[] = [];
+  const uit = raw.map((c, i) => {
+    const standaard = kenmerkUitBestand(c.standaard);
+    const naam = `combinatie ${c.name ?? `#${i + 1}`} (id ${c.id})`;
+    if (c.type !== "uls" && c.type !== "sls") {
+      redenen.push(
+        `In ${naam} staat type ${JSON.stringify(c.type)}; alleen "uls" ` +
+          `(uiterste grenstoestand) en "sls" (bruikbaarheid) bestaan. Er wordt ` +
+          "niet geraden: het verschil bepaalt of de combinatie in de " +
+          "sterktetoets of in de doorbuigingstoets terechtkomt.",
+      );
+    }
+    const factors = new Map<number, number>();
+    for (const [caseId, f] of Object.entries(c.factors ?? {})) {
+      const getal = typeof f === "number" ? f : Number(f);
+      if (!Number.isFinite(getal)) {
+        redenen.push(
+          `In ${naam} is de factor van belastinggeval ${caseId} ` +
+            `${JSON.stringify(f)}; dat is geen getal. Een decimale KOMMA hoort ` +
+            "een punt te zijn (1.5, niet 1,5); anders zou er met NaN gerekend " +
+            "worden en zou de hele combinatie leeg uitkomen.",
+        );
+        continue;
+      }
+      factors.set(Number(caseId), getal);
+    }
+    const bevestigdeFactoren = bevestigingUitBestand(c.bevestigdeFactoren);
+    return {
+      id: c.id,
+      name: c.name,
+      type: (c.type === "sls" ? "sls" : "uls") as LoadCombination["type"],
+      formula: c.formula ?? "",
+      factors,
+      ...(standaard ? { standaard } : {}),
+      ...(bevestigdeFactoren ? { bevestigdeFactoren } : {}),
+    };
+  });
+  if (redenen.length > 0) throw new ProjectBestandFout(redenen);
+  return uit;
+}
+
+export interface ProjectFile {
+  /**
+   * Formaat-id. `serializeProject` schrijft altijd `PROJECT_FORMAT_ID`;
+   * `deserializeProject` laat staan wat er in het bestand stond (ook het id
+   * van een eerdere uitgave).
+   */
+  format: ProjectFormatId;
+  version: number;
+  savedAt: string;          // ISO timestamp
+  /** Eén gezaghebbende modeldimensie. Ontbreekt alleen in oudere bestanden. */
+  modelDimension?: "2d" | "3d";
+  // Model
+  nodes: Node[];
+  beams: Beam[];
+  supports: Support[];
+  plates: Plate[];
+  loads: Load[];
+  // Cases + UI prefs
+  loadCases: LoadCase[];
+  activeLoadCaseId: number;
+  selfWeightEnabled: boolean;
+  /**
+   * OUD veld, nog altijd geschreven: `true` voor beide tweede-orde-standen.
+   * Het is de enige uitspraak over het analysetype die een oudere versie van
+   * de app (en de sidecar) kan lezen. Bij het laden telt hij alleen wanneer
+   * `analysetype` ontbreekt.
+   */
+  nonlinearEnabled: boolean;
+  // v2 — optioneel zodat v1-bestanden zonder migratiestap blijven laden.
+  /**
+   * Analysetype (v2, optioneel): "eersteOrde" | "tweedeOrdeGeometrisch" |
+   * "tweedeOrdeFysisch". Ontbreekt het veld, dan bepaalt `nonlinearEnabled`
+   * de stand. Bewust als `string` getypeerd: een bestand uit een nieuwere
+   * versie mag hier een onbekende waarde in hebben staan zonder dat het
+   * laden omvalt — `analysetypeUitBestand` valt dan terug op de booleaan.
+   */
+  analysetype?: string;
+  /** Absolute lastfactoren voor de afzonderlijke axiale Rust-FNL-analyse. */
+  axialMaterialLoadPath?: number[];
+  /** Gewenste segmentlengte in mm (v2, optioneel — ontbreekt = 400, besluit B3). */
+  betonSegmentLengteMm?: number;
+  /**
+   * φ(∞,t₀) van het project, art. 3.1.4 (september 2026, optioneel). Ontbreekt
+   * het veld of staat er `null`, dan is de kruipcoëfficiënt NIET opgegeven —
+   * uitdrukkelijk iets anders dan 0.
+   */
+  betonKruipcoefficient?: number | null;
+  /**
+   * De invoer voor φ(∞,t₀) volgens bijlage B (september 2026, optioneel):
+   * `{ rhProcent, t0Dagen, cementklasse }`. Ontbreekt het veld of staat er
+   * `null`, dan wordt er niets berekend — elk ouder bestand rekent dus als
+   * voorheen. Een opgegeven `betonKruipcoefficient` gaat voor.
+   */
+  betonKruipInvoer?: KruipInvoerProject | null;
+  /** Belastingcombinatie-definities (v2). */
+  combinations?: ProjectFileCombination[];
+  /**
+   * Tellers voor nieuwe id's (v2, optioneel — september 2026). Ze lopen nooit
+   * terug, zodat een verwijderd belastinggeval of een verwijderde combinatie
+   * zijn id nooit aan een nieuwe doorgeeft. Ontbreekt het veld, dan leidt
+   * `openCombinatieStaat` (lib/combinatieBeheer) de tellers af uit de hoogste
+   * id's — van de gevallen én van de factortabellen, zodat een wees-factor uit
+   * een ouder bestand nooit door een nieuw geval wordt geërfd.
+   */
+  idTellers?: { belastinggeval: number; combinatie: number };
+  /**
+   * De melding van een vervanging van combinaties bij het openen (v2,
+   * optioneel — september 2026). Bijschrift voor het rapport; zie de
+   * versiegeschiedenis hierboven.
+   */
+  combinatiesVervangenBijOpenen?: string;
+  /** Stramien (v2). */
+  structuralGrid?: StructuralGrid;
+  /** Scheefstand meenemen in de berekening (v2, optioneel — ontbreekt = uit). */
+  scheefstandEnabled?: boolean;
+  /** Noemer x in φ = 1/x (v2, optioneel — ontbreekt = 200). */
+  scheefstandNoemer?: number;
+  /** Richting van de equivalente horizontale krachten (v2, optioneel — ontbreekt = +1). */
+  scheefstandRichting?: 1 | -1;
+  /**
+   * Waar φ vandaan komt (v2, optioneel — ontbreekt = "vast", dus de noemer
+   * hierboven). Geldige waarden: "vast" | "en1993" | "en1992" | "en1995" |
+   * "ongunstigste", zie `lib/scheefstandNorm.ts`. Bewust als `string`
+   * getypeerd, net als `analysetype`: een bestand uit een nieuwere versie mag
+   * hier een onbekende waarde in hebben staan zonder dat het laden omvalt —
+   * de store valt dan terug op "vast".
+   */
+  scheefstandBron?: string;
+  /** Handmatige hoogte h in m voor α_h (v2, optioneel — ontbreekt = afleiden). */
+  scheefstandHoogteM?: number | null;
+  /** Handmatig aantal verticale elementen m voor α_m (v2, optioneel — ontbreekt = afleiden). */
+  scheefstandAantalElementen?: number | null;
+  /**
+   * Alleen 3D (issue #212, optioneel — geen versie-bump): handmatige m_X en
+   * m_Y per richting (ontbreekt/null = `scheefstandAantalElementen`, anders
+   * afleiden) en de torsievarianten van EN 1993-1-1 5.3.2(10) (ontbreekt = uit).
+   */
+  scheefstandAantalX?: number | null;
+  scheefstandAantalY?: number | null;
+  scheefstandTorsie?: boolean;
+  /**
+   * Alleen 3D (issue #199, fase 3, optioneel): de eigen scheefstand per losse
+   * kolom in de UGT-toets. Ontbreekt = uit.
+   */
+  scheefstandEigenKolom?: boolean;
+  /**
+   * 2D (issue #199, fase 4, optioneel): hout in de UGT-toets volgens
+   * NEN-EN 1995-1-1 (E_d, boogimperfectie). Ontbreekt = uit.
+   */
+  houtToetsEN1995?: boolean;
+  /**
+   * Eigen doorsneden uit de profieleditor waarnaar staven verwijzen
+   * (`EIGEN:<naam>`); v2, optioneel — geen versie-bump. Ontbreekt het veld
+   * (ouder bestand), dan blijft de lokaal bewaarde lijst ongemoeid.
+   *
+   * Alleen de GEBRUIKTE doorsneden staan erin (zie `exporteer` in
+   * eigenDoorsnedenStore); bij het openen worden ze SAMENGEVOEGD met de
+   * lokale bibliotheek, waarbij het project wint bij een gelijke naam.
+   */
+  eigenDoorsneden?: EigenDoorsnede[];
+  /**
+   * De projectgegevens (naam, nummer, ingenieur, bedrijf, datum, locatie,
+   * omschrijving, uitgangspunten met normen, gevolgklasse, windgebied en
+   * terreincategorie). Die stonden alleen in de app-instellingen van de
+   * machine, niet in het bestand: wie een project doorstuurde, stuurde het
+   * zonder zijn gegevens, en wie een ander project opende hield de vorige
+   * projectnaam. Optioneel: een ouder bestand laadt zonder en laat de
+   * instellingen staan. Bewust als losse JSON (geen ProjectInfo-import):
+   * dit bestand kent de dialoog niet, en onbekende velden reizen zo mee.
+   */
+  projectInfo?: Record<string, unknown>;
+  /**
+   * De instellingen van de windbelastinggenerator, zodat "Genereren" op een
+   * andere machine dezelfde lasten oplevert. Optioneel; de gegenereerde
+   * lasten zelf staan al in `loads` en `loadCases`.
+   */
+  windInstellingen?: Record<string, unknown>;
+  /**
+   * De rapportinstellingen die de inhoud bepalen: rapporttype, toetsdetail,
+   * aan/uit per sectie, staafkeuze, inhoudsopgavediepte, opmaak en
+   * papierformaat. Geen zoom of actieve sectie — dat is scherm, geen
+   * project.
+   */
+  rapport?: Record<string, unknown>;
+  /**
+   * Eigen CLT-vloeropbouwen: de NAMEN die de gebruiker aan opbouwen gaf,
+   * v2, optioneel — geen versie-bump.
+   *
+   * Anders dan bij `eigenDoorsneden` is dit geen afhankelijkheid maar een
+   * bijschrift: een CLT-staaf draagt zijn opbouw volledig in de profielnaam
+   * ("CLT 40L:C24/20D:C16/40L b600"), dus een bestand zonder dit veld rekent
+   * exact hetzelfde door — je mist alleen de naam waaronder de gebruiker de
+   * opbouw kent. Alleen opbouwen die in dít model voorkomen gaan mee (zie
+   * `exporteer` in cltOpbouwenStore), en bij het openen worden ze op dezelfde
+   * manier samengevoegd als de eigen doorsneden.
+   */
+  eigenCltOpbouwen?: EigenCltOpbouw[];
+  /** Geometrie van een 3D-model; gezaghebbend wanneer modelDimension = "3d". */
+  model3d?: OpenFem3DModel;
+  /** Benoemde camera-, resultaat- en zichtbaarheidsstanden van de 3D-werkruimte. */
+  openFem3dViewSets?: OpenFem3DViewSet[];
+  /**
+   * De standaardviews van de 3D-werkruimte (tab Views) die NIET in het
+   * berekeningsrapport komen; ontbrekend = alle standaardviews erin. De
+   * rapportkeuze van een eigen view staat bij die view (`inRapport`).
+   */
+  openFem3dStandaardViewsUitRapport?: OpenFem3DStandaardViewId[];
+}
+
+export function serializeProject(state: Omit<ProjectFile, "format" | "version" | "savedAt">): string {
+  const modelDimension = state.modelDimension ?? (state.model3d !== undefined ? "3d" : "2d");
+  // Canonieke bestanden dragen nooit een tweede actief modeltype. De oude
+  // 2D-lijsten blijven bij 3D alleen als controle- en compatibiliteitsspoor.
+  const model3d = modelDimension === "3d" ? parseOpenFem3DModel(state.model3d) : undefined;
+  const file: ProjectFile = {
+    format: PROJECT_FORMAT_ID,
+    version: model3d?.plates?.some((plate) => plate.masonry !== undefined) ? PROJECT_FORMAT_VERSION_3D_MASONRY
+      : model3d && hasOpenFem3DNativeFields(model3d) ? PROJECT_FORMAT_VERSION_3D_NATIVE
+      : state.beams?.some((beam) => beam.tensionOnly === true) ? PROJECT_FORMAT_VERSION_2D_TENSION_ONLY
+      : modelDimension !== "3d" ? PROJECT_FORMAT_VERSION
+      : (model3d?.envelopePanels?.length ?? 0) > 0 || model3d?.loadPanels?.some((panel) => (panel.openings?.length ?? 0) > 0)
+        ? PROJECT_FORMAT_VERSION_3D_ENVELOPE_PANELS
+      : model3d?.analysisMaterials && Object.keys(model3d.analysisMaterials).length > 0 ? PROJECT_FORMAT_VERSION_3D_ANALYSIS_MATERIALS
+      : model3d?.plates?.some((plate) => plate.bedding !== undefined) ? PROJECT_FORMAT_VERSION_3D_PLATE_BEDDING
+      : model3d?.beams.some((beam) => beam.profileNameEnd !== undefined) ? PROJECT_FORMAT_VERSION_3D_TAPERED
+      : model3d?.beams.some((beam) => beam.bedding !== undefined) ? PROJECT_FORMAT_VERSION_3D_BEDDING
+      : (model3d?.loadPanels?.length ?? 0) > 0 ? PROJECT_FORMAT_VERSION_3D_LOAD_PANELS : PROJECT_FORMAT_VERSION_3D,
+    savedAt: new Date().toISOString(),
+    ...state,
+    modelDimension,
+    model3d,
+    openFem3dViewSets: modelDimension === "3d" ? parseOpenFem3DViewSets(state.openFem3dViewSets) : undefined,
+    openFem3dStandaardViewsUitRapport: modelDimension === "3d" && state.openFem3dStandaardViewsUitRapport !== undefined
+      ? parseOpenFem3DStandaardViewsUitRapport(state.openFem3dStandaardViewsUitRapport) : undefined,
+  };
+  // Een aanroeper van buiten (MCP, tests) kan een volledig geopend bestand
+  // meegeven, met het id van een eerdere uitgave erin; `...state` zou dat
+  // hierboven terugzetten. Geschreven wordt altijd het huidige id (de sleutel
+  // blijft vooraan staan).
+  file.format = PROJECT_FORMAT_ID;
+  return JSON.stringify(file, null, 2);
+}
+
+/**
+ * De lijsten die ELK projectbestand draagt. Ontbreekt er een, dan is het
+ * bestand niet leesbaar: `pasProjectToe` zet dan `undefined` in de store en de
+ * app valt pas veel later om, op een plek die niets meer met het bestand te
+ * maken heeft ("Cannot read properties of undefined"). Tot september 2026
+ * gebeurde dat zonder enige melding bij het openen (basisaudit ruw 27).
+ *
+ * Ze zijn alle zes al sinds v1 verplicht: geen van de 32 bestanden in de repo
+ * mist er een. Een lege lijst is gewoon goed — het gaat om het VELD.
+ */
+const VERPLICHTE_LIJSTEN = [
+  "nodes", "beams", "supports", "plates", "loads", "loadCases",
+] as const;
+
+/**
+ * Alle sleutels die deze versie op modelniveau van een projectbestand kent.
+ * Wat hier niet in staat, overleeft een rondje openen-en-opslaan niet: de
+ * opslaroute (`App.tsx`) bouwt een vaste veldlijst op. `toelichting` — de
+ * documentatie in de referentiebestanden — is daar het gemeten voorbeeld van.
+ */
+const BEKENDE_TOPVELDEN: readonly string[] = [
+  "format", "version", "savedAt",
+  ...VERPLICHTE_LIJSTEN,
+  "activeLoadCaseId", "selfWeightEnabled", "nonlinearEnabled", "analysetype", "axialMaterialLoadPath",
+  "betonSegmentLengteMm", "betonKruipcoefficient", "betonKruipInvoer", "combinations", "idTellers",
+  "combinatiesVervangenBijOpenen", "structuralGrid",
+  "scheefstandEnabled", "scheefstandNoemer", "scheefstandRichting",
+  "scheefstandBron", "scheefstandHoogteM", "scheefstandAantalElementen",
+  "scheefstandAantalX", "scheefstandAantalY", "scheefstandTorsie", "scheefstandEigenKolom", "houtToetsEN1995",
+  "eigenDoorsneden", "eigenCltOpbouwen", "projectInfo", "windInstellingen",
+  "rapport", "modelDimension", "model3d", "openFem3dViewSets", "openFem3dStandaardViewsUitRapport",
+  // Oude veldnaam van de 3D-weergaven (ontwikkelspoor `frame3d`); bij openen
+  // omgezet naar `openFem3dViewSets`, zie deserializeProject.
+  "frame3dViewSets",
+];
+
+/**
+ * De top-level sleutels die deze versie NIET kent, in leesvolgorde. Niet
+ * blokkerend — een onbekend veld is meestal documentatie of een veld uit een
+ * latere versie — maar wel te melden, want bij het volgende opslaan is het weg.
+ */
+export function onbekendeTopVelden(parsed: unknown): string[] {
+  if (parsed === null || typeof parsed !== "object") return [];
+  return Object.keys(parsed as Record<string, unknown>)
+    .filter((k) => !BEKENDE_TOPVELDEN.includes(k));
+}
+
+export function deserializeProject(text: string): ProjectFile {
+  const parsed = JSON.parse(text);
+  if (!isProjectFormatId(parsed.format)) {
+    throw new Error(`Onbekend bestandsformaat: ${parsed.format ?? "(geen format-tag)"}`);
+  }
+  if (typeof parsed.version !== "number") {
+    throw new Error("Bestand mist version-tag");
+  }
+  if (parsed.version > PROJECT_FORMAT_VERSION_MAX) {
+    throw new Error(`Bestand is opgeslagen met nieuwere versie (${parsed.version}) — werk je app bij`);
+  }
+  const hadExplicitDimension = parsed.modelDimension !== undefined;
+  if (hadExplicitDimension && parsed.modelDimension !== "2d" && parsed.modelDimension !== "3d") {
+    throw new ProjectBestandFout([`Onbekende modeldimensie ${JSON.stringify(parsed.modelDimension)}; alleen "2d" en "3d" bestaan.`]);
+  }
+  // Structuur. Hier stond `return parsed as ProjectFile` en verder niets: de
+  // drie poorten hierboven keken alleen naar de kaft van het bestand.
+  const redenen: string[] = [];
+  for (const veld of VERPLICHTE_LIJSTEN) {
+    if (!Array.isArray(parsed[veld])) {
+      redenen.push(
+        `Het bestand mist de lijst \`${veld}\`` +
+          (parsed[veld] === undefined ? "" : ` (er staat ${JSON.stringify(parsed[veld])})`) +
+          ". Elk projectbestand draagt nodes, beams, supports, plates, loads en " +
+          "loadCases; een lege lijst mag, het veld weglaten niet.",
+      );
+    }
+  }
+  if (redenen.length > 0) throw new ProjectBestandFout(redenen);
+  // Het analysetype aan de poort (basisaudit ruw 28): een waarde die deze
+  // versie niet kent viel stil terug op de booleaan — meestal op tweede orde.
+  // De weigering hoort hier te vallen, bij het openen, en niet halverwege het
+  // laden in de store.
+  analysetypeUitBestand(parsed.analysetype, parsed.nonlinearEnabled);
+  if (parsed.axialMaterialLoadPath !== undefined && (!Array.isArray(parsed.axialMaterialLoadPath)
+      || parsed.axialMaterialLoadPath.length === 0 || parsed.axialMaterialLoadPath.length > 100
+      || parsed.axialMaterialLoadPath.some((factor: unknown) => typeof factor !== "number" || !Number.isFinite(factor)))) {
+    throw new ProjectBestandFout(["Ongeldig axiaal Rust-FNL-lastpad: geef 1 tot 100 eindige lastfactoren op."]);
+  }
+  for (const beam of parsed.beams) {
+    const law = beam?.axialMaterialLaw;
+    if (law === undefined) continue;
+    const strength = law?.kind === "steelBilinear" ? law.yieldMpa
+      : law?.kind === "concreteCracking" ? law.tensileMpa : undefined;
+    const ratio = law?.kind === "steelBilinear" ? law.hardeningRatio
+      : law?.kind === "concreteCracking" ? law.residualRatio : undefined;
+    if (typeof strength !== "number" || !Number.isFinite(strength) || strength <= 0
+        || typeof ratio !== "number" || !Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
+      throw new ProjectBestandFout([`Staaf ${beam?.id ?? "?"}: ongeldige axiale Rust-FNL-materiaalwet.`]);
+    }
+  }
+  for (const load of parsed.loads) {
+    if (load?.type !== "thermal") continue;
+    const gradient = load.deltaTGradient;
+    const depth = load.thermalDepthMm;
+    if (gradient !== undefined && (typeof gradient !== "number" || !Number.isFinite(gradient))
+        || depth !== undefined && (typeof depth !== "number" || !Number.isFinite(depth) || depth <= 0)
+        || gradient !== undefined && gradient !== 0 && depth === undefined) {
+      throw new ProjectBestandFout([
+        `Temperatuurlast ${load?.id ?? "?"}: de gradiënt vereist een eindige waarde en een positieve afstand h in mm.`,
+      ]);
+    }
+  }
+  if (parsed.model3d !== undefined) {
+    // Het ontwikkelspoor `frame3d` bewaarde ook volumes, volumelasten,
+    // plaatrandlasten en een materiaallastpad in `model3d`; die leest
+    // parseOpenFem3DModel mee (openFem3dNativeModel) voor de native Rust-route.
+    try {
+      parsed.model3d = parseOpenFem3DModel(parsed.model3d);
+    } catch (error) {
+      throw new ProjectBestandFout([error instanceof Error ? error.message : String(error)]);
+    }
+  }
+  // Oude veldnaam (ontwikkelspoor `frame3d`, bestanden van vóór de samenvoeging
+  // met Open FEM 3D): dezelfde weergaven, nu onder `openFem3dViewSets`. Een
+  // bestand met beide velden houdt het nieuwe; het oude veld valt weg.
+  if (parsed.frame3dViewSets !== undefined) {
+    if (parsed.openFem3dViewSets === undefined) parsed.openFem3dViewSets = parsed.frame3dViewSets;
+    delete parsed.frame3dViewSets;
+  }
+  if (parsed.openFem3dViewSets !== undefined) {
+    parsed.openFem3dViewSets = parseOpenFem3DViewSets(parsed.openFem3dViewSets);
+  }
+  if (parsed.openFem3dStandaardViewsUitRapport !== undefined) {
+    parsed.openFem3dStandaardViewsUitRapport = parseOpenFem3DStandaardViewsUitRapport(parsed.openFem3dStandaardViewsUitRapport);
+  }
+  if (hadExplicitDimension && parsed.modelDimension === "2d" && parsed.model3d !== undefined) {
+    throw new ProjectBestandFout(["Een 2D-project mag geen tweede 3D-model bevatten."]);
+  }
+  // Bestanden van de eerste 3D-uitgave hadden nog geen expliciete dimensie.
+  // Een aanwezig 3D-model maakte het project toen al 3D; neem dat hier over.
+  if (parsed.modelDimension === undefined) {
+    parsed.modelDimension = parsed.model3d !== undefined ? "3d" : "2d";
+  }
+  if (parsed.modelDimension === "3d" && parsed.model3d === undefined) {
+    parsed.model3d = parseOpenFem3DModel(undefined);
+  }
+  // Combinatietypen en factoren (basisaudit ruw 29): `combinationsFromFile`
+  // weigert een onbekend type en een niet-eindige factor. Hier alvast, zodat
+  // een bestand met een tikfout niet half geladen op het scherm komt.
+  combinationsFromFile(parsed.combinations);
+  return parsed as ProjectFile;
+}
+
+// ── Tauri vs. browser detection ─────────────────────────────────────────────
+function isTauri(): boolean {
+  return typeof window !== "undefined" && !!(window as any).__TAURI_INTERNALS__;
+}
+
+// ── Save flow ──────────────────────────────────────────────────────────────
+/**
+ * Save text to a file. In Tauri: opens a native Save-dialog and writes via
+ * the fs plugin. In browser: triggers a Blob download. Returns the path that
+ * was saved to (Tauri only — empty string in browser).
+ */
+export async function saveProjectAs(text: string, suggestedName: string): Promise<string> {
+  if (isTauri()) {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+    const path = await save({
+      defaultPath: suggestedName,
+      filters: [{ name: "Open FEM Studio project", extensions: [PROJECT_FILE_EXT] }],
+    });
+    if (!path) return "";  // user cancelled
+    await writeTextFile(path, text);
+    return path as string;
+  }
+  // Browser fallback: trigger download
+  const blob = new Blob([text], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = suggestedName.endsWith(`.${PROJECT_FILE_EXT}`)
+    ? suggestedName
+    : `${suggestedName}.${PROJECT_FILE_EXT}`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return "";
+}
+
+/**
+ * Save to a known path (no dialog). Falls back to saveProjectAs in the browser.
+ */
+export async function saveProjectTo(path: string, text: string): Promise<void> {
+  if (isTauri() && path) {
+    const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+    await writeTextFile(path, text);
+    return;
+  }
+  // No known path / browser → fall back to dialog flow
+  await saveProjectAs(text, "project");
+}
+
+// ── Open flow ──────────────────────────────────────────────────────────────
+/**
+ * Open a project file. In Tauri: native dialog + fs read. In browser: hidden
+ * file-input. Returns { text, path } — text is the raw JSON, path is the
+ * file path (Tauri only) or filename (browser).
+ */
+export async function openProject(importFilters: { name: string; extensions: string[] }[] = []): Promise<
+  | { soort: "project"; text: string; path: string }
+  | { soort: "resultaten"; text: string; path: string }
+  | { soort: "import"; path: string }
+  | null
+> {
+  if (isTauri()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const { readTextFile } = await import("@tauri-apps/plugin-fs");
+    const selected = await open({
+      multiple: false,
+      filters: [
+        { name: "Alle ondersteunde bestanden", extensions: [...new Set([...PROJECT_FILE_EXTS, RESULTATEN_FILE_EXT, ...importFilters.flatMap((filter) => filter.extensions)])] },
+        { name: "Open FEM Studio project", extensions: [...PROJECT_FILE_EXTS] },
+        { name: "Open FEM Studio resultaten (IFC4)", extensions: [RESULTATEN_FILE_EXT] },
+        ...importFilters,
+      ],
+    });
+    if (!selected || Array.isArray(selected)) return null;
+    const path = selected as string;
+    const type = path.split(".").pop()?.toLowerCase() ?? "";
+    if (type === RESULTATEN_FILE_EXT) return { soort: "resultaten", text: await readTextFile(path), path };
+    if (!PROJECT_FILE_EXTS.includes(type)) return { soort: "import", path };
+    const text = await readTextFile(path);
+    return { soort: "project", text, path };
+  }
+  // Browser: hidden <input type=file>
+  return await new Promise(resolve => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = `${[...PROJECT_FILE_EXTS, RESULTATEN_FILE_EXT].map((e) => `.${e}`).join(",")},application/json`;
+    input.hidden = true;
+    document.body.appendChild(input);
+    const finish = (value: { soort: "project" | "resultaten"; text: string; path: string } | null) => {
+      input.remove();
+      resolve(value);
+    };
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) { finish(null); return; }
+      const text = await file.text();
+      const resultaten = file.name.toLowerCase().endsWith(`.${RESULTATEN_FILE_EXT}`);
+      finish({ soort: resultaten ? "resultaten" : "project", text, path: file.name });
+    };
+    input.addEventListener("cancel", () => finish(null), { once: true });
+    input.click();
+  });
+}

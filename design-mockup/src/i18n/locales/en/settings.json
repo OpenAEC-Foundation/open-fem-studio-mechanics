@@ -1,0 +1,150 @@
+{
+  "title": "Settings",
+  "resetToDefaults": "Reset to Defaults",
+  "resetConfirm": "Are you sure you want to reset all settings to their default values?",
+  "tabs": {
+    "general": "General",
+    "appearance": "Appearance",
+    "calculation": "Calculation",
+    "aiAssistant": "AI assistant (MCP)",
+    "editor": "Editor",
+    "files": "Files",
+    "shortcuts": "Shortcuts",
+    "plugins": "Plugins",
+    "about": "About"
+  },
+  "general": {
+    "application": "Application",
+    "language": "Language",
+    "startup": "Startup",
+    "restoreSession": "Restore last session on startup",
+    "checkUpdates": "Check for updates automatically",
+    "author": "Author",
+    "authorName": "Author name"
+  },
+  "appearance": {
+    "theme": "Theme",
+    "themeDescription": "Choose a color theme for the application.",
+    "light": "Light",
+    "dark": "Dark",
+    "blueprint": "Blueprint",
+    "highContrastDark": "High contrast dark",
+    "highContrastLight": "High contrast light",
+    "font": "Font",
+    "uiFontSize": "UI Font Size"
+  },
+  "calculation": {
+    "engine": "Calculation engine",
+    "solver": "Solver",
+    "automatic": "Automatic (recommended)",
+    "automaticDescription": "Open FEM automatically selects one available solver that supports the complete analysis.",
+    "manualDescription": "{{solver}} is used when it supports the requested analysis.",
+    "available": "Available",
+    "unavailable": "Not included yet",
+    "license": "License",
+    "version": "Version",
+    "supports": "Supports",
+    "adapterPending": "The Rust adapter is registered and becomes selectable when it is shipped with the app.",
+    "analysis": {
+      "linear": "linear",
+      "p-delta": "second order P-Δ",
+      "material-nonlinear": "material nonlinear"
+    },
+    "elements": {
+      "frame": "frame",
+      "plate": "plate",
+      "solid": "solid"
+    }
+  },
+  "editor": {
+    "general": "General",
+    "wordWrap": "Word wrap",
+    "lineNumbers": "Show line numbers",
+    "minimap": "Show minimap",
+    "indentation": "Indentation",
+    "tabSize": "Tab size",
+    "insertSpaces": "Insert spaces instead of tabs",
+    "nSpaces": "{{count}} spaces"
+  },
+  "files": {
+    "autoSave": "Auto Save",
+    "autoSaveOption": "Auto save",
+    "off": "Off",
+    "afterDelay": "After delay",
+    "onFocusChange": "On focus change",
+    "onWindowChange": "On window change",
+    "encoding": "File Encoding",
+    "defaultEncoding": "Default encoding",
+    "backup": "Backup",
+    "autoBackup": "Create automatic backups"
+  },
+  "shortcuts": {
+    "placeholder": "Keyboard shortcuts configuration will appear here."
+  },
+  "plugins": {
+    "placeholder": "Plugin management will appear here."
+  },
+  "library": {
+    "title": "Library",
+    "subtitle": "Library — read-only reference. Values come from the section database and code tables (EN 338 / EN 14080); editing is not possible here.",
+    "tabSections": "Steel sections",
+    "tabMaterials": "Materials",
+    "search": "Search…",
+    "noResults": "No results for this filter.",
+    "colName": "Name",
+    "colA": "A [mm²]",
+    "colIy": "Iy [×10⁶ mm⁴]",
+    "colDims": "h × b × tw × tf [mm]",
+    "colFy": "fy [N/mm²]",
+    "colE": "E [N/mm²]",
+    "colEmean": "E₀,mean [N/mm²]",
+    "steelGroup": "Steel grades (EN 1993)",
+    "timberGroup": "Timber strength classes (EN 338 / EN 14080)"
+  },
+  "aiAssistant": {
+    "title": "Control by an AI assistant",
+    "allow": "Allow an AI assistant to control the app (MCP)",
+    "allowDescription": "Control is on after a fresh install. You can switch it off here; that choice survives updates. An AI assistant such as Claude Desktop or Claude Code can then operate the app through the bundled MCP server: build models, calculate, run checks and create reports. Only programs on this computer can reach the channel, with a key that is new at every start. The choice applies immediately and is remembered; Save or Cancel does not change it.",
+    "statusActive": "Active on port {{poort}}",
+    "statusOff": "Off",
+    "statusFailed": "Not started: {{fout}}",
+    "statusEnv": "Switched on for this session when the app started (by an AI assistant through gui_start_app, or with OPENAEC_GUI_CONTROL=1); the saved setting is off, so the channel will be off at the next start.",
+    "stopSession": "Switch off now",
+    "statusBrowser": "Only available in the desktop app.",
+    "busy": "Working…",
+    "connect": "Connect an AI assistant",
+    "server": "MCP server",
+    "serverMissing": "The MCP server ({{naam}}) was not found.",
+    "serverSearched": "Searched in:",
+    "serverHint": "The installer puts the server next to the app. In a development build: cargo build --release -p openaec-mcp-server.",
+    "claudeDesktop": "Claude Desktop",
+    "claudeDesktopDescription": "Adds the entry \"{{naam}}\" to {{config}}. Other servers and settings stay as they are; a backup copy is made next to the file first.",
+    "claudeDesktopButton": "Add to Claude Desktop",
+    "result": {
+      "aangemaakt": "Created {{config}} with the entry for Open FEM Studio.",
+      "toegevoegd": "Added to {{config}}.",
+      "bijgewerkt": "Updated in {{config}}.",
+      "ongewijzigd": "Already set up in {{config}}; nothing changed."
+    },
+    "backup": "Backup: {{pad}}",
+    "restart": "Restart Claude Desktop to load the server.",
+    "folderCreated": "The Claude Desktop folder did not exist yet. Is Claude Desktop installed?",
+    "duplicate": "Note: {{namen}} starts the same server; Claude Desktop will then show the tools twice. Remove that entry yourself if it is no longer needed.",
+    "failed": "Not added: {{fout}}",
+    "invalidJson": "{{config}} is not valid JSON: error at line {{regel}}, column {{kolom}}. The file was not changed.",
+    "claudeCode": "Claude Code",
+    "claudeCodeDescription": "Run this command in a terminal:",
+    "otherClients": "Other MCP clients",
+    "otherClientsDescription": "Add this fragment to the client's MCP configuration:",
+    "copy": "Copy",
+    "copied": "Copied",
+    "startApp": "If the app is not running yet, an assistant can start it with the tool gui_start_app; the channel is then on for that session only. If the app is already open, this setting must be on."
+  },
+  "about": {
+    "appName": "Open FEM Studio",
+    "version": "Version",
+    "framework": "Framework",
+    "license": "License",
+    "description": "A template application for building cross-platform desktop apps with Tauri."
+  }
+}

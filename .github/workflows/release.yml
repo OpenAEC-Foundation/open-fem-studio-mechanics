@@ -1,0 +1,350 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. Pre-flight check ───────────────────────────────────
+  # The frontend lives in design-mockup/ (build.frontendDist in
+  # src-tauri/tauri.conf.json). If it does not build, there is no point in
+  # building three platforms.
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Version YYYY.W.N identical everywhere, and equal to the tag (vYYYY.W.N).
+      - name: Version number
+        run: |
+          node scripts/versie.mjs --check
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            app=$(node -p "require('./design-mockup/package.json').version")
+            [ "v$app" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $app"; exit 1; }
+          fi
+      - uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('design-mockup/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      - run: npm ci
+        working-directory: design-mockup
+      - run: npm run build
+        working-directory: design-mockup
+
+  # ── 2. Installers bouwen ──────────────────────────────────
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            label: Windows
+            bundles: msi,nsis
+          - platform: macos-latest
+            rust-target: universal-apple-darwin
+            label: macOS
+            bundles: app,dmg
+          - platform: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            label: Linux
+            bundles: appimage,deb
+
+    name: Build – ${{ matrix.label }}
+    runs-on: ${{ matrix.platform }}
+
+    # Signing only happens when the organisation secrets are available (same
+    # setup as the other OpenAEC studios). Without them the release is built
+    # unsigned: a build must not fail on a missing certificate.
+    #   Windows: Azure Trusted Signing (AZURE_*), via bundle.windows.signCommand.
+    #   macOS:   Developer ID + notarization with an App Store Connect API key (APPLE_*).
+    env:
+      WIN_SIGN: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME != '' }}
+      MAC_SIGN: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_API_KEY != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Cache npm
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('design-mockup/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust targets (macOS universal)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            patchelf
+
+      # beforeBuildCommand in tauri.conf.json runs `cd design-mockup &&
+      # npm run build`, so its dependencies must be installed first.
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: design-mockup
+
+      # tauri-action runs `npm run tauri build` in the project root, which needs
+      # @tauri-apps/cli from the root dependencies.
+      - name: Install root dependencies
+        run: npm ci
+
+      # The MCP server ships as a separate binary in the installer (externalBin in
+      # src-tauri/tauri.bundel.conf.json). Tauri needs it before the build as
+      # binaries/openaec-mcp-server-<triple>; on macOS the script merges both
+      # architectures with lipo.
+      - name: Build MCP server (shipped in the installer)
+        run: node scripts/mcp-sidecar.mjs --target ${{ matrix.rust-target }}
+
+      # ── Windows signing (Azure Trusted Signing) ──
+      # Installs signtool and the Trusted Signing dlib on the runner and signs the
+      # MCP sidecar in src-tauri/binaries. Tauri then signs every Windows binary
+      # itself once bundle.windows.signCommand is set: the sidecar, the app exe
+      # (after the bundler has written the bundle type into it), the NSIS dlls,
+      # uninstall.exe and the installers.
+      - name: Install Azure signing tools (Windows)
+        if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
+        uses: azure/trusted-signing-action@v1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+          cache-dependencies: false
+          files-folder: ${{ github.workspace }}/src-tauri/binaries
+          files-folder-filter: exe
+          files-folder-depth: 1
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # A CI config that extends tauri.bundel.conf.json (the MCP sidecar) with a
+      # signCommand for the signtool + dlib installed above.
+      - name: Configure Tauri sign command (Windows)
+        if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
+        shell: pwsh
+        env:
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_ACCOUNT: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_PROFILE: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'TrustedSigning'
+          $signtool = Get-ChildItem $root -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          $dlib = Get-ChildItem $root -Recurse -Filter Azure.CodeSigning.Dlib.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $signtool -or -not $dlib) { Write-Error "signtool or the Trusted Signing dlib not found under $root"; exit 1 }
+          $metadata = Join-Path $env:RUNNER_TEMP 'trusted-signing-metadata.json'
+          @{
+            Endpoint = $env:AZURE_ENDPOINT
+            CodeSigningAccountName = $env:AZURE_ACCOUNT
+            CertificateProfileName = $env:AZURE_PROFILE
+          } | ConvertTo-Json | Set-Content -Path $metadata -Encoding utf8
+          $conf = Get-Content src-tauri/tauri.bundel.conf.json -Raw | ConvertFrom-Json -AsHashtable
+          $conf.bundle.windows = @{ signCommand = @{
+            cmd = $signtool.FullName
+            args = @('sign', '/v', '/fd', 'SHA256', '/tr', 'http://timestamp.acs.microsoft.com', '/td', 'SHA256',
+                     '/dlib', $dlib.FullName, '/dmdf', $metadata, '%1')
+          } }
+          $conf | ConvertTo-Json -Depth 10 | Set-Content -Path src-tauri/tauri.signing.conf.json -Encoding utf8
+          Get-Content src-tauri/tauri.signing.conf.json
+
+      # ── macOS signing and notarization ──
+      # Notarization with an App Store Connect API key (Apple ID + app-specific
+      # password gave persistent HTTP 500 errors from the notary API).
+      - name: Write App Store Connect API key (macOS)
+        if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: printf '%s' "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/apple-api-key.p8"
+
+      # Unsigned: Linux always, Windows and macOS while their secrets are missing.
+      - name: Build Tauri app
+        if: >-
+          !(runner.os == 'Windows' && env.WIN_SIGN == 'true') &&
+          !(runner.os == 'macOS' && env.MAC_SIGN == 'true')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundel.conf.json
+
+      - name: Build Tauri app (Windows, signed)
+        if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The dlib authenticates with Azure using these.
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        with:
+          args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.signing.conf.json
+
+      - name: Build Tauri app (macOS, signed and notarized)
+        if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundel.conf.json
+
+      # Verify what users download: both installers carry a valid signature.
+      - name: Verify signatures (Windows)
+        if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/${{ matrix.rust-target }}/release/bundle"
+          $files = @(Get-ChildItem "$bundle/nsis/*-setup.exe") + @(Get-ChildItem "$bundle/msi/*.msi")
+          $fout = $false
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            Write-Output ("{0}: {1} ({2})" -f $f.Name, $sig.Status, $sig.SignerCertificate.Subject)
+            if ($sig.Status -ne 'Valid') { $fout = $true }
+          }
+          if ($fout -or $files.Count -lt 2) { Write-Error 'Not all Windows installers are validly signed'; exit 1 }
+
+      # The .app inside the dmg (what users actually get): signature,
+      # Gatekeeper and the stapled notarization ticket.
+      - name: Verify signature and notarization (macOS)
+        if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DMG_PATH="$(find src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg -name '*.dmg' -print -quit)"
+          test -n "$DMG_PATH"
+          MOUNT_DIR="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG_PATH"
+          APP_SRC="$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_SRC"
+          mkdir -p "$RUNNER_TEMP/verify-app"
+          cp -R "$APP_SRC" "$RUNNER_TEMP/verify-app/"
+          hdiutil detach "$MOUNT_DIR"
+          APP_PATH="$RUNNER_TEMP/verify-app/$(basename "$APP_SRC")"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose=4 "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: open-fem-studio-mechanics-${{ matrix.label }}
+          path: |
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/nsis/*.exe
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/msi/*.msi
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/deb/*.deb
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ── 3. Publish a draft release ────────────────────────────
+  # Draft, so the release notes can be reviewed first.
+  publish:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Collect installer files
+        run: |
+          mkdir -p release
+          find artifacts -name '*-setup.exe' -exec cp {} release/ \;
+          find artifacts -name '*.msi' -exec cp {} release/ \;
+          find artifacts -name '*.dmg' -exec cp {} release/ \;
+          find artifacts -name '*.AppImage' -exec cp {} release/ \;
+          find artifacts -name '*.deb' -exec cp {} release/ \;
+          ls -la release/
+
+      # As in OpenAEC Blueprint: checksums, and the checksums and the AppImage
+      # signed with the organisation's OpenPGP key. Without the key only the
+      # checksums are published.
+      - name: Checksums and OpenPGP signature (Linux)
+        env:
+          OPENAEC_GPG_PRIVATE_KEY: ${{ secrets.OPENAEC_GPG_PRIVATE_KEY }}
+          OPENAEC_GPG_PASSPHRASE: ${{ secrets.OPENAEC_GPG_PASSPHRASE }}
+          OPENAEC_GPG_FINGERPRINT: ${{ vars.OPENAEC_GPG_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          if [[ -z "${OPENAEC_GPG_PRIVATE_KEY:-}" || -z "${OPENAEC_GPG_PASSPHRASE:-}" || -z "${OPENAEC_GPG_FINGERPRINT:-}" ]]; then
+            echo "OpenPGP key not available; not signed."; exit 0
+          fi
+          export GNUPGHOME=$(mktemp -d)
+          printf '%s\n' "$OPENAEC_GPG_PRIVATE_KEY" | gpg --batch --import
+          fpr=$(tr -d ' ' <<< "$OPENAEC_GPG_FINGERPRINT")
+          gpg --batch --list-secret-keys --with-colons | grep -q "$fpr" || { echo "::error::the key is not $fpr"; exit 1; }
+          for f in release/SHA256SUMS release/*.AppImage; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENAEC_GPG_PASSPHRASE" --local-user "$fpr" --armor --detach-sign --output "$f.asc" "$f"
+            gpg --batch --verify "$f.asc" "$f"
+          done
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Open FEM Studio Mechanics ${{ github.ref_name }}
+          prerelease: false
+          draft: true
+          generate_release_notes: true
+          body: |
+            **Downloads:**
+            - **Windows:** `.exe` (NSIS-installer) / `.msi`
+            - **macOS:** `.dmg` (universal)
+            - **Linux:** `.AppImage` / `.deb` (OpenPGP: `.asc`, checksums in `SHA256SUMS`)
+          files: release/*

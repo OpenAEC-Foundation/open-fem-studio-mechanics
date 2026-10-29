@@ -1,0 +1,175 @@
+// De JS-kant en de Rust-kant van elke Tauri-plugin moeten dezelfde hoofd- en
+// subversie hebben. Tauri brengt ze per paar uit; loopt de JS-plugin achter,
+// dan roept hij commando's aan die de Rust-plugin niet (meer) kent.
+//
+// Aanleiding: @tauri-apps/plugin-dialog 2.6.0 riep `plugin:dialog|ask` aan,
+// terwijl tauri-plugin-dialog 2.7.1 alleen `message`, `open` en `save` kent.
+// De vraag "opslaan?" gooide daardoor een fout, de sluitbeveiliging brak af
+// vóór destroy() en het kruisje deed niets zodra het model gewijzigd was.
+//
+//   [1] versies  — package-lock.json naast Cargo.lock, per plugin en voor de kern
+//   [2] commando — de geïnstalleerde JS-dialoogplugin roept geen commando aan
+//                  dat in de rechten van de Rust-plugin ontbreekt (als de
+//                  cargo-registry op schijf staat)
+//   [3] vangnet  — de sluitbeveiliging vangt een falende native dialoog op
+//   [4] links    — externe links lopen via één helper, openExternal in
+//                  src/lib/tauri.ts (#38); het gedrag van die helper toetst
+//                  test-extern-openen.mjs
+//   [5] os       — de os-plugin staat in een try met terugval buiten Tauri
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+
+const HIER = dirname(fileURLToPath(import.meta.url));
+let geslaagd = 0;
+let gefaald = 0;
+const log = (s) => console.log(s);
+function check(naam, ok, detail = "") {
+  if (ok) { geslaagd++; log(`  ✓ ${naam}`); } else { gefaald++; log(`  ✗ ${naam}${detail ? " — " + detail : ""}`); }
+}
+const lees = (...p) => readFileSync(join(HIER, ...p), "utf8").replace(/\r\n/g, "\n");
+
+// ── [1] versies ─────────────────────────────────────────────────────────────
+log("[1] JS- en Rust-versie per Tauri-plugin");
+const lock = JSON.parse(lees("package-lock.json"));
+const cargoLock = lees("..", "src-tauri", "Cargo.lock");
+const pakket = JSON.parse(lees("package.json"));
+
+const rustVersie = (crate) =>
+  new RegExp(`name = "${crate}"\\nversion = "([^"]+)"`).exec(cargoLock)?.[1];
+const jsVersie = (naam) => lock.packages?.[`node_modules/${naam}`]?.version;
+const hoofdSub = (v) => v?.split(".").slice(0, 2).join(".");
+
+const paren = Object.keys({ ...pakket.dependencies, ...pakket.devDependencies })
+  .filter((n) => n.startsWith("@tauri-apps/plugin-"))
+  .map((n) => [n, "tauri-" + n.slice("@tauri-apps/".length)]);
+paren.push(["@tauri-apps/api", "tauri"]);
+
+check("er zijn Tauri-plugins gevonden om te vergelijken", paren.length >= 2, `${paren.length}`);
+for (const [js, crate] of paren) {
+  const j = jsVersie(js);
+  const r = rustVersie(crate);
+  check(`${js} ${j} naast ${crate} ${r}: zelfde hoofd- en subversie`,
+    Boolean(j) && Boolean(r) && hoofdSub(j) === hoofdSub(r),
+    !j ? "niet in package-lock.json" : !r ? "niet in Cargo.lock" : "werk de achterlopende kant bij");
+}
+// Zet Cargo.toml een plugin vast op =x.y.z, dan hoort package.json ~x.y.z: zo
+// installeert npm geen subversie die de Rust-kant nog niet kent (#38).
+const cargoToml = lees("..", "src-tauri", "Cargo.toml");
+const bereiken = { ...pakket.dependencies, ...pakket.devDependencies };
+for (const [js, crate] of paren) {
+  const vast = new RegExp(`^${crate} = "=([0-9.]+)"`, "m").exec(cargoToml)?.[1];
+  if (!vast) continue;
+  check(`${js} "${bereiken[js]}" past bij ${crate} "=${vast}"`, bereiken[js] === `~${vast}`, `verwacht "~${vast}"`);
+}
+
+// De pakketten alleen opnemen is niet genoeg: Tauri moet de plugins ook
+// initialiseren en de gebruikte JS-functies toegang geven.
+const rustApp = lees("..", "src-tauri", "src", "lib.rs");
+const capabilities = JSON.parse(lees("..", "src-tauri", "capabilities", "default.json"));
+for (const plugin of ["opener", "os"]) {
+  check(`${plugin}: Rust-plugin geregistreerd`, rustApp.includes(`.plugin(tauri_plugin_${plugin}::init())`));
+}
+for (const permission of ["opener:allow-open-url", "opener:allow-default-urls", "os:allow-arch", "os:allow-os-type", "os:allow-version"]) {
+  check(`${permission}: toegestaan`, capabilities.permissions.includes(permission));
+}
+
+// ── [2] commando's van de dialoogplugin ─────────────────────────────────────
+log("\n[2] de JS-dialoogplugin roept alleen commando's aan die de Rust-plugin kent");
+const jsBron = lees("node_modules", "@tauri-apps", "plugin-dialog", "dist-js", "index.js");
+const aangeroepen = [...new Set([...jsBron.matchAll(/invoke\('plugin:dialog\|([a-z_]+)'/g)].map((m) => m[1]))];
+check("de JS-plugin roept commando's aan", aangeroepen.length > 0, aangeroepen.join(", "));
+
+const registry = join(process.env.CARGO_HOME ?? join(homedir(), ".cargo"), "registry", "src");
+const rustDialog = rustVersie("tauri-plugin-dialog");
+let commandoMap = null;
+if (existsSync(registry)) {
+  for (const index of readdirSync(registry)) {
+    const p = join(registry, index, `tauri-plugin-dialog-${rustDialog}`, "permissions", "autogenerated", "commands");
+    if (existsSync(p)) { commandoMap = p; break; }
+  }
+}
+if (!commandoMap) {
+  log(`  · overgeslagen: tauri-plugin-dialog ${rustDialog} staat niet in de cargo-registry op deze machine`);
+} else {
+  const bekend = readdirSync(commandoMap).map((f) => f.replace(/\.toml$/, ""));
+  for (const c of aangeroepen) {
+    check(`commando "${c}" bestaat in tauri-plugin-dialog ${rustDialog}`, bekend.includes(c), `bekend: ${bekend.join(", ")}`);
+  }
+}
+
+// ── [3] de sluitbeveiliging ─────────────────────────────────────────────────
+// Sinds 2026-10-27 vraagt de app dit in een eigen venster (OnopgeslagenDialog)
+// met drie knoppen, in plaats van twee native dialogen achter elkaar. Een
+// falende native dialoog kan de gebruiker dus niet meer opsluiten; wat nu moet
+// gelden: geen native ask/confirm meer in deze route, Esc en het kruisje zijn
+// Annuleren, en alleen een expliciete keuze "Niet opslaan" gooit werk weg.
+log("\n[3] de sluitbeveiliging vraagt het in een eigen venster, Annuleren is de veilige uitweg");
+const app = lees("src", "App.tsx");
+const blok = /const confirmUnsavedAction = useCallback\([\s\S]*?\n  \}, \[handleSaveProject, t\]\);/.exec(app)?.[0] ?? "";
+check("confirmUnsavedAction is in de bron gevonden", blok.length > 200, `lengte ${blok.length}`);
+check("geen native ask/confirm meer in de sluitbeveiliging", !/plugin-dialog/.test(blok));
+check("doorgaan zonder opslaan alleen na de keuze \"niet\"", /return keuze === "niet";/.test(blok));
+const dialoog = lees("src", "components", "OnopgeslagenDialog.tsx");
+check("Esc of het kruisje van het venster = Annuleren", /onClose=\{\(\) => onKeuze\("annuleren"\)\}/.test(dialoog));
+
+// ── [4] externe links via één helper ───────────────────────────────────────
+// Aanleiding (#38): IfcViewerPanel riep openUrl aan zonder await en zonder
+// terugval; in de browser en bij een geweigerde IPC gaf dat een onafgehandelde
+// rejection en ging de link niet open. Een <a target="_blank"> zonder eigen
+// onClick opent in de app via het klikscript van de plugin, ook zonder catch.
+log("\n[4] externe links lopen via openExternal in src/lib/tauri.ts");
+const bronbestanden = (map) => readdirSync(map, { withFileTypes: true }).flatMap((item) => {
+  const pad = join(map, item.name);
+  if (item.isDirectory()) return bronbestanden(pad);
+  return /\.tsx?$/.test(item.name) ? [pad] : [];
+});
+const bron = bronbestanden(join(HIER, "src")).map((pad) => ({
+  rel: relative(HIER, pad).replace(/\\/g, "/"),
+  tekst: readFileSync(pad, "utf8").replace(/\r\n/g, "\n"),
+}));
+const HELPER = "src/lib/tauri.ts";
+const buitenHelper = bron.filter((b) => b.rel !== HELPER);
+const metOpener = buitenHelper.filter((b) => /@tauri-apps\/plugin-opener|\bopenUrl\b/.test(b.tekst)).map((b) => b.rel);
+check("openUrl en @tauri-apps/plugin-opener komen alleen in src/lib/tauri.ts voor", metOpener.length === 0, metOpener.join(", "));
+
+const helper = bron.find((b) => b.rel === HELPER)?.tekst ?? "";
+const openExternalBron = /export async function openExternal\(url: string\): Promise<void> \{[\s\S]*?\n\}/.exec(helper)?.[0] ?? "";
+check("openExternal(url) staat in src/lib/tauri.ts", openExternalBron.length > 0);
+check("in Tauri: await openUrl(url) via de plugin, binnen try/catch",
+  /if \(isTauriApp\(\)\) \{\s*try \{[\s\S]*?await import\("@tauri-apps\/plugin-opener"\);[\s\S]*?await openUrl\(url\);\s*return;\s*\} catch/.test(openExternalBron));
+check("anders of na een fout: window.open(url, \"_blank\", \"noopener,noreferrer\"), zelf ook in try/catch",
+  /try \{\s*window\.open\(url, "_blank", "noopener,noreferrer"\);\s*\} catch/.test(openExternalBron));
+
+const IMPORT_HELPER = /import \{[^}]*\bopenExternal\b[^}]*\} from "(?:\.\.\/)+lib\/tauri"/;
+const links = bron.filter((b) => b.rel.endsWith(".tsx")).flatMap((b) =>
+  [...b.tekst.matchAll(/<a\s(?:=>|[^>])*>/g)].filter((m) => /\bhref=/.test(m[0])).map((m) => ({ ...b, tag: m[0] })));
+check("links met href gevonden (Backstage, wateraccumulatie)", links.length >= 4, `${links.length}`);
+const losseLinks = links.filter((l) => !/\bonClick=/.test(l.tag) || !IMPORT_HELPER.test(l.tekst));
+check("elke link met href heeft een onClick en zijn bestand gebruikt openExternal", losseLinks.length === 0,
+  losseLinks.map((l) => `${l.rel}: ${l.tag.slice(0, 80)}`).join("; "));
+const helperGebruikers = ["src/components/backstage/Backstage.tsx", "src/components/feedback/FeedbackDialog.tsx",
+  "src/components/panels/IfcViewerPanel.tsx", "src/components/fem/WaterAccumulation2DDialog.tsx"];
+for (const rel of helperGebruikers) {
+  const b = bron.find((x) => x.rel === rel);
+  check(`${rel} gebruikt openExternal uit lib/tauri`, Boolean(b) && IMPORT_HELPER.test(b.tekst) && /\bopenExternal\(/.test(b.tekst));
+}
+// window.open buiten de helper alleen voor eigen vensters van de app (los
+// rekenvenster, afdrukvenster); een externe link hoort via de helper.
+const EIGEN_VENSTERS = ["src/hooks/useWindowManager.ts", "src/io/reportExport.ts"];
+const andereOpen = buitenHelper.filter((b) => /window\.open\(/.test(b.tekst) && !EIGEN_VENSTERS.includes(b.rel)).map((b) => b.rel);
+check("window.open buiten de helper alleen voor eigen vensters", andereOpen.length === 0, andereOpen.join(", "));
+
+// ── [5] de os-plugin buiten Tauri ───────────────────────────────────────────
+// De functies van @tauri-apps/plugin-os lezen window.__TAURI_OS_PLUGIN_INTERNALS__
+// en gooien buiten de app een TypeError; dat moet in een try met terugval.
+log("\n[5] de os-plugin staat in een try met terugval");
+const metOs = bron.filter((b) => b.tekst.includes("@tauri-apps/plugin-os")).map((b) => b.rel);
+check("plugin-os alleen in FeedbackDialog.tsx", JSON.stringify(metOs) === JSON.stringify(["src/components/feedback/FeedbackDialog.tsx"]), metOs.join(", "));
+const osInfo = /async function getOsInfo\(\): Promise<string> \{[\s\S]*?\n\}/.exec(lees("src", "components", "feedback", "FeedbackDialog.tsx"))?.[0] ?? "";
+check("import en os.type/version/arch binnen try, terugval op navigator.platform",
+  /try \{\s*const os = await import\("@tauri-apps\/plugin-os"\);[\s\S]*?os\.type\(\)[\s\S]*?\} catch \{\s*return navigator\.platform/.test(osInfo));
+
+log(`\n${geslaagd} geslaagd, ${gefaald} gefaald`);
+process.exit(gefaald > 0 ? 1 : 0);

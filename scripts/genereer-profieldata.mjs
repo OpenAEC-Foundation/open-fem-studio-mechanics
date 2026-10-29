@@ -1,0 +1,2190 @@
+#!/usr/bin/env node
+/**
+ * genereer-profieldata.mjs — genereert doorsnedegrootheden van staalprofielen
+ * UIT genormeerde basisgeometrie, in plaats van hele tabellen over te typen.
+ *
+ * Waarom: overtypen van afgeleide grootheden (Av;z, It, Iw, Wpl) is de
+ * foutgevoeligste stap in een profieldatabase. Basisgeometrie (h, b, tw, tf, r
+ * resp. h, b, t resp. d, t) is genormeerd, kort en goed te controleren; al het
+ * andere volgt uit gesloten formules die hieronder expliciet staan.
+ *
+ * Gebruik:
+ *   node scripts/genereer-profieldata.mjs --valideer
+ *       Herberekent alle profielen die al in profiles.json staan en rapporteert
+ *       de afwijking per grootheid en per reeks. Dit is het bewijs dat de
+ *       formules kloppen.
+ *   node scripts/genereer-profieldata.mjs --schrijf
+ *       Schrijft de NIEUWE profielen naar
+ *       src-tauri/crates/steel-profiles/data/profielen-uitbreiding.json.
+ *   node scripts/genereer-profieldata.mjs --zelfcontrole
+ *       Interne consistentiecontrole op de uitbreiding.
+ *   node scripts/genereer-profieldata.mjs --eindcontrole
+ *       Controleert de HELE profiles.json op de twee formulevrije bovengrenzen
+ *       en op interne consistentie.
+ *   zonder vlaggen: alle bovenstaande (dus NIET --herstel).
+ *
+ *   node scripts/genereer-profieldata.mjs --herstel
+ *       Herberekent uitsluitend de 39 met de hand overgetypte profielen die
+ *       aantoonbaar onveilige waarden hadden (26 holle doorsneden + 13
+ *       U-profielen; zie sectie 11). Alle andere regels blijven byte-identiek.
+ *
+ *   node scripts/genereer-profieldata.mjs --motor-valideer
+ *   node scripts/genereer-profieldata.mjs --motor-herstel
+ *       Rekenen met de EXACTE MOTOR uit crates/section-properties in plaats van
+ *       met de formules hieronder. Zie sectie 12. `--motor-herstel` schrijft
+ *       uitsluitend de grootheden waarvan is vastgesteld dat de motor beter is
+ *       dan de database (MOTOR_OVERNAME).
+ *
+ * Alleen --herstel en --motor-herstel schrijven in profiles.json; beide vlaggen
+ * moeten expliciet gegeven worden en zitten niet in de vlagloze uitvoering.
+ *
+ * Geen npm-dependencies; alleen Node-ingebouwde modules. De motorvlaggen hebben
+ * daarnaast een Rust-toolchain nodig.
+ */
+import { execFileSync } from "node:child_process";
+import {
+  existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const hier = dirname(fileURLToPath(import.meta.url));
+const wortel = join(hier, "..");
+const bestaandPad = join(
+  wortel, "src-tauri", "crates", "steel-profiles", "data", "profiles.json",
+);
+const uitbreidingPad = join(
+  wortel, "src-tauri", "crates", "steel-profiles", "data",
+  "profielen-uitbreiding.json",
+);
+
+/* ==================================================================== *
+ * 1. Meetkundige hulpgrootheden voor de walsuitronding                 *
+ * ==================================================================== *
+ *
+ * Een walsuitronding (of buitenhoekafronding) is het gebied tussen een
+ * scherpe hoek r x r en de kwartcirkel met straal r. Alle bijdragen aan
+ * A, I, Wpl en het zwaartepunt volgen uit drie exacte momenten van dat
+ * gebied, gemeten vanaf de SCHERPE hoek (coordinaat u loopt van 0 aan de
+ * scherpe hoek tot r bij het middelpunt van de boog):
+ *
+ *   opp        = INT dA      = r^2 * (1 - pi/4)
+ *   statisch   = INT u dA    = r^3 * (5/6 - pi/4)
+ *   traagheid  = INT u^2 dA  = r^4 * (1 - 5*pi/16)
+ *
+ * Afleiding: vierkant [0,r]^2 minus kwartschijf met middelpunt (r,r).
+ * Controle (zie zelftest onderaan): met r = h/2 = b/2 levert de afgeronde
+ * rechthoek exact de cirkel op (I = pi*r^4/4).
+ */
+const K_A = 1 - Math.PI / 4;           // 0.2146018...
+const K_S = 5 / 6 - Math.PI / 4;       // 0.0479351...
+const K_I = 1 - (5 * Math.PI) / 16;    // 0.0182525...
+/** Zwaartepunt van de uitronding, gemeten vanaf de scherpe hoek. */
+const K_C = K_S / K_A;                 // 0.2233730...
+
+/** Oppervlak van EEN uitronding. */
+const uitrondingOpp = (r) => K_A * r * r;
+
+/**
+ * Traagheidsmoment van EEN uitronding om een as op afstand `d` van de scherpe
+ * hoek, waarbij het materiaal VAN die as AF ligt (d = h_w/2 bij een I-profiel:
+ * de scherpe hoek zit op h_w/2 van de neutrale lijn, de uitronding ligt naar
+ * binnen). Volgt uit INT (d - u)^2 dA.
+ */
+function uitrondingTraagheidNaarBinnen(r, d) {
+  return K_I * r ** 4 - 2 * d * K_S * r ** 3 + d * d * K_A * r * r;
+}
+
+/**
+ * Idem, maar het materiaal ligt VAN de as AF gerekend naar BUITEN
+ * (d = t_w/2 bij Iz van een I-profiel). Volgt uit INT (d + u)^2 dA.
+ */
+function uitrondingTraagheidNaarBuiten(r, d) {
+  return K_I * r ** 4 + 2 * d * K_S * r ** 3 + d * d * K_A * r * r;
+}
+
+/** Statisch moment van EEN uitronding om een as op afstand d, naar binnen. */
+const uitrondingStatischNaarBinnen = (r, d) => d * K_A * r * r - K_S * r ** 3;
+/** Statisch moment van EEN uitronding om een as op afstand d, naar buiten. */
+const uitrondingStatischNaarBuiten = (r, d) => d * K_A * r * r + K_S * r ** 3;
+
+/* -------------------------------------------------------------------- *
+ * Afgeronde rechthoek (gebruikt voor koker-buitenkant en -binnenkant)   *
+ * -------------------------------------------------------------------- */
+
+/** Oppervlak van een rechthoek B x H met hoekstraal R. */
+const rechthoekOpp = (B, H, R) => B * H - 4 * uitrondingOpp(R);
+
+/**
+ * Traagheidsmoment van een rechthoek B x H met hoekstraal R om de as
+ * evenwijdig aan B (dus met H^3). De vier uitrondingen liggen op afstand H/2
+ * van de neutrale lijn, naar binnen gerekend.
+ */
+const rechthoekTraagheid = (B, H, R) =>
+  (B * H ** 3) / 12 - 4 * uitrondingTraagheidNaarBinnen(R, H / 2);
+
+/** Plastisch weerstandsmoment van een afgeronde rechthoek B x H, straal R. */
+const rechthoekWpl = (B, H, R) =>
+  2 * ((B * H * H) / 8 - 2 * uitrondingStatischNaarBinnen(R, H / 2));
+
+/** Omtrek van een afgeronde rechthoek B x H met straal R. */
+const rechthoekOmtrek = (B, H, R) => 2 * (B + H) - (8 - 2 * Math.PI) * R;
+
+/* ==================================================================== *
+ * 2. Knikkrommen — EN 1993-1-1 tabel 6.2                               *
+ * ==================================================================== */
+
+/**
+ * Knikkromme volgens EN 1993-1-1 tabel 6.2 ("Keuze knikkromme voor een
+ * doorsnede"), voor staalsoorten t/m S460 zoals de rest van de database.
+ *
+ * Gewalste I/H-profielen:
+ *   h/b > 1,2  en  tf <= 40 mm   -> y-y: a   z-z: b
+ *   h/b > 1,2  en  40 < tf <= 100 -> y-y: b   z-z: c
+ *   h/b <= 1,2 en  tf <= 100 mm  -> y-y: b   z-z: c
+ *   h/b <= 1,2 en  tf > 100 mm   -> y-y: d   z-z: d
+ * U-, T- en massieve doorsneden (tabel 6.2, voorlaatste regel) -> c en c.
+ * Warmgewalste holle doorsneden (koker en buis) -> a en a.
+ * (Koudgevormde holle doorsneden zouden c/c zijn; die staan niet in deze
+ *  database — alle koker- en buisreeksen hier zijn warmgewalst.)
+ */
+function knikkrommen(kind, g) {
+  if (kind === "ISection") {
+    const hb = g.h / g.b;
+    if (hb > 1.2) {
+      if (g.tf <= 40) return { y_axis: "a", z_axis: "b" };
+      if (g.tf <= 100) return { y_axis: "b", z_axis: "c" };
+      return { y_axis: "d", z_axis: "d" };
+    }
+    if (g.tf <= 100) return { y_axis: "b", z_axis: "c" };
+    return { y_axis: "d", z_axis: "d" };
+  }
+  // U-profielen: tabel 6.2, regel "U-, T- en massieve doorsneden".
+  if (kind === "Channel") return { y_axis: "c", z_axis: "c" };
+  // Warmgewalste kokers en buizen: tabel 6.2, regel "warmgewalst".
+  return { y_axis: "a", z_axis: "a" };
+}
+
+/* ==================================================================== *
+ * 3. Torsieconstante van open gewalste doorsneden                      *
+ * ==================================================================== */
+
+/**
+ * It van een gewalst I/H-profiel. Basis is de dunwandige som (1/3)*SOM(b*t^3);
+ * de uitrondingen leveren een aanzienlijke extra bijdrage die met de
+ * standaardbenadering van El Darwish & Johnston wordt meegenomen. Deze
+ * benadering ligt op alle gecontroleerde profielen binnen ~1% van de
+ * tabelwaarde (zie --valideer).
+ *
+ *   It = (1/3)*(2*b*tf^3 + h_w*tw^3) + 2*alpha*D^4 - 0,420*tf^4
+ *   D  = ((tf + r)^2 + tw*(r + tw/4)) / (2r + tf)
+ */
+function itIProfiel({ h, b, tw, tf, r }) {
+  const hw = h - 2 * tf;
+  const basis = (2 * b * tf ** 3 + hw * tw ** 3) / 3;
+  if (r <= 0) return basis;
+  const q = tw / tf;
+  const p = r / tf;
+  const alpha =
+    -0.042 + 0.2204 * q + 0.1355 * p - 0.0865 * p * q - 0.0725 * q * q;
+  const D = ((tf + r) ** 2 + tw * (r + tw / 4)) / (2 * r + tf);
+  return basis + 2 * alpha * D ** 4 - 0.42 * tf ** 4;
+}
+
+/**
+ * It van een gewalst U-profiel. Zelfde opbouw, maar een U heeft slechts TWEE
+ * uitrondingen in plaats van vier en twee vrije flensuiteinden in plaats van
+ * vier; de uitrondings- en uiteindetermen halveren daarom.
+ */
+function itUProfiel({ h, b, tw, tf, r }) {
+  const hw = h - 2 * tf;
+  const basis = (2 * b * tf ** 3 + hw * tw ** 3) / 3;
+  if (r <= 0) return basis;
+  const q = tw / tf;
+  const p = r / tf;
+  const alpha =
+    -0.042 + 0.2204 * q + 0.1355 * p - 0.0865 * p * q - 0.0725 * q * q;
+  const D = ((tf + r) ** 2 + tw * (r + tw / 4)) / (2 * r + tf);
+  return basis + alpha * D ** 4 - 0.21 * tf ** 4;
+}
+
+/* ==================================================================== *
+ * 4. Doorsnedegrootheden per profieltype                               *
+ * ==================================================================== */
+
+/** Afschuifoppervlak-ondergrens uit EN 1993-1-1 §6.2.6(3): eta * hw * tw. */
+const ETA = 1.0; // conservatief; NEN-EN 1993-1-1 NB laat eta = 1,0 toe
+
+/**
+ * Gewalst I/H-profiel (dubbelsymmetrisch).
+ * Geometrie: h (totale hoogte), b (flensbreedte), tw (lijf), tf (flens),
+ * r (walsuitronding lijf-flens).
+ */
+function berekenIProfiel(g) {
+  const { h, b, tw, tf, r } = g;
+  const hw = h - 2 * tf;              // vrije lijfhoogte
+  const nOpp = 4 * uitrondingOpp(r);  // vier uitrondingen
+
+  // A = twee flenzen + lijf + vier uitrondingen
+  const A = 2 * b * tf + hw * tw + nOpp;
+
+  // Iy: volle rechthoek b*h minus de twee uitsparingen naast het lijf,
+  // plus de vier uitrondingen (Steiner zit in uitrondingTraagheid...).
+  const Iy =
+    (b * h ** 3 - (b - tw) * hw ** 3) / 12 +
+    4 * uitrondingTraagheidNaarBinnen(r, hw / 2);
+
+  // Iz: twee flenzen om hun eigen as + lijf + vier uitrondingen naar buiten.
+  const Iz =
+    (2 * tf * b ** 3) / 12 +
+    (hw * tw ** 3) / 12 +
+    4 * uitrondingTraagheidNaarBuiten(r, tw / 2);
+
+  const WelY = Iy / (h / 2);
+  const WelZ = Iz / (b / 2);
+
+  // Wpl;y = 2 * statisch moment van de bovenste helft om de middenlijn.
+  const WplY =
+    2 *
+    ((b * tf * (h - tf)) / 2 +
+      (tw * hw * hw) / 8 +
+      2 * uitrondingStatischNaarBinnen(r, hw / 2));
+
+  // Wpl;z = 2 * statisch moment van de rechterhelft om het lijfmidden.
+  const WplZ =
+    2 *
+    ((tf * b * b) / 4 +
+      (hw * tw * tw) / 8 +
+      2 * uitrondingStatischNaarBuiten(r, tw / 2));
+
+  // EN 1993-1-1 §6.2.6(3): Av;z = A - 2*b*tf + (tw + 2r)*tf,
+  // met ondergrens eta*hw*tw. Av;y = A - SOM(hw*tw) = 2*b*tf.
+  const AvZ = Math.max(A - 2 * b * tf + (tw + 2 * r) * tf, ETA * hw * tw);
+  const AvY = 2 * b * tf;
+
+  const It = itIProfiel(g);
+  // Welvingsconstante van een dubbelsymmetrisch I-profiel:
+  // Iw = Iz * hs^2 / 4 met hs = h - tf (hart-op-hart flenzen).
+  const Iw = (Iz * (h - tf) ** 2) / 4;
+
+  return props(g, { A, Iy, Iz, WelY, WelZ, WplY, WplZ, AvY, AvZ, It, Iw });
+}
+
+/**
+ * U-profiel met evenwijdige flenzen (UPE) of nagenoeg evenwijdig (UNP).
+ * Het lijf staat links; de flenzen steken naar rechts uit. De zwakke as ligt
+ * dus niet in het midden: het zwaartepunt zit op z0 vanaf de lijfrug.
+ * De flensschuinte van UNP wordt NIET gemodelleerd (zie verantwoording).
+ */
+function berekenUProfiel(g) {
+  const { h, b, tw, tf, r } = g;
+  const hw = h - 2 * tf;
+  const oppUitr = uitrondingOpp(r);
+  const A = tw * h + 2 * (b - tw) * tf + 2 * oppUitr;
+
+  // Sterke as: symmetrisch om de halve hoogte.
+  const Iy =
+    (b * h ** 3 - (b - tw) * hw ** 3) / 12 +
+    2 * uitrondingTraagheidNaarBinnen(r, hw / 2);
+  const WelY = Iy / (h / 2);
+  const WplY =
+    2 *
+    ((b * tf * (h - tf)) / 2 +
+      (tw * hw * hw) / 8 +
+      uitrondingStatischNaarBinnen(r, hw / 2));
+
+  // Zwakke as: eerst het zwaartepunt z0 vanaf de lijfrug (z = 0).
+  const zLijf = tw / 2;
+  const zFlens = tw + (b - tw) / 2;
+  const zUitr = tw + K_C * r;
+  const z0 =
+    (tw * h * zLijf + 2 * (b - tw) * tf * zFlens + 2 * oppUitr * zUitr) / A;
+
+  // Eigen traagheidsmoment van EEN uitronding om zijn eigen zwaartepunt.
+  const iUitrEigen = K_I * r ** 4 - K_A * r * r * (K_C * r) ** 2;
+
+  const Iz =
+    (h * tw ** 3) / 12 + tw * h * (zLijf - z0) ** 2 +
+    2 * (((b - tw) ** 3 * tf) / 12 + (b - tw) * tf * (zFlens - z0) ** 2) +
+    2 * (iUitrEigen + oppUitr * (zUitr - z0) ** 2);
+
+  // Elastisch weerstandsmoment zwakke as: de MAATGEVENDE (kleinste) waarde,
+  // dus gedeeld door de grootste randafstand.
+  const WelZ = Iz / Math.max(z0, b - z0);
+
+  // Wpl;z: de plastische neutrale lijn ligt waar het oppervlak zich haalveert.
+  // De breedtefunctie w(z) (totale materiaalhoogte op positie z) is stuksgewijs
+  // maar met een boog erin; numeriek integreren is hier eenvoudiger EN
+  // nauwkeuriger dan de stuksgewijze primitieve met arcsin-termen.
+  const WplZ = wplZUProfiel(g);
+
+  // EN 1993-1-1 §6.2.6(3) voor U-profielen: Av;z = A - 2*b*tf + (tw + r)*tf.
+  const AvZ = Math.max(A - 2 * b * tf + (tw + r) * tf, ETA * hw * tw);
+  const AvY = 2 * b * tf;
+
+  const It = itUProfiel(g);
+
+  // Welvingsconstante van een U-profiel (standaardformule voor een kanaal),
+  // met b' de flensuitkraging vanaf het lijfhart en hs de flenshartafstand:
+  //   Iw = (tf * b'^3 * hs^2 / 12) * (3*b'*tf + 2*hs*tw)/(6*b'*tf + hs*tw)
+  const bAcc = b - tw / 2;
+  const hs = h - tf;
+  const Iw =
+    ((tf * bAcc ** 3 * hs * hs) / 12) *
+    ((3 * bAcc * tf + 2 * hs * tw) / (6 * bAcc * tf + hs * tw));
+
+  return props(g, { A, Iy, Iz, WelY, WelZ, WplY, WplZ, AvY, AvZ, It, Iw }, z0);
+}
+
+/**
+ * Breedtefunctie van een U-profiel: totale materiaalhoogte op horizontale
+ * positie z (z = 0 aan de lijfrug). Gebruikt voor Wpl;z.
+ */
+function uBreedte({ h, b, tw, tf, r }, z) {
+  if (z <= tw) return h;
+  if (z >= b) return 0;
+  let w = 2 * tf;
+  if (z < tw + r) {
+    // Uitrondingdikte op positie z: r - sqrt(r^2 - (z - tw - r)^2).
+    const u = z - tw - r;
+    w += 2 * (r - Math.sqrt(Math.max(0, r * r - u * u)));
+  }
+  return w;
+}
+
+/** Wpl;z van een U-profiel via numerieke integratie van de breedtefunctie. */
+function wplZUProfiel(g) {
+  const N = 200000;
+  const dz = g.b / N;
+  const w = new Float64Array(N);
+  let A = 0;
+  for (let i = 0; i < N; i += 1) {
+    w[i] = uBreedte(g, (i + 0.5) * dz);
+    A += w[i] * dz;
+  }
+  // Plastische neutrale lijn: cumulatief oppervlak = A/2.
+  let cum = 0;
+  let zPl = 0;
+  for (let i = 0; i < N; i += 1) {
+    const volgend = cum + w[i] * dz;
+    if (volgend >= A / 2) {
+      zPl = i * dz + ((A / 2 - cum) / (w[i] * dz)) * dz;
+      break;
+    }
+    cum = volgend;
+  }
+  let S = 0;
+  for (let i = 0; i < N; i += 1) {
+    S += w[i] * Math.abs((i + 0.5) * dz - zPl) * dz;
+  }
+  return S;
+}
+
+/* -------------------------------------------------------------------- *
+ * U-profiel MET flensschuinte (UNP volgens DIN 1026-1)                  *
+ * -------------------------------------------------------------------- *
+ *
+ * De UNP-flens is niet prismatisch: de binnenzijde loopt met 8% toe naar de
+ * flenstip. Zonder die schuinte overschat een prismatisch model A en Iy met
+ * 2-3% en Iz met ~14%, want de schuinte haalt materiaal weg precies bij de
+ * flenstip, waar het voor Iz het zwaarst telt.
+ *
+ * Doorsnede in de BOVENHELFT (y van y_low(z) tot h/2, z vanaf de lijfrug):
+ *
+ *   z in [0, tw]        lijf                       -> y_low = 0
+ *   z in [tw, ztan1]    walsuitronding r1          -> boog, holte-middelpunt
+ *   z in [ztan1, ztan2] schuin flensbinnenvlak     -> y = a + s*z
+ *   z in [ztan2, b]     flenstipafronding r2       -> boog, materiaal-middelpunt
+ *
+ * De onderhelft is het spiegelbeeld. Het flensBUITENvlak is vlak op y = h/2.
+ */
+
+/** Flensschuinte van UNP volgens DIN 1026-1: 8%. */
+const UNP_SCHUINTE = 0.08;
+
+/**
+ * Meetkunde van een UNP.
+ *
+ * De genormeerde flensdikte tf geldt op HALVE FLENSBREEDTE, dus op z = b/2
+ * gemeten vanaf de lijfrug. Dat is dezelfde conventie als bij de andere
+ * DIN-walsprofielen met schuine flens (daar wordt t op het midden van de
+ * flensuitkraging gemeten). De zelftest onderaan laat zien dat alleen deze
+ * keuze A, Iy, Iz en het zwaartepunt van de hele reeks binnen 0,5% van de
+ * genormeerde tabelwaarden brengt; met z = (b+tw)/2 blijft er 1,2-2,6% staan.
+ *
+ * De flenstip is afgerond met r2 = r1/2 (DIN 1026-1).
+ */
+function unpMeetkunde({ h, b, tw, tf, r }) {
+  const s = UNP_SCHUINTE;
+  const r1 = r;
+  const r2 = r / 2;
+  const H = h / 2;
+  const k = Math.sqrt(1 + s * s);
+  // Flensdikte op positie z: tf + s*(b/2 - z); binnenvlak y = a + s*z.
+  const a = H - tf - (s * b) / 2;
+  // Walsuitronding: middelpunt in de HOLTE, dus onder het schuine vlak.
+  const zc1 = tw + r1;
+  const yc1 = a + s * zc1 - r1 * k;
+  const ztan1 = zc1 - (r1 * s) / k;
+  // Flenstipafronding: middelpunt in het MATERIAAL, dus boven het schuine vlak.
+  const zc2 = b - r2;
+  const yc2 = a + s * zc2 + r2 * k;
+  const ztan2 = zc2 + (r2 * s) / k;
+  // Hoeken waar de bogen het schuine vlak raken (hoek gemeten in de gewone
+  // wiskundige zin vanaf het middelpunt van de betreffende boog).
+  const thetaA = Math.atan2(1 / k, -s / k);              // boog 1, net onder pi
+  const thetaB = 2 * Math.PI + Math.atan2(-1 / k, s / k); // boog 2, net onder 2pi
+  return {
+    h, b, tw, tf, s, r1, r2, H, k, a,
+    zc1, yc1, ztan1, zc2, yc2, ztan2, thetaA, thetaB,
+  };
+}
+
+/** Onderrand van het materiaal in de bovenhelft, op positie z. */
+function unpOnderrand(m, z) {
+  if (z <= m.tw) return 0;
+  if (z <= m.ztan1) {
+    return m.yc1 + Math.sqrt(Math.max(0, m.r1 * m.r1 - (z - m.zc1) ** 2));
+  }
+  if (z <= m.ztan2) return m.a + m.s * z;
+  return m.yc2 - Math.sqrt(Math.max(0, m.r2 * m.r2 - (z - m.zc2) ** 2));
+}
+
+/**
+ * Integreert de vijf benodigde momenten over de bovenhelft in een keer.
+ * De twee bogen worden in HOEK geparametriseerd; daarmee verdwijnt de
+ * wortelsingulariteit die z-integratie aan de boograndan zou geven, en is de
+ * middelpuntregel gelijkmatig nauwkeurig.
+ */
+function unpIntegraal(m, N = 60000) {
+  const H = m.H;
+  let A = 0; let Sz = 0; let Izz = 0; let Iyy = 0; let Sy = 0;
+  const tel = (z, y, dz) => {
+    const dA = (H - y) * dz;
+    A += dA;
+    Sz += z * dA;
+    Izz += z * z * dA;
+    Iyy += ((H ** 3 - y ** 3) / 3) * dz;
+    Sy += ((H * H - y * y) / 2) * dz;
+  };
+  // Lijf.
+  {
+    const dz = m.tw / N;
+    for (let i = 0; i < N; i += 1) tel((i + 0.5) * dz, 0, dz);
+  }
+  // Boog 1: theta van pi (bij z = tw) tot thetaA.
+  {
+    const dth = (m.thetaA - Math.PI) / N;
+    for (let i = 0; i < N; i += 1) {
+      const th = Math.PI + (i + 0.5) * dth;
+      tel(m.zc1 + m.r1 * Math.cos(th), m.yc1 + m.r1 * Math.sin(th),
+        -m.r1 * Math.sin(th) * dth);
+    }
+  }
+  // Schuin flensbinnenvlak.
+  {
+    const dz = (m.ztan2 - m.ztan1) / N;
+    for (let i = 0; i < N; i += 1) {
+      const z = m.ztan1 + (i + 0.5) * dz;
+      tel(z, m.a + m.s * z, dz);
+    }
+  }
+  // Boog 2: theta van thetaB tot 2*pi (bij z = b).
+  {
+    const dth = (2 * Math.PI - m.thetaB) / N;
+    for (let i = 0; i < N; i += 1) {
+      const th = m.thetaB + (i + 0.5) * dth;
+      tel(m.zc2 + m.r2 * Math.cos(th), m.yc2 + m.r2 * Math.sin(th),
+        -m.r2 * Math.sin(th) * dth);
+    }
+  }
+  return { A, Sz, Izz, Iyy, Sy };
+}
+
+/** Wpl;z van een UNP: zelfde methode als bij UPE, maar op de schuine flens. */
+function wplZUnp(m) {
+  const N = 200000;
+  const dz = m.b / N;
+  const w = new Float64Array(N);
+  let A = 0;
+  for (let i = 0; i < N; i += 1) {
+    w[i] = 2 * (m.H - unpOnderrand(m, (i + 0.5) * dz));
+    A += w[i] * dz;
+  }
+  let cum = 0;
+  let zPl = 0;
+  for (let i = 0; i < N; i += 1) {
+    const volgend = cum + w[i] * dz;
+    if (volgend >= A / 2) {
+      zPl = i * dz + ((A / 2 - cum) / (w[i] * dz)) * dz;
+      break;
+    }
+    cum = volgend;
+  }
+  let S = 0;
+  for (let i = 0; i < N; i += 1) {
+    S += w[i] * Math.abs((i + 0.5) * dz - zPl) * dz;
+  }
+  return S;
+}
+
+/**
+ * Welvingsconstante van een UNP, via sectoriale-oppervlakintegratie over de
+ * SCHUINE wandmiddellijn. De gesloten kanaalformule (zie berekenUProfiel) geldt
+ * voor evenwijdige flenzen; voor een UNP ligt zij 12,5-14,4% te hoog, want zij
+ * rekent met de volle dikte tf tot aan de flenstip terwijl het sectoriale
+ * oppervlak juist daar het grootst is. Te hoge Iw is onveilig voor kip, dus de
+ * schuinte moet hier mee.
+ *
+ * Methode identiek aan iwSectoriaal(): pool naar het dwarskrachtcentrum via
+ * x_S = INT omega_0 * y * t ds / Iy, daarna normaliseren op INT omega t ds = 0
+ * en Iw = INT omega^2 t ds.
+ */
+function iwUnpSchuin({ h, b, tw, tf }, N = 40000) {
+  const s = UNP_SCHUINTE;
+  const H = h / 2;
+  const dikte = (z) => tf + s * (b / 2 - z);
+  const yMid = (z) => H - dikte(z) / 2;   // midden tussen buiten- en binnenvlak
+  const xEind = b - tw / 2;               // flens loopt van lijfhart tot tip
+  const pts = [];
+  const flens = (teken, omgekeerd) => {
+    for (let i = 0; i < N; i += 1) {
+      const f = omgekeerd ? 1 - (i + 0.5) / N : (i + 0.5) / N;
+      const fa = omgekeerd ? 1 - i / N : i / N;
+      const fb = omgekeerd ? 1 - (i + 1) / N : (i + 1) / N;
+      const x = xEind * f;
+      const dx = xEind * (fb - fa);
+      const dy = teken * (yMid(xEind * fb + tw / 2) - yMid(xEind * fa + tw / 2));
+      pts.push({
+        x,
+        y: teken * yMid(x + tw / 2),
+        t: dikte(x + tw / 2),
+        ds: Math.hypot(dx, dy),
+        dx,
+        dy,
+      });
+    }
+  };
+  flens(-1, true);                       // onderflens: tip -> lijf
+  const hsMid = 2 * yMid(tw / 2);        // flenshartafstand aan het lijf
+  for (let i = 0; i < N; i += 1) {
+    pts.push({
+      x: 0, y: -hsMid / 2 + (hsMid * (i + 0.5)) / N,
+      t: tw, ds: hsMid / N, dx: 0, dy: hsMid / N,
+    });
+  }
+  flens(1, false);                       // bovenflens: lijf -> tip
+  return sectoriaalIw(pts);
+}
+
+/** Gedeelde kern van de sectoriale-oppervlakmethode. */
+function sectoriaalIw(pts) {
+  const A = pts.reduce((a, p) => a + p.t * p.ds, 0);
+  const Iy = pts.reduce((a, p) => a + p.y * p.y * p.t * p.ds, 0);
+  const om = new Float64Array(pts.length);
+  let w = 0;
+  pts.forEach((p, i) => {
+    const d = p.x * p.dy - p.y * p.dx;
+    om[i] = w + d / 2;
+    w += d;
+  });
+  let num = 0;
+  pts.forEach((p, i) => { num += om[i] * p.y * p.t * p.ds; });
+  const xS = num / Iy;
+  const yStart = pts[0].y;
+  let gem = 0;
+  pts.forEach((p, i) => {
+    om[i] -= xS * (p.y - yStart);
+    gem += om[i] * p.t * p.ds;
+  });
+  gem /= A;
+  let Iw = 0;
+  pts.forEach((p, i) => { Iw += (om[i] - gem) ** 2 * p.t * p.ds; });
+  return { Iw, xS };
+}
+
+/** Doorsnedegrootheden van een UNP (U-profiel met 8% flensschuinte). */
+function berekenUProfielSchuin(g) {
+  const { h, b, tw, tf, r } = g;
+  const m = unpMeetkunde(g);
+  const v = unpIntegraal(m);
+  const A = 2 * v.A;
+  const z0 = v.Sz / v.A;                 // zwaartepunt vanaf de lijfrug
+  const Iy = 2 * v.Iyy;
+  const Iz = 2 * v.Izz - A * z0 * z0;
+  const WelY = Iy / (h / 2);
+  const WelZ = Iz / Math.max(z0, b - z0);
+  const WplY = 2 * v.Sy;
+  const WplZ = wplZUnp(m);
+
+  const hw = h - 2 * tf;
+  const AvZ = Math.max(A - 2 * b * tf + (tw + r) * tf, ETA * hw * tw);
+  const AvY = 2 * b * tf;
+
+  const It = itUProfiel(g);
+  const Iw = iwUnpSchuin(g).Iw;
+
+  return props(g, { A, Iy, Iz, WelY, WelZ, WplY, WplZ, AvY, AvZ, It, Iw }, z0);
+}
+
+/**
+ * Warmgewalste rechthoekige of vierkante koker (SHS/RHS).
+ * Conform EN 10210-2: buitenhoekstraal 1,5*t, binnenhoekstraal 1,0*t.
+ * Die combinatie is geometrisch niet exact (de wand is in de hoek dikker),
+ * maar het is de normconventie waarmee de gepubliceerde tabellen zijn
+ * opgesteld; de spotchecks onderaan bevestigen dat.
+ */
+function berekenKoker(g) {
+  const { h, b, t } = g;
+  const ro = 1.5 * t;
+  const ri = 1.0 * t;
+  const bi = b - 2 * t;
+  const hi = h - 2 * t;
+
+  const A = rechthoekOpp(b, h, ro) - rechthoekOpp(bi, hi, ri);
+  const Iy = rechthoekTraagheid(b, h, ro) - rechthoekTraagheid(bi, hi, ri);
+  const Iz = rechthoekTraagheid(h, b, ro) - rechthoekTraagheid(hi, bi, ri);
+  const WelY = Iy / (h / 2);
+  const WelZ = Iz / (b / 2);
+  const WplY = rechthoekWpl(b, h, ro) - rechthoekWpl(bi, hi, ri);
+  const WplZ = rechthoekWpl(h, b, ro) - rechthoekWpl(hi, bi, ri);
+
+  // Av;z = A*h/(b+h) (afschuiving evenwijdig aan de hoogte), Av;y = A*b/(b+h).
+  const AvZ = (A * h) / (b + h);
+  const AvY = (A * b) / (b + h);
+
+  // It van een GESLOTEN doorsnede volgens Bredt: It = 4*Am^2*t/Um, met Am het
+  // door de wandmiddellijn omsloten oppervlak en Um de lengte van die lijn.
+  const rm = (ro + ri) / 2;
+  const Am = rechthoekOpp(b - t, h - t, rm);
+  const Um = rechthoekOmtrek(b - t, h - t, rm);
+  const It = (4 * Am * Am * t) / Um;
+
+  // Iw van een gesloten koker is verwaarloosbaar t.o.v. de St.-Venanttorsie
+  // en wordt in EN 1993-1-1 voor kokers niet gebruikt -> 0.
+  const Iw = 0;
+
+  return props(g, { A, Iy, Iz, WelY, WelZ, WplY, WplZ, AvY, AvZ, It, Iw });
+}
+
+/** Warmgewalste ronde buis (CHS). Geometrie: d (uitwendig) en t. */
+function berekenBuis(g) {
+  const d = g.h; // h = b = uitwendige diameter
+  const { t } = g;
+  const di = d - 2 * t;
+  const A = (Math.PI / 4) * (d * d - di * di);
+  const I = (Math.PI / 64) * (d ** 4 - di ** 4);
+  const Wel = (2 * I) / d;
+  const Wpl = (d ** 3 - di ** 3) / 6;
+  // It van een dunwandige gesloten ronde buis = polair traagheidsmoment = 2*I.
+  const It = 2 * I;
+  const Av = (2 * A) / Math.PI;
+  return props(g, {
+    A, Iy: I, Iz: I, WelY: Wel, WelZ: Wel, WplY: Wpl, WplZ: Wpl,
+    AvY: Av, AvZ: Av, It, Iw: 0, // Iw van een ronde buis is exact 0
+  });
+}
+
+/** Zet de berekende grootheden om in het JSON-formaat van profiles.json. */
+function props(g, v, z0) {
+  const o = {
+    area_mm2: v.A,
+    iy_mm4: v.Iy,
+    iz_mm4: v.Iz,
+    wel_y_mm3: v.WelY,
+    wel_z_mm3: v.WelZ,
+    wpl_y_mm3: v.WplY,
+    wpl_z_mm3: v.WplZ,
+    av_y_mm2: v.AvY,
+    av_z_mm2: v.AvZ,
+    it_mm4: v.It,
+    iw_mm6: v.Iw,
+    iy_radius_mm: Math.sqrt(v.Iy / v.A),
+    iz_radius_mm: Math.sqrt(v.Iz / v.A),
+    h_mm: g.h,
+    b_mm: g.b,
+    tw_mm: g.tw ?? g.t,
+    tf_mm: g.tf ?? g.t,
+    r_mm: g.r ?? 0,
+  };
+  if (z0 !== undefined) o._z0_mm = z0; // alleen voor interne controle
+  return o;
+}
+
+/**
+ * Rekenkern per profielsoort. `schuin` onderscheidt de U-profielen met
+ * toelopende flens (UNP, DIN 1026-1) van die met evenwijdige flenzen (UPE,
+ * DIN 1026-2); de meetkunde verschilt te veel voor een gedeelde formule.
+ */
+function bereken(kind, g, schuin = false) {
+  if (kind === "ISection") return berekenIProfiel(g);
+  if (kind === "Channel") {
+    return schuin ? berekenUProfielSchuin(g) : berekenUProfiel(g);
+  }
+  if (kind === "Shs" || kind === "Rhs") return berekenKoker(g);
+  if (kind === "Chs") return berekenBuis(g);
+  throw new Error(`Onbekende profielsoort: ${kind}`);
+}
+
+/* ==================================================================== *
+ * 5. Brontabellen — UITSLUITEND genormeerde basisgeometrie             *
+ * ==================================================================== *
+ *
+ * I/H en U: [naam, h, b, tw, tf, r]  (alle maten in mm)
+ * Koker   : [h, b, t]                (hoekstralen volgen uit t)
+ * Buis    : [d, t]
+ *
+ * Bronnen: EN 10365 (walsprofielreeksen IPE/HE/UPE), DIN 1026-1 (UNP),
+ * DIN 1026-2 (UPE), EN 10210-2 (warmgewalste holle doorsneden).
+ */
+
+/** IPE — EN 10365. Volledig aanwezig in de database; dient ter validatie. */
+const IPE = [
+  ["IPE 80", 80, 46, 3.8, 5.2, 5],
+  ["IPE 100", 100, 55, 4.1, 5.7, 7],
+  ["IPE 120", 120, 64, 4.4, 6.3, 7],
+  ["IPE 140", 140, 73, 4.7, 6.9, 7],
+  ["IPE 160", 160, 82, 5.0, 7.4, 9],
+  ["IPE 180", 180, 91, 5.3, 8.0, 9],
+  ["IPE 200", 200, 100, 5.6, 8.5, 12],
+  ["IPE 220", 220, 110, 5.9, 9.2, 12],
+  ["IPE 240", 240, 120, 6.2, 9.8, 15],
+  ["IPE 270", 270, 135, 6.6, 10.2, 15],
+  ["IPE 300", 300, 150, 7.1, 10.7, 15],
+  ["IPE 330", 330, 160, 7.5, 11.5, 18],
+  ["IPE 360", 360, 170, 8.0, 12.7, 18],
+  ["IPE 400", 400, 180, 8.6, 13.5, 21],
+  ["IPE 450", 450, 190, 9.4, 14.6, 21],
+  ["IPE 500", 500, 200, 10.2, 16.0, 21],
+  ["IPE 550", 550, 210, 11.1, 17.2, 24],
+  ["IPE 600", 600, 220, 12.0, 19.0, 24],
+];
+
+/** HE-A (HEA) — EN 10365, volledige reeks 100 t/m 1000. */
+const HEA = [
+  ["HEA 100", 96, 100, 5.0, 8.0, 12],
+  ["HEA 120", 114, 120, 5.0, 8.0, 12],
+  ["HEA 140", 133, 140, 5.5, 8.5, 12],
+  ["HEA 160", 152, 160, 6.0, 9.0, 15],
+  ["HEA 180", 171, 180, 6.0, 9.5, 15],
+  ["HEA 200", 190, 200, 6.5, 10.0, 18],
+  ["HEA 220", 210, 220, 7.0, 11.0, 18],
+  ["HEA 240", 230, 240, 7.5, 12.0, 21],
+  ["HEA 260", 250, 260, 7.5, 12.5, 24],
+  ["HEA 280", 270, 280, 8.0, 13.0, 24],
+  ["HEA 300", 290, 300, 8.5, 14.0, 27],
+  ["HEA 320", 310, 300, 9.0, 15.5, 27],
+  ["HEA 340", 330, 300, 9.5, 16.5, 27],
+  ["HEA 360", 350, 300, 10.0, 17.5, 27],
+  ["HEA 400", 390, 300, 11.0, 19.0, 27],
+  ["HEA 450", 440, 300, 11.5, 21.0, 27],
+  ["HEA 500", 490, 300, 12.0, 23.0, 27],
+  ["HEA 550", 540, 300, 12.5, 24.0, 27],
+  ["HEA 600", 590, 300, 13.0, 25.0, 27],
+  ["HEA 650", 640, 300, 13.5, 26.0, 27],
+  ["HEA 700", 690, 300, 14.5, 27.0, 27],
+  ["HEA 800", 790, 300, 15.0, 28.0, 30],
+  ["HEA 900", 890, 300, 16.0, 30.0, 30],
+  ["HEA 1000", 990, 300, 16.5, 31.0, 30],
+];
+
+/** HE-B (HEB) — EN 10365, volledige reeks 100 t/m 1000. */
+const HEB = [
+  ["HEB 100", 100, 100, 6.0, 10.0, 12],
+  ["HEB 120", 120, 120, 6.5, 11.0, 12],
+  ["HEB 140", 140, 140, 7.0, 12.0, 12],
+  ["HEB 160", 160, 160, 8.0, 13.0, 15],
+  ["HEB 180", 180, 180, 8.5, 14.0, 15],
+  ["HEB 200", 200, 200, 9.0, 15.0, 18],
+  ["HEB 220", 220, 220, 9.5, 16.0, 18],
+  ["HEB 240", 240, 240, 10.0, 17.0, 21],
+  ["HEB 260", 260, 260, 10.0, 17.5, 24],
+  ["HEB 280", 280, 280, 10.5, 18.0, 24],
+  ["HEB 300", 300, 300, 11.0, 19.0, 27],
+  ["HEB 320", 320, 300, 11.5, 20.5, 27],
+  ["HEB 340", 340, 300, 12.0, 21.5, 27],
+  ["HEB 360", 360, 300, 12.5, 22.5, 27],
+  ["HEB 400", 400, 300, 13.5, 24.0, 27],
+  ["HEB 450", 450, 300, 14.0, 26.0, 27],
+  ["HEB 500", 500, 300, 14.5, 28.0, 27],
+  ["HEB 550", 550, 300, 15.0, 29.0, 27],
+  ["HEB 600", 600, 300, 15.5, 30.0, 27],
+  ["HEB 650", 650, 300, 16.0, 31.0, 27],
+  ["HEB 700", 700, 300, 17.0, 32.0, 27],
+  ["HEB 800", 800, 300, 17.5, 33.0, 30],
+  ["HEB 900", 900, 300, 18.5, 35.0, 30],
+  ["HEB 1000", 1000, 300, 19.0, 36.0, 30],
+];
+
+/** HE-M (HEM) — EN 10365, volledige reeks 100 t/m 1000. */
+const HEM = [
+  ["HEM 100", 120, 106, 12.0, 20.0, 12],
+  ["HEM 120", 140, 126, 12.5, 21.0, 12],
+  ["HEM 140", 160, 146, 13.0, 22.0, 12],
+  ["HEM 160", 180, 166, 14.0, 23.0, 15],
+  ["HEM 180", 200, 186, 14.5, 24.0, 15],
+  ["HEM 200", 220, 206, 15.0, 25.0, 18],
+  ["HEM 220", 240, 226, 15.5, 26.0, 18],
+  ["HEM 240", 270, 248, 18.0, 32.0, 21],
+  ["HEM 260", 290, 268, 18.0, 32.5, 24],
+  ["HEM 280", 310, 288, 18.5, 33.0, 24],
+  ["HEM 300", 340, 310, 21.0, 39.0, 27],
+  ["HEM 320", 359, 309, 21.0, 40.0, 27],
+  ["HEM 340", 377, 309, 21.0, 40.0, 27],
+  ["HEM 360", 395, 308, 21.0, 40.0, 27],
+  ["HEM 400", 432, 307, 21.0, 40.0, 27],
+  ["HEM 450", 478, 307, 21.0, 40.0, 27],
+  ["HEM 500", 524, 306, 21.0, 40.0, 27],
+  ["HEM 550", 572, 306, 21.0, 40.0, 27],
+  ["HEM 600", 620, 305, 21.0, 40.0, 27],
+  ["HEM 650", 668, 305, 21.0, 40.0, 27],
+  ["HEM 700", 716, 304, 21.0, 40.0, 27],
+  ["HEM 800", 814, 303, 21.0, 40.0, 30],
+  ["HEM 900", 910, 302, 21.0, 40.0, 30],
+  ["HEM 1000", 1008, 302, 21.0, 40.0, 30],
+];
+
+/**
+ * UNP — DIN 1026-1 (schuine flenzen, 8%). Volledig aanwezig in de database.
+ *
+ * De reeks in de gepubliceerde profieltabel loopt door tot UNP 400 (de maten
+ * 320, 350, 380 en 400 staan er ook in). Die vier staan hier BEWUST NIET, en
+ * dat is een meetresultaat, geen omissie: het 8%-model hierboven reproduceert
+ * de tabel voor 80 t/m 300 op 0,55% nauwkeurig, maar loopt vanaf 320 abrupt
+ * weg. Met de conventie die voor de hele reeks geldt (r1 = tf, r2 = r1/2,
+ * schuinte 8%) tegen de gepubliceerde A / Iy / Wy;el / Iz / Wz;el:
+ *
+ *   maat   A        Iy       Wy;el    Iz       Wz;el
+ *   300    +0,004%  -0,004%  +0,033%  +0,031%  -0,060%   <- binnen de grens
+ *   320    -1,355%  -1,986%  -1,941%  -5,827%  -6,776%
+ *   350    -1,308%  -2,066%  -2,066%  -6,502%  -7,492%
+ *   380    -1,249%  -1,998%  -1,973%  -6,526%  -7,514%
+ *   400    -1,248%  -1,923%  -1,956%  -6,116%  -6,871%
+ *
+ * De sprong zit precies waar de reeks ook in maatvoering springt: van UNP 300
+ * (tw 10) naar UNP 320 (tw 14). Het patroon — A en Iy een procent te laag,
+ * maar Iz en Wz;el een veelvoud daarvan — wijst op een andere flensschuinte
+ * EN een andere walsuitronding bij de zware maten; met alleen een andere
+ * schuinte komt geen enkele waarde binnen 0,5%. Welke waarden dat dan zijn,
+ * staat NIET in de gebruikte tabel (die geeft alleen h, b, tw, tf). Zolang die
+ * twee maten niet uit een bron komen, blijven deze vier eruit: een profiel met
+ * 7% te lage Wz;el maakt de zwakke-as-toetsing stil onveilig, en dat is erger
+ * dan een profiel dat ontbreekt.
+ *
+ * Om dezelfde reden staat hier GEEN regel "UNP 350": de database kent die maat
+ * als "UNP350" (zonder spatie) met waarden uit een andere bron, en die liggen
+ * 2 tot 3 keer dichter bij de tabel dan dit model ze zou zetten (zie sectie 11).
+ * Een regel hier zou bovendien een tweede schrijfwijze van hetzelfde profiel
+ * introduceren; `lookup_key` haalt de spatie weg, dus die twee botsen.
+ */
+const UNP = [
+  ["UNP 80", 80, 45, 6.0, 8.0, 8],
+  ["UNP 100", 100, 50, 6.0, 8.5, 8.5],
+  ["UNP 120", 120, 55, 7.0, 9.0, 9],
+  ["UNP 140", 140, 60, 7.0, 10.0, 10],
+  ["UNP 160", 160, 65, 7.5, 10.5, 10.5],
+  ["UNP 180", 180, 70, 8.0, 11.0, 11],
+  ["UNP 200", 200, 75, 8.5, 11.5, 11.5],
+  ["UNP 220", 220, 80, 9.0, 12.5, 12.5],
+  ["UNP 240", 240, 85, 9.5, 13.0, 13],
+  ["UNP 260", 260, 90, 10.0, 14.0, 14],
+  ["UNP 280", 280, 95, 10.0, 15.0, 15],
+  ["UNP 300", 300, 100, 10.0, 16.0, 16],
+];
+
+/** UPE — DIN 1026-2 (evenwijdige flenzen). Nieuwe reeks. */
+const UPE = [
+  ["UPE 80", 80, 50, 4.0, 7.0, 10],
+  ["UPE 100", 100, 55, 4.5, 7.5, 10],
+  ["UPE 120", 120, 60, 5.0, 8.0, 12],
+  ["UPE 140", 140, 65, 5.0, 9.0, 12],
+  ["UPE 160", 160, 70, 5.5, 9.5, 12],
+  ["UPE 180", 180, 75, 5.5, 10.5, 12],
+  ["UPE 200", 200, 80, 6.0, 11.0, 13],
+  ["UPE 220", 220, 85, 6.5, 12.0, 13],
+  ["UPE 240", 240, 90, 7.0, 12.5, 15],
+  ["UPE 270", 270, 95, 7.5, 13.5, 15],
+  ["UPE 300", 300, 100, 9.5, 15.0, 15],
+  ["UPE 330", 330, 105, 11.0, 16.0, 18],
+  ["UPE 360", 360, 110, 12.0, 17.0, 18],
+  ["UPE 400", 400, 115, 13.5, 18.0, 18],
+];
+
+/** SHS warmgewalst — EN 10210-2. [maat, [wanddikten]] */
+const SHS = [
+  [40, [3.0, 4.0, 5.0]],
+  [50, [3.0, 4.0, 5.0, 6.3]],
+  [60, [3.0, 4.0, 5.0, 6.3, 8.0]],
+  [70, [3.6, 4.0, 5.0, 6.3, 8.0]],
+  [80, [3.6, 4.0, 5.0, 6.3, 8.0, 10.0]],
+  [90, [4.0, 5.0, 6.3, 8.0, 10.0]],
+  [100, [4.0, 5.0, 6.3, 8.0, 10.0, 12.5]],
+  [120, [5.0, 6.3, 8.0, 10.0, 12.5]],
+  [140, [5.0, 6.3, 8.0, 10.0, 12.5]],
+  [150, [5.0, 6.3, 8.0, 10.0, 12.5, 16.0]],
+  [160, [6.3, 8.0, 10.0, 12.5, 16.0]],
+  [180, [6.3, 8.0, 10.0, 12.5, 16.0]],
+  [200, [6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [220, [8.0, 10.0, 12.5, 16.0]],
+  [250, [6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [260, [8.0, 10.0, 12.5, 16.0]],
+  [300, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [350, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [400, [10.0, 12.5, 16.0, 20.0]],
+];
+
+/** RHS warmgewalst — EN 10210-2. [h, b, [wanddikten]] */
+const RHS = [
+  [50, 30, [3.0, 3.2, 4.0, 5.0]],
+  [60, 40, [3.0, 3.2, 4.0, 5.0, 6.3]],
+  [70, 50, [3.0, 3.6, 4.0, 5.0, 6.3]],
+  [80, 40, [3.0, 3.2, 4.0, 5.0, 6.3, 8.0]],
+  [90, 50, [3.6, 4.0, 5.0, 6.3, 8.0]],
+  [100, 50, [3.0, 3.2, 4.0, 5.0, 6.3, 8.0]],
+  [100, 60, [3.6, 4.0, 5.0, 6.3, 8.0]],
+  [120, 60, [3.6, 4.0, 5.0, 6.3, 8.0, 10.0]],
+  [120, 80, [4.0, 5.0, 6.3, 8.0, 10.0]],
+  [140, 80, [4.0, 5.0, 6.3, 8.0, 10.0]],
+  [150, 100, [4.0, 5.0, 6.3, 8.0, 10.0, 12.5]],
+  [160, 80, [4.0, 5.0, 6.3, 8.0, 10.0, 12.5]],
+  [180, 100, [5.0, 6.3, 8.0, 10.0, 12.5]],
+  [200, 100, [5.0, 6.3, 8.0, 10.0, 12.5, 16.0]],
+  [200, 120, [6.3, 8.0, 10.0, 12.5]],
+  [250, 150, [6.3, 8.0, 10.0, 12.5, 16.0]],
+  [260, 180, [8.0, 10.0, 12.5, 16.0]],
+  [300, 200, [6.3, 8.0, 10.0, 12.5, 16.0]],
+  [350, 250, [8.0, 10.0, 12.5, 16.0]],
+  [400, 200, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [450, 250, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [500, 300, [10.0, 12.5, 16.0, 20.0]],
+];
+
+/** CHS warmgewalst — EN 10210-2. [d, [wanddikten]] */
+const CHS = [
+  [33.7, [2.6, 3.2, 4.0]],
+  [42.4, [2.6, 3.2, 4.0]],
+  [48.3, [3.2, 4.0, 5.0]],
+  [60.3, [3.2, 4.0, 5.0, 6.3]],
+  [76.1, [3.2, 4.0, 5.0, 6.3, 8.0]],
+  [88.9, [3.2, 4.0, 5.0, 6.3, 8.0]],
+  [114.3, [3.6, 4.0, 5.0, 6.3, 8.0, 10.0]],
+  [139.7, [4.0, 5.0, 6.3, 8.0, 10.0, 12.5]],
+  [168.3, [4.0, 5.0, 6.3, 8.0, 10.0, 12.5]],
+  [193.7, [5.0, 6.3, 8.0, 10.0, 12.5, 16.0]],
+  [219.1, [5.0, 6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [244.5, [6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [273.0, [6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [323.9, [6.3, 8.0, 10.0, 12.5, 16.0, 20.0]],
+  [355.6, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [406.4, [8.0, 10.0, 12.5, 16.0, 20.0]],
+  [457.0, [10.0, 12.5, 16.0, 20.0]],
+  [508.0, [10.0, 12.5, 16.0, 20.0]],
+];
+
+/* ==================================================================== *
+ * 6. Van brontabel naar profielrecords                                 *
+ * ==================================================================== */
+
+/** Maatgetal netjes formatteren: 4.0 -> "4", 6.3 -> "6.3", 273.0 -> "273". */
+const fmt = (x) => String(Number(x.toFixed(2)));
+
+function openProfiel(kind, [name, h, b, tw, tf, r], schuin = false) {
+  return { name, kind, geometry: { h, b, tw, tf, r }, schuin };
+}
+
+function kokerProfiel(kind, h, b, t) {
+  const naam =
+    kind === "Shs" ? `SHS ${fmt(b)}x${fmt(h)}x${fmt(t)}`
+      : `RHS ${fmt(h)}x${fmt(b)}x${fmt(t)}`;
+  return {
+    name: naam,
+    kind,
+    geometry: { h, b, tw: t, tf: t, t, r: 1.5 * t },
+  };
+}
+
+function buisProfiel(d, t) {
+  return {
+    name: `CHS ${fmt(d)}x${fmt(t)}`,
+    kind: "Chs",
+    geometry: { h: d, b: d, tw: t, tf: t, t, r: 0 },
+  };
+}
+
+/** Alle profielen die de brontabellen beschrijven, in vaste volgorde. */
+function alleKandidaten() {
+  const uit = [];
+  for (const rij of IPE) uit.push(openProfiel("ISection", rij));
+  for (const rij of HEA) uit.push(openProfiel("ISection", rij));
+  for (const rij of HEB) uit.push(openProfiel("ISection", rij));
+  for (const rij of HEM) uit.push(openProfiel("ISection", rij));
+  for (const rij of UNP) uit.push(openProfiel("Channel", rij, true));
+  for (const rij of UPE) uit.push(openProfiel("Channel", rij));
+  for (const [a, dikten] of SHS) {
+    for (const t of dikten) uit.push(kokerProfiel("Shs", a, a, t));
+  }
+  for (const [h, b, dikten] of RHS) {
+    for (const t of dikten) uit.push(kokerProfiel("Rhs", h, b, t));
+  }
+  for (const [d, dikten] of CHS) {
+    for (const t of dikten) uit.push(buisProfiel(d, t));
+  }
+  return uit;
+}
+
+/** Reeksnaam (IPE, HEA, ... ) uit de profielnaam. */
+const reeksVan = (naam) => naam.split(/[\s0-9]/)[0].toUpperCase();
+
+/** Zelfde normalisatie als lookup_key in de Rust-crate. */
+const sleutel = (naam) => naam.replace(/[\s\-.]/g, "").toUpperCase();
+
+/**
+ * Meetkundige vingerafdruk: twee profielen met dezelfde soort en dezelfde
+ * hoofdmaten zijn hetzelfde profiel, ook als de naam anders geschreven is
+ * ("CHS 273x10" vs "CHS 273.0x10.0"). Dit vangt naamvarianten die de
+ * lookup-sleutel NIET vangt.
+ */
+function vingerafdruk(p) {
+  const g = p.geometry;
+  const n = (x) => Number((x ?? 0).toFixed(2));
+  return [p.kind, n(g.h), n(g.b), n(g.tw || g.t), n(g.tf || g.t)].join("|");
+}
+
+/* ==================================================================== *
+ * 7. Validatie tegen de bestaande database                             *
+ * ==================================================================== */
+
+const GROOTHEDEN = [
+  "area_mm2", "iy_mm4", "iz_mm4", "wel_y_mm3", "wel_z_mm3",
+  "wpl_y_mm3", "wpl_z_mm3", "av_y_mm2", "av_z_mm2", "it_mm4",
+  "iw_mm6", "iy_radius_mm", "iz_radius_mm",
+];
+
+function statistiek(afwijkingen) {
+  if (afwijkingen.length === 0) return null;
+  const abs = afwijkingen.map((a) => Math.abs(a.pct)).sort((x, y) => x - y);
+  const gem = abs.reduce((s, x) => s + x, 0) / abs.length;
+  const mediaan = abs[Math.floor(abs.length / 2)];
+  const ergste = afwijkingen.reduce(
+    (a, b) => (Math.abs(b.pct) > Math.abs(a.pct) ? b : a),
+  );
+  return { n: abs.length, gem, mediaan, max: Math.abs(ergste.pct), ergste };
+}
+
+function valideer() {
+  const bestaand = JSON.parse(readFileSync(bestaandPad, "utf8"));
+  const perSleutel = new Map();
+  // Twee profielen die op dezelfde zoeksleutel uitkomen ("HEB160" en
+  // "HEB 160") zijn een echte fout, geen administratief detail: de opzoeking
+  // pakt de eerste die hij tegenkomt, dus de SCHRIJFWIJZE van de gebruiker
+  // bepaalt met welke waarden er gerekend wordt. Ze apart bijhouden zodat de
+  // validatie ze bij naam kan melden.
+  const duplicaten = new Map();
+  for (const p of bestaand) {
+    const k = sleutel(p.name);
+    if (!perSleutel.has(k)) perSleutel.set(k, p);
+    else {
+      if (!duplicaten.has(k)) duplicaten.set(k, [perSleutel.get(k).name]);
+      duplicaten.get(k).push(p.name);
+    }
+  }
+
+  const perGrootheid = new Map(GROOTHEDEN.map((k) => [k, []]));
+  const perReeksGrootheid = new Map();
+  let gematcht = 0;
+  const nietGevonden = [];
+  const krommeVerschil = [];
+
+  for (const kand of alleKandidaten()) {
+    const ref = perSleutel.get(sleutel(kand.name));
+    if (!ref) continue;
+    gematcht += 1;
+    const reeks = reeksVan(kand.name);
+    const eigen = bereken(kand.kind, kand.geometry, kand.schuin);
+    const krommen = knikkrommen(kand.kind, kand.geometry);
+    if (
+      krommen.y_axis !== ref.buckling_curves.y_axis ||
+      krommen.z_axis !== ref.buckling_curves.z_axis
+    ) {
+      krommeVerschil.push(
+        `${kand.name}: berekend ${krommen.y_axis}/${krommen.z_axis}, ` +
+        `database ${ref.buckling_curves.y_axis}/${ref.buckling_curves.z_axis}`,
+      );
+    }
+    for (const k of GROOTHEDEN) {
+      const dbW = ref.properties[k];
+      const eigenW = eigen[k];
+      if (!Number.isFinite(dbW) || dbW === 0) continue;
+      const pct = ((eigenW - dbW) / dbW) * 100;
+      perGrootheid.get(k).push({ naam: kand.name, pct });
+      const rk = `${reeks}|${k}`;
+      if (!perReeksGrootheid.has(rk)) perReeksGrootheid.set(rk, []);
+      perReeksGrootheid.get(rk).push({ naam: kand.name, pct });
+    }
+  }
+  for (const [k, p] of perSleutel) {
+    if (!alleKandidaten().some((c) => sleutel(c.name) === k)) {
+      nietGevonden.push(p.name);
+    }
+  }
+
+  console.log("=".repeat(74));
+  console.log("VALIDATIE TEGEN DE BESTAANDE DATABASE");
+  console.log("=".repeat(74));
+  console.log(
+    `Bestaande database: ${bestaand.length} regels, ${perSleutel.size} unieke ` +
+    `sleutels. Daarvan opnieuw berekend: ${gematcht}.`,
+  );
+  if (nietGevonden.length) {
+    console.log(
+      `Niet in de brontabellen (dus niet gevalideerd): ${nietGevonden.join(", ")}`,
+    );
+  }
+  if (duplicaten.size) {
+    console.log(
+      `\n!! ${duplicaten.size} zoeksleutel(s) met meer dan één profiel — de ` +
+      `schrijfwijze bepaalt dan met welke waarden gerekend wordt:`,
+    );
+    for (const [k, namen] of duplicaten) {
+      console.log(`   ${k}: ${namen.map((n) => JSON.stringify(n)).join(" , ")}`);
+    }
+    console.log("   Verwijder de dubbele regels uit profiles.json.");
+  }
+
+  console.log("\n-- Afwijking per grootheid (|berekend - database| / database) --");
+  console.log(
+    "grootheid".padEnd(16) + "n".padStart(5) + "gem%".padStart(9) +
+    "med%".padStart(9) + "max%".padStart(9) + "  slechtste",
+  );
+  for (const k of GROOTHEDEN) {
+    const s = statistiek(perGrootheid.get(k));
+    if (!s) continue;
+    console.log(
+      k.padEnd(16) + String(s.n).padStart(5) +
+      s.gem.toFixed(2).padStart(9) + s.mediaan.toFixed(2).padStart(9) +
+      s.max.toFixed(2).padStart(9) + `  ${s.ergste.naam} (${s.ergste.pct.toFixed(1)}%)`,
+    );
+  }
+
+  console.log("\n-- Afwijking per reeks (gemiddelde absolute % per grootheid) --");
+  const reeksen = [...new Set([...perReeksGrootheid.keys()].map((x) => x.split("|")[0]))];
+  const kern = ["area_mm2", "iy_mm4", "iz_mm4", "wel_y_mm3", "wpl_y_mm3", "wpl_z_mm3", "it_mm4", "iw_mm6"];
+  console.log(
+    "reeks".padEnd(8) + kern.map((k) => k.replace(/_mm\d?$|_mm$/, "").padStart(9)).join(""),
+  );
+  for (const r of reeksen) {
+    let regel = r.padEnd(8);
+    for (const k of kern) {
+      const s = statistiek(perReeksGrootheid.get(`${r}|${k}`) ?? []);
+      regel += (s ? s.gem.toFixed(2) : "-").padStart(9);
+    }
+    console.log(regel);
+  }
+
+  if (krommeVerschil.length) {
+    console.log("\n-- Knikkrommen die afwijken van de database --");
+    for (const v of krommeVerschil) console.log(`   ${v}`);
+  } else {
+    console.log("\nKnikkrommen: alle berekende krommen gelijk aan de database.");
+  }
+
+  // Waar generator en database uiteenlopen: wie heeft gelijk? Twee harde,
+  // formulevrije bovengrenzen wijzen dat aan.
+  console.log("\n-- Harde bovengrenzen op de bestaande database --");
+  let onmogelijkKoker = 0;
+  let onmogelijkIw = 0;
+  const voorbeelden = [];
+  for (const p of bestaand) {
+    const g = p.geometry;
+    const t = g.t || g.tw;
+    if (["Shs", "Rhs", "Chs"].includes(p.kind)) {
+      // Een doorsnede met afgeronde hoeken kan nooit stijver zijn dan dezelfde
+      // doorsnede met scherpe hoeken; bij een CHS is de ringformule exact.
+      const scherp = p.kind === "Chs"
+        ? (Math.PI / 64) * (g.h ** 4 - (g.h - 2 * t) ** 4)
+        : (g.b * g.h ** 3 - (g.b - 2 * t) * (g.h - 2 * t) ** 3) / 12;
+      if (p.properties.iy_mm4 > scherp * 1.0001) {
+        onmogelijkKoker += 1;
+        if (voorbeelden.length < 4) {
+          voorbeelden.push(
+            `${p.name}: Iy = ${p.properties.iy_mm4.toExponential(3)} > ` +
+            `scherpe-hoek bovengrens ${scherp.toExponential(3)} ` +
+            `(+${(((p.properties.iy_mm4 - scherp) / scherp) * 100).toFixed(1)}%)`,
+          );
+        }
+      }
+    }
+    if (p.kind === "Channel") {
+      // Iw van een U-profiel is altijd kleiner dan Iz*hs^2/4 (de waarde die
+      // een I-profiel met dezelfde Iz en flenshartafstand zou hebben).
+      const grens = (p.properties.iz_mm4 * (g.h - g.tf) ** 2) / 4;
+      if (p.properties.iw_mm6 > grens) onmogelijkIw += 1;
+    }
+  }
+  console.log(
+    `Holle doorsneden met Iy boven de scherpe-hoek bovengrens: ` +
+    `${onmogelijkKoker} van ${bestaand.filter((p) => ["Shs", "Rhs", "Chs"].includes(p.kind)).length}`,
+  );
+  for (const v of voorbeelden) console.log(`   ${v}`);
+  console.log(
+    `U-profielen met Iw boven de bovengrens Iz*hs^2/4: ` +
+    `${onmogelijkIw} van ${bestaand.filter((p) => p.kind === "Channel").length}`,
+  );
+  return { perGrootheid, perReeksGrootheid };
+}
+
+/* ==================================================================== *
+ * 8. Zelftests op de formules (onafhankelijk van de database)          *
+ * ==================================================================== */
+
+/**
+ * Onafhankelijke numerieke bepaling van Iw van een U-profiel via de
+ * sectoriale-oppervlakmethode op de dunwandige middellijn. Dient uitsluitend
+ * als controle op de gesloten formule in berekenUProfiel(): de pool wordt naar
+ * het dwarskrachtcentrum verschoven met
+ *     x_S = INT omega_0 * y * t ds / Iy
+ * (het profiel is symmetrisch om y = 0), daarna wordt omega genormaliseerd op
+ * INT omega t ds = 0 en geldt Iw = INT omega^2 t ds.
+ */
+function iwSectoriaal({ h, b, tw, tf }, N = 20000) {
+  const bf = b - tw / 2;
+  const hs = h - tf;
+  const pts = [];
+  // onderflens tip -> lijf, lijf onder -> boven, bovenflens lijf -> tip
+  for (let i = 0; i < N; i += 1) {
+    const s = (i + 0.5) / N;
+    pts.push({ x: bf * (1 - s), y: -hs / 2, t: tf, ds: bf / N, dx: -bf / N, dy: 0 });
+  }
+  for (let i = 0; i < N; i += 1) {
+    const s = (i + 0.5) / N;
+    pts.push({ x: 0, y: -hs / 2 + hs * s, t: tw, ds: hs / N, dx: 0, dy: hs / N });
+  }
+  for (let i = 0; i < N; i += 1) {
+    const s = (i + 0.5) / N;
+    pts.push({ x: bf * s, y: hs / 2, t: tf, ds: bf / N, dx: bf / N, dy: 0 });
+  }
+  return sectoriaalIw(pts).Iw;
+}
+
+function zelftests() {
+  const fouten = [];
+  const bijna = (a, b, tol, wat) => {
+    const rel = Math.abs(a - b) / Math.abs(b);
+    if (!(rel <= tol)) {
+      fouten.push(`${wat}: ${a.toPrecision(6)} vs ${b.toPrecision(6)} (${(rel * 100).toFixed(2)}%)`);
+    }
+  };
+
+  // (1) Afgeronde rechthoek met R = H/2 = B/2 moet de cirkel opleveren.
+  const R = 50;
+  bijna(rechthoekTraagheid(2 * R, 2 * R, R), (Math.PI * R ** 4) / 4, 1e-12,
+    "afgeronde rechthoek -> cirkel, I");
+  bijna(rechthoekOpp(2 * R, 2 * R, R), Math.PI * R * R, 1e-12,
+    "afgeronde rechthoek -> cirkel, A");
+  // Wpl van een cirkel = d^3/6 = (2R)^3/6.
+  bijna(rechthoekWpl(2 * R, 2 * R, R), (2 * R) ** 3 / 6, 1e-12,
+    "afgeronde rechthoek -> cirkel, Wpl");
+
+  // (2) Scherpe hoeken (R = 0) moeten de gewone rechthoekformules geven.
+  bijna(rechthoekTraagheid(100, 200, 0), (100 * 200 ** 3) / 12, 1e-12,
+    "rechthoek zonder afronding, I");
+
+  // (3) EN 10210 spotchecks tegen gepubliceerde tabelwaarden.
+  const shs = berekenKoker({ h: 100, b: 100, t: 5 });
+  bijna(shs.area_mm2, 1870, 0.005, "SHS 100x100x5 A (tabel 18,7 cm2)");
+  bijna(shs.iy_mm4, 2.79e6, 0.01, "SHS 100x100x5 Iy (tabel 279 cm4)");
+  bijna(shs.it_mm4, 4.39e6, 0.01, "SHS 100x100x5 It (tabel 439 cm4)");
+
+  const chs = berekenBuis({ h: 114.3, b: 114.3, t: 6.3 });
+  bijna(chs.area_mm2, 2137, 0.005, "CHS 114.3x6.3 A (tabel 21,4 cm2)");
+
+  // (4) Bovengrens: een afgeronde koker mag nooit stijver zijn dan dezelfde
+  //     koker met scherpe hoeken.
+  for (const [h, b, t] of [[100, 100, 5], [200, 100, 8], [300, 200, 10]]) {
+    const p = berekenKoker({ h, b, t });
+    const scherpI = (b * h ** 3 - (b - 2 * t) * (h - 2 * t) ** 3) / 12;
+    if (p.iy_mm4 > scherpI) {
+      fouten.push(`koker ${h}x${b}x${t}: Iy boven de scherpe-hoek bovengrens`);
+    }
+  }
+
+  // (5) I-profiel: A uit de losse delen moet gelijk zijn aan een fijne
+  //     numerieke integratie van de breedtefunctie (controle op de
+  //     uitrondingsbijdrage).
+  const g = { h: 300, b: 150, tw: 7.1, tf: 10.7, r: 15 };
+  const N = 400000;
+  const dz = g.h / N;
+  let Anum = 0;
+  let Inum = 0;
+  for (let i = 0; i < N; i += 1) {
+    const z = (i + 0.5) * dz - g.h / 2;
+    const az = Math.abs(z);
+    let w;
+    if (az >= g.h / 2 - g.tf) w = g.b;
+    else if (az >= g.h / 2 - g.tf - g.r) {
+      const u = az - (g.h / 2 - g.tf - g.r);
+      w = g.tw + 2 * (g.r - Math.sqrt(Math.max(0, g.r * g.r - u * u)));
+    } else w = g.tw;
+    Anum += w * dz;
+    Inum += w * z * z * dz;
+  }
+  const ip = berekenIProfiel(g);
+  bijna(ip.area_mm2, Anum, 1e-4, "IPE 300 A analytisch vs numeriek");
+  bijna(ip.iy_mm4, Inum, 1e-4, "IPE 300 Iy analytisch vs numeriek");
+
+  // (6) Iw van een U-profiel: de gesloten formule moet gelijk zijn aan een
+  //     directe sectoriale-oppervlakintegratie over de wandmiddellijn.
+  for (const u of [
+    { h: 80, b: 45, tw: 6, tf: 8 },
+    { h: 200, b: 75, tw: 8.5, tf: 11.5 },
+    { h: 300, b: 100, tw: 10, tf: 16 },
+    { h: 400, b: 115, tw: 13.5, tf: 18 },
+  ]) {
+    const bAcc = u.b - u.tw / 2;
+    const hs = u.h - u.tf;
+    const gesloten =
+      ((u.tf * bAcc ** 3 * hs * hs) / 12) *
+      ((3 * bAcc * u.tf + 2 * hs * u.tw) / (6 * bAcc * u.tf + hs * u.tw));
+    bijna(gesloten, iwSectoriaal(u), 2e-3,
+      `Iw U-profiel h=${u.h} gesloten vs sectoriaal`);
+  }
+
+  // (7) UNP met flensschuinte: de hoek-geparametriseerde integratie moet
+  //     gelijk zijn aan een botte strookintegratie van dezelfde onderrand.
+  {
+    const gU = { h: 200, b: 75, tw: 8.5, tf: 11.5, r: 11.5 };
+    const m = unpMeetkunde(gU);
+    const v = unpIntegraal(m);
+    const Ns = 2000000;
+    const dz = gU.b / Ns;
+    let Anum = 0;
+    let Iynum = 0;
+    for (let i = 0; i < Ns; i += 1) {
+      const z = (i + 0.5) * dz;
+      const y = unpOnderrand(m, z);
+      Anum += (m.H - y) * dz;
+      Iynum += ((m.H ** 3 - y ** 3) / 3) * dz;
+    }
+    bijna(v.A, Anum, 1e-5, "UNP 200 A hoekintegratie vs strookintegratie");
+    bijna(v.Iyy, Iynum, 1e-5, "UNP 200 Iy hoekintegratie vs strookintegratie");
+  }
+
+  // (8) UNP-schuinte tegen de genormeerde tabelwaarden (DIN 1026-1).
+  //     [naam, h, b, tw, tf, r, A, Iy, Iz, e (zwaartepunt vanaf lijfrug)]
+  for (const [naam, h, b, tw, tf, r, A, Iy, Iz, e] of [
+    ["UNP 80", 80, 45, 6.0, 8.0, 8.0, 1100, 1.06e6, 1.94e5, 14.5],
+    ["UNP 140", 140, 60, 7.0, 10.0, 10.0, 2040, 6.05e6, 6.27e5, 17.5],
+    ["UNP 200", 200, 75, 8.5, 11.5, 11.5, 3220, 1.91e7, 1.48e6, 20.1],
+    ["UNP 300", 300, 100, 10.0, 16.0, 16.0, 5880, 8.03e7, 4.95e6, 27.0],
+  ]) {
+    const p = berekenUProfielSchuin({ h, b, tw, tf, r });
+    bijna(p.area_mm2, A, 5e-3, `${naam} A tegen DIN 1026-1`);
+    bijna(p.iy_mm4, Iy, 5e-3, `${naam} Iy tegen DIN 1026-1`);
+    bijna(p.iz_mm4, Iz, 5e-3, `${naam} Iz tegen DIN 1026-1`);
+    bijna(p._z0_mm, e, 5e-3, `${naam} zwaartepunt tegen DIN 1026-1`);
+    // Harde bovengrens: Iw van een U ligt altijd onder Iz*hs^2/4.
+    const grens = (p.iz_mm4 * (h - tf) ** 2) / 4;
+    if (!(p.iw_mm6 < grens)) {
+      fouten.push(`${naam}: Iw boven de bovengrens Iz*hs^2/4`);
+    }
+    // En altijd onder de prismatische kanaalformule, want de schuinte haalt
+    // materiaal weg juist waar het sectoriale oppervlak het grootst is.
+    const bAcc = b - tw / 2;
+    const hs = h - tf;
+    const prismatisch =
+      ((tf * bAcc ** 3 * hs * hs) / 12) *
+      ((3 * bAcc * tf + 2 * hs * tw) / (6 * bAcc * tf + hs * tw));
+    if (!(p.iw_mm6 < prismatisch)) {
+      fouten.push(`${naam}: Iw niet kleiner dan de prismatische kanaalformule`);
+    }
+  }
+
+  console.log("=".repeat(74));
+  console.log("ZELFTESTS OP DE FORMULES");
+  console.log("=".repeat(74));
+  if (fouten.length === 0) {
+    console.log("Alle zelftests geslaagd (cirkellimiet, scherpe hoek, EN 10210-");
+    console.log("spotchecks, bovengrens koker, analytisch vs numeriek I-profiel,");
+    console.log("UNP-flensschuinte tegen DIN 1026-1 en de Iw-bovengrenzen).");
+  } else {
+    for (const f of fouten) console.log(`FOUT  ${f}`);
+    process.exitCode = 1;
+  }
+  return fouten.length === 0;
+}
+
+/* ==================================================================== *
+ * 9. Uitbreiding schrijven                                             *
+ * ==================================================================== */
+
+function bouwUitbreiding() {
+  const bestaand = JSON.parse(readFileSync(bestaandPad, "utf8"));
+  const sleutelsBestaand = new Set(bestaand.map((p) => sleutel(p.name)));
+  const vingersBestaand = new Set(bestaand.map(vingerafdruk));
+
+  const nieuw = [];
+  const eigenSleutels = new Set();
+  const eigenVingers = new Set();
+  const overgeslagen = [];
+
+  for (const kand of alleKandidaten()) {
+    const s = sleutel(kand.name);
+    const v = vingerafdruk(kand);
+    if (sleutelsBestaand.has(s) || vingersBestaand.has(v)) {
+      overgeslagen.push(kand.name);
+      continue;
+    }
+    if (eigenSleutels.has(s) || eigenVingers.has(v)) {
+      overgeslagen.push(`${kand.name} (dubbel in de brontabel)`);
+      continue;
+    }
+    eigenSleutels.add(s);
+    eigenVingers.add(v);
+    const p = bereken(kand.kind, kand.geometry, kand.schuin);
+    delete p._z0_mm; // interne hulpwaarde hoort niet in het bestand
+    nieuw.push({
+      name: kand.name,
+      kind: kand.kind,
+      geometry: kand.geometry,
+      properties: p,
+      buckling_curves: knikkrommen(kand.kind, kand.geometry),
+    });
+  }
+  return { nieuw, overgeslagen };
+}
+
+/** Getallen afronden op zinvolle precisie (6 significante cijfers). */
+function afgerond(x) {
+  if (!Number.isFinite(x)) throw new Error(`Niet-eindig getal: ${x}`);
+  if (x === 0) return 0;
+  return Number(x.toPrecision(6));
+}
+
+function schrijf() {
+  const { nieuw, overgeslagen } = bouwUitbreiding();
+  const uit = nieuw.map((p) => ({
+    ...p,
+    properties: Object.fromEntries(
+      Object.entries(p.properties).map(([k, v]) => [k, afgerond(v)]),
+    ),
+  }));
+  writeFileSync(uitbreidingPad, `${JSON.stringify(uit, null, 2)}\n`, "utf8");
+
+  const perReeks = new Map();
+  for (const p of nieuw) {
+    const r = reeksVan(p.name);
+    perReeks.set(r, (perReeks.get(r) ?? 0) + 1);
+  }
+  console.log("=".repeat(74));
+  console.log("UITBREIDING GESCHREVEN");
+  console.log("=".repeat(74));
+  console.log(`Bestand: ${uitbreidingPad}`);
+  console.log(`Nieuwe profielen: ${nieuw.length}`);
+  for (const [r, n] of [...perReeks].sort()) console.log(`   ${r.padEnd(6)} ${n}`);
+  console.log(
+    `Overgeslagen omdat ze al bestaan of dubbel zijn: ${overgeslagen.length}`,
+  );
+  return nieuw;
+}
+
+/* ==================================================================== *
+ * 10. Zelfcontrole op de uitbreiding                                   *
+ * ==================================================================== */
+
+function zelfcontrole(nieuw) {
+  const fouten = [];
+  const waarschuwingen = [];
+  const rel = (a, b) => Math.abs(a - b) / Math.abs(b);
+
+  for (const p of nieuw) {
+    const q = p.properties;
+    const g = p.geometry;
+    const naam = p.name;
+
+    // Interne consistentie van de traagheidsstralen.
+    if (rel(q.iy_radius_mm, Math.sqrt(q.iy_mm4 / q.area_mm2)) > 1e-6) {
+      fouten.push(`${naam}: iy != sqrt(Iy/A)`);
+    }
+    if (rel(q.iz_radius_mm, Math.sqrt(q.iz_mm4 / q.area_mm2)) > 1e-6) {
+      fouten.push(`${naam}: iz != sqrt(Iz/A)`);
+    }
+    // Wel;y = Iy/(h/2) geldt voor alle dubbelsymmetrische doorsneden en ook
+    // voor het U-profiel (dat om de sterke as symmetrisch is).
+    if (rel(q.wel_y_mm3, q.iy_mm4 / (g.h / 2)) > 1e-5) {
+      fouten.push(`${naam}: Wel;y != Iy/(h/2)`);
+    }
+    // Wel;z = Iz/(b/2) alleen bij dubbelsymmetrie; bij een U-profiel is het
+    // Iz gedeeld door de GROOTSTE randafstand en dus kleiner.
+    if (p.kind !== "Channel" && rel(q.wel_z_mm3, q.iz_mm4 / (g.b / 2)) > 1e-5) {
+      fouten.push(`${naam}: Wel;z != Iz/(b/2)`);
+    }
+    if (p.kind === "Channel" && q.wel_z_mm3 >= q.iz_mm4 / (g.b / 2)) {
+      fouten.push(`${naam}: Wel;z van een U-profiel moet kleiner zijn dan Iz/(b/2)`);
+    }
+    // Vormfactoren.
+    if (!(q.wpl_y_mm3 >= q.wel_y_mm3)) fouten.push(`${naam}: Wpl;y < Wel;y`);
+    if (!(q.wpl_z_mm3 >= q.wel_z_mm3)) fouten.push(`${naam}: Wpl;z < Wel;z`);
+    const fy = q.wpl_y_mm3 / q.wel_y_mm3;
+    if (fy > 1.8) waarschuwingen.push(`${naam}: vormfactor sterke as ${fy.toFixed(2)}`);
+    // Afschuifoppervlak.
+    if (!(q.av_z_mm2 > 0 && q.av_z_mm2 < q.area_mm2)) {
+      fouten.push(`${naam}: Av;z buiten (0, A)`);
+    }
+    if (!(q.av_y_mm2 > 0 && q.av_y_mm2 < q.area_mm2)) {
+      fouten.push(`${naam}: Av;y buiten (0, A)`);
+    }
+    // Positieve grootheden.
+    for (const k of ["area_mm2", "iy_mm4", "iz_mm4", "it_mm4"]) {
+      if (!(q[k] > 0)) fouten.push(`${naam}: ${k} niet positief`);
+    }
+    if (!(q.iw_mm6 >= 0)) fouten.push(`${naam}: Iw negatief`);
+    // Iy >= Iz voor alle profielen waar h >= b.
+    if (g.h >= g.b && q.iy_mm4 < q.iz_mm4) {
+      fouten.push(`${naam}: Iy < Iz terwijl h >= b`);
+    }
+    // Bovengrens: A mag nooit boven de omhullende rechthoek liggen.
+    if (q.area_mm2 > g.h * g.b) fouten.push(`${naam}: A groter dan h*b`);
+    // Kokers en buizen zijn GESLOTEN doorsneden: hun torsiestijfheid ligt in
+    // dezelfde orde als de buigstijfheid. De maatgevende ondergrens is Iz (de
+    // zwakke as); It mag wel onder Iy liggen zodra h/b flink groter dan 1 is,
+    // want de schuifstroom loopt om de KLEINSTE maat rond.
+    if ((p.kind === "Shs" || p.kind === "Rhs" || p.kind === "Chs")
+      && !(q.it_mm4 > q.iz_mm4)) {
+      waarschuwingen.push(`${naam}: It niet groter dan Iz (gesloten doorsnede)`);
+    }
+    // Open profielen: It moet juist veel kleiner zijn dan Iy.
+    if ((p.kind === "ISection" || p.kind === "Channel")
+      && !(q.it_mm4 < q.iy_mm4 / 5)) {
+      waarschuwingen.push(`${naam}: It verdacht groot voor een open profiel`);
+    }
+  }
+
+  // Monotonie binnen een reeks: een groter profiel moet zwaarder en stijver
+  // zijn dan het kleinere met dezelfde reeksnaam.
+  const reeksen = new Map();
+  for (const p of nieuw) {
+    const r = reeksVan(p.name);
+    if (!reeksen.has(r)) reeksen.set(r, []);
+    reeksen.get(r).push(p);
+  }
+  let monoGecontroleerd = 0;
+  for (const [r, lijst] of reeksen) {
+    if (r !== "HEA" && r !== "HEB" && r !== "HEM" && r !== "UPE") continue;
+    const gesorteerd = [...lijst].sort((a, b) => a.geometry.h - b.geometry.h);
+    for (let i = 1; i < gesorteerd.length; i += 1) {
+      const v = gesorteerd[i - 1];
+      const n = gesorteerd[i];
+      monoGecontroleerd += 1;
+      if (!(n.properties.area_mm2 > v.properties.area_mm2)) {
+        fouten.push(`${r}: A niet monotoon bij ${v.name} -> ${n.name}`);
+      }
+      if (!(n.properties.iy_mm4 > v.properties.iy_mm4)) {
+        fouten.push(`${r}: Iy niet monotoon bij ${v.name} -> ${n.name}`);
+      }
+      if (!(n.properties.wpl_y_mm3 > v.properties.wpl_y_mm3)) {
+        fouten.push(`${r}: Wpl;y niet monotoon bij ${v.name} -> ${n.name}`);
+      }
+    }
+  }
+  // Kokers: bij gelijke buitenmaat moet een dikkere wand meer oppervlak geven.
+  const perMaat = new Map();
+  for (const p of nieuw) {
+    if (p.kind !== "Shs" && p.kind !== "Rhs" && p.kind !== "Chs") continue;
+    const k = `${p.kind}|${p.geometry.h}x${p.geometry.b}`;
+    if (!perMaat.has(k)) perMaat.set(k, []);
+    perMaat.get(k).push(p);
+  }
+  for (const [k, lijst] of perMaat) {
+    const s = [...lijst].sort((a, b) => a.geometry.t - b.geometry.t);
+    for (let i = 1; i < s.length; i += 1) {
+      monoGecontroleerd += 1;
+      if (!(s[i].properties.area_mm2 > s[i - 1].properties.area_mm2)) {
+        fouten.push(`${k}: A niet monotoon in wanddikte (${s[i - 1].name})`);
+      }
+      if (!(s[i].properties.iy_mm4 > s[i - 1].properties.iy_mm4)) {
+        fouten.push(`${k}: Iy niet monotoon in wanddikte (${s[i - 1].name})`);
+      }
+    }
+  }
+
+  console.log("=".repeat(74));
+  console.log("ZELFCONTROLE OP DE UITBREIDING");
+  console.log("=".repeat(74));
+  console.log(
+    `${nieuw.length} profielen gecontroleerd, ${monoGecontroleerd} ` +
+    `monotonie-vergelijkingen.`,
+  );
+  if (fouten.length === 0) console.log("Geen fouten.");
+  else {
+    for (const f of fouten) console.log(`FOUT  ${f}`);
+    process.exitCode = 1;
+  }
+  if (waarschuwingen.length) {
+    console.log(`Waarschuwingen (${waarschuwingen.length}):`);
+    for (const w of waarschuwingen.slice(0, 20)) console.log(`   ${w}`);
+    if (waarschuwingen.length > 20) console.log("   ...");
+  } else console.log("Geen waarschuwingen.");
+}
+
+/* ==================================================================== *
+ * 11. Herstel van de handmatig ingevoerde profielen                    *
+ * ==================================================================== *
+ *
+ * De eerste 100 regels van profiles.json zijn met de hand overgetypt. De
+ * 39 hieronder hadden aantoonbaar foute, ONVEILIGE waarden:
+ *
+ *  - 21 van de 26 holle doorsneden hebben een Iy boven de scherpe-hoek
+ *    bovengrens (RHS tot +23,7%, CHS tot +7,9%, SHS tot +2,2%). Een doorsnede
+ *    met afgeronde hoeken kan nooit stijver zijn dan dezelfde met scherpe
+ *    hoeken; bij een CHS is de ringformule zelfs exact. Alle 26 worden
+ *    herberekend, ook de vijf die de grens net niet overschreden.
+ *  - 12 van de 13 U-profielen hebben een Iw van 2,00x tot 4,45x boven de
+ *    bovengrens Iz*hs^2/4, en een It die 43-60% boven een numerieke
+ *    Prandtl-oplossing ligt. Beide maken de kiptoetsing onveilig.
+ *
+ * UNP350 krijgt ALLEEN een nieuwe It en Iw. Zijn A, Wpl;y en Av;z zijn op een
+ * externe referentie-berekening geijkt (en de generator reproduceert Av;z
+ * daarvan onafhankelijk op 4945,7 vs 4946 mm2). De rest van zijn grootheden
+ * blijft staan, en dat is nagemeten tegen de gepubliceerde profieltabel:
+ *
+ *   grootheid   tabel        database   db-tabel   dit model  model-tabel
+ *   A           7725 mm2     7665,7     -0,77%     7624       -1,31%
+ *   Iy          128,45e6     126,94e6   -1,17%     125,80e6   -2,07%
+ *   Wy;el       734e3        725,4e3    -1,17%     718,8e3    -2,07%
+ *   Iz          5,710e6      5,604e6    -1,86%     5,339e6    -6,50%
+ *   Wz;el       75,1e3       73,45e3    -2,20%     69,47e3    -7,49%
+ *
+ * Oftewel: de regel die er staat ligt op ELKE grootheid dichter bij de tabel
+ * dan wat dit script ervan zou maken, op Iz en Wz;el zelfs een factor 3.
+ *
+ * Dat is de valkuil bij deze ene regel. Zolang "UNP 350" in de brontabel stond,
+ * kwam UNP350 in --valideer als slechtste van de hele database uit (Iz -4,7%,
+ * Wz;el -5,4%) en las dat als een fout in de regel. Maar --valideer meet de
+ * database TEGEN DIT MODEL, en voor h = 350 is het model zelf de partij die
+ * ernaast zit (zie de brontabel bij UNP). Die uitslag was dus geen bewijs dat
+ * de regel fout is; hem "herstellen" met berekenUProfielSchuin zou zijn
+ * Iz-fout van 1,9% naar 6,5% brengen en zijn Wz;el-fout van 2,2% naar 7,5%.
+ * Daarom staat UNP350 niet in HERSTEL_UNP en staat "UNP 350" niet in de
+ * brontabel. Alleen It en Iw worden wel vervangen (HERSTEL_UNP_TORSIE): dat
+ * zijn de twee grootheden waarvoor de bovenstaande tabel geen gepubliceerde
+ * waarde geeft, en waarvoor de bovengrens Iw <= Iz*hs^2/4 uit de eindcontrole
+ * het enige houvast is.
+ *
+ * De regel wordt sinds deze ronde wél tegen de gepubliceerde tabel bewaakt,
+ * buiten dit script om: design-mockup/test-unp-tabel.mjs.
+ */
+
+/** Holle doorsneden uit de handmatig ingevoerde set (SHS/RHS/CHS). */
+const HERSTEL_HOL = [
+  "HFRHS200X200X16",
+  "SHS 80x80x4", "SHS 100x100x5", "SHS 120x120x5", "SHS 150x150x6",
+  "SHS 200x200x8", "SHS 250x250x10", "SHS 300x300x10",
+  "RHS 100x50x4", "RHS 120x60x5", "RHS 150x100x6", "RHS 200x100x8",
+  "RHS 250x150x8", "RHS 300x200x10",
+  "CHS 42.4x3.2", "CHS 48.3x3.2", "CHS 60.3x4.0", "CHS 76.1x5.0",
+  "CHS 88.9x5.0", "CHS 114.3x6.3", "CHS 139.7x8.0", "CHS 168.3x8.0",
+  "CHS 219.1x10", "CHS 273x10", "CHS 323.9x12.5", "CHS 406.4x16",
+];
+
+/** UNP-profielen die volledig herberekend worden. */
+const HERSTEL_UNP = [
+  "UNP 80", "UNP 100", "UNP 120", "UNP 140", "UNP 160", "UNP 180",
+  "UNP 200", "UNP 220", "UNP 240", "UNP 260", "UNP 280", "UNP 300",
+];
+
+/** UNP-profielen waarvan alleen de torsiegrootheden hersteld worden. */
+const HERSTEL_UNP_TORSIE = ["UNP350"];
+
+function herstel() {
+  const ruw = readFileSync(bestaandPad, "utf8");
+  const crlf = ruw.includes("\r\n");
+  const eindNieuweRegel = /\n$/.test(ruw);
+  const db = JSON.parse(ruw);
+  const opNaam = new Map(db.map((p) => [p.name, p]));
+  const regels = [];
+
+  const pak = (naam) => {
+    const p = opNaam.get(naam);
+    if (!p) throw new Error(`Profiel niet in de database: ${naam}`);
+    return p;
+  };
+  const verschil = (oud, nieuw, sleutels) => sleutels
+    .filter((k) => Number.isFinite(oud[k]) && oud[k] !== 0)
+    .map((k) => ({ k, pct: ((nieuw[k] - oud[k]) / oud[k]) * 100 }))
+    .filter((d) => Math.abs(d.pct) >= 0.05);
+
+  // --- Holle doorsneden -------------------------------------------------
+  for (const naam of HERSTEL_HOL) {
+    const p = pak(naam);
+    const t = p.geometry.t ?? p.geometry.tw;
+    if (!Number.isFinite(t) || t <= 0) {
+      throw new Error(`${naam}: geen bruikbare wanddikte in de geometrie`);
+    }
+    // EN 10210-2: buitenhoekstraal 1,5*t (buis: geen hoek, dus 0). De oude
+    // regels hadden r = t staan, wat de binnenstraal is; die waarde is nooit
+    // in een berekening gebruikt maar hoort wel bij de doorsnede.
+    const r = p.kind === "Chs" ? 0 : 1.5 * t;
+    const g = { ...p.geometry, t, r };
+    const nieuw = p.kind === "Chs" ? berekenBuis(g) : berekenKoker(g);
+    const oud = p.properties;
+    regels.push({ naam, verschillen: verschil(oud, nieuw, GROOTHEDEN) });
+    p.geometry.r = r;
+    p.properties = Object.fromEntries(
+      Object.entries(nieuw).map(([k, v]) => [k, afgerond(v)]),
+    );
+  }
+
+  // --- U-profielen, volledig -------------------------------------------
+  for (const naam of HERSTEL_UNP) {
+    const p = pak(naam);
+    const nieuw = berekenUProfielSchuin(p.geometry);
+    delete nieuw._z0_mm;
+    regels.push({ naam, verschillen: verschil(p.properties, nieuw, GROOTHEDEN) });
+    p.properties = Object.fromEntries(
+      Object.entries(nieuw).map(([k, v]) => [k, afgerond(v)]),
+    );
+  }
+
+  // --- U-profielen, alleen It en Iw ------------------------------------
+  for (const naam of HERSTEL_UNP_TORSIE) {
+    const p = pak(naam);
+    const g = p.geometry;
+    const nieuw = {
+      it_mm4: afgerond(itUProfiel(g)),
+      iw_mm6: afgerond(iwUnpSchuin(g).Iw),
+    };
+    regels.push({
+      naam,
+      verschillen: verschil(p.properties, nieuw, ["it_mm4", "iw_mm6"]),
+    });
+    Object.assign(p.properties, nieuw);
+  }
+
+  let uit = JSON.stringify(db, null, 2);
+  if (eindNieuweRegel) uit += "\n";
+  if (crlf) uit = uit.replace(/\n/g, "\r\n");
+  writeFileSync(bestaandPad, uit, "utf8");
+
+  console.log("=".repeat(74));
+  console.log("HERSTEL VAN DE HANDMATIG INGEVOERDE PROFIELEN");
+  console.log("=".repeat(74));
+  console.log(`Bestand: ${bestaandPad}`);
+  console.log(
+    `Herberekend: ${HERSTEL_HOL.length} holle doorsneden + ` +
+    `${HERSTEL_UNP.length} U-profielen; ` +
+    `${HERSTEL_UNP_TORSIE.length} U-profiel alleen It en Iw.`,
+  );
+  console.log("\nWijziging per profiel (alleen grootheden die >= 0,05% schuiven):");
+  for (const { naam, verschillen } of regels) {
+    if (verschillen.length === 0) {
+      console.log(`   ${naam.padEnd(16)} ongewijzigd`);
+      continue;
+    }
+    console.log(
+      `   ${naam.padEnd(16)} ` +
+      verschillen
+        .map((d) => `${d.k.replace(/_mm\d?$/, "")} ${d.pct >= 0 ? "+" : ""}${d.pct.toFixed(1)}%`)
+        .join("  "),
+    );
+  }
+  return db;
+}
+
+/* ==================================================================== *
+ * 12. De exacte motor als bron                                         *
+ * ==================================================================== *
+ *
+ * Alles hierboven rekent in JavaScript met gesloten formules. Dat werkt, maar
+ * het is een TWEEDE implementatie naast de Rust-crate die de app zelf gebruikt,
+ * en een formule als It van een gewalst profiel bestaat daar sowieso niet in
+ * gesloten vorm — daar staat een empirische benadering met ~1-2% spreiding.
+ *
+ * Deze sectie legt daarom een pad open waarin niet dit script maar de
+ * Rust-motor (`crates/section-properties`) de waarden levert:
+ *
+ *   contour.rs  A, zwaartepunt, Iy, Iz, Iyz, hoofdassen, Wel, Wpl, i
+ *               -> EXACT, gesloten randintegralen per lijn- en boogsegment
+ *   torsie.rs   It, Iw, schuifmiddelpunt
+ *               -> NUMERIEK, driehoekselementen, met insluiting van It
+ *   motor.rs    Av;y, Av;z
+ *               -> NORMBEPAALD, EN 1993-1-1 par. 6.2.6(3)
+ *
+ * De motor draait als los binair bestand dat JSON in en JSON uit doet, zodat
+ * dit script zijn geometrietabellen kan blijven beheren zonder de formules te
+ * dupliceren. Eén waarheid, twee rollen: geometrie hier, rekenwerk daar.
+ *
+ *   node scripts/genereer-profieldata.mjs --motor-valideer
+ *       Rekent alle 416 profielen uit profiles.json opnieuw door met de motor
+ *       en rapporteert per grootheid en per reeks de afwijking.
+ *   node scripts/genereer-profieldata.mjs --motor-herstel
+ *       Schrijft UITSLUITEND de grootheden terug waarvan is vastgesteld dat de
+ *       motor beter is dan de database (zie MOTOR_OVERNAME).
+ */
+
+/** Pad naar het binaire bestand van de motor. */
+const motorBin = join(
+  wortel, "src-tauri", "target", "release",
+  process.platform === "win32" ? "doorsnedemotor.exe" : "doorsnedemotor",
+);
+
+/**
+ * Vertaalt een databaserecord naar de invoer van de motor.
+ *
+ * De enige beslissing die hier valt is UNP versus UPE: de database kent beide
+ * als `Channel`, maar een UNP heeft 8% flensschuinte (DIN 1026-1) en een UPE
+ * evenwijdige flenzen (DIN 1026-2). Dat is meetkunde, geen naamgeving — maar
+ * de naam is wél waar het in staat.
+ */
+function motorInvoerVan(p) {
+  const g = p.geometry;
+  // De flenshelling staat in de database (`flange_slope`): UNP 0,08 en INP
+  // 0,14. Zonder die vertaling rekende `--motor-valideer` een INP als I met
+  // evenwijdige flenzen en meldde 19 % afwijking op Iz die er niet is.
+  const schuin = (g.flange_slope ?? 0) > 0;
+  const soort = p.kind === "Channel"
+    ? (schuin || sleutel(p.name).startsWith("UNP") ? "ChannelSchuin" : "Channel")
+    : p.kind === "ISection" && schuin
+      ? "ISectionSchuin"
+      : p.kind;
+  return {
+    naam: p.name,
+    soort,
+    h: g.h,
+    b: g.b,
+    tw: g.tw ?? 0,
+    tf: g.tf ?? 0,
+    t: g.t ?? 0,
+    r: g.r ?? 0,
+    // Teenafronding van de hoeklijn; voor de andere soorten 0.
+    r2: g.r2 ?? 0,
+  };
+}
+
+/**
+ * Draait de motor over een lijst geometrieën. Bouwt hem eerst als hij ontbreekt
+ * of ouder is dan de bron; zo kan niemand per ongeluk met een verouderde motor
+ * de database vullen.
+ */
+function draaiMotor(lijst) {
+  const bronDir = join(wortel, "src-tauri", "crates", "section-properties", "src");
+  const bronTijd = readdirSync(bronDir, { recursive: true })
+    .map((f) => join(bronDir, String(f)))
+    .filter((f) => f.endsWith(".rs"))
+    .reduce((t, f) => Math.max(t, statSync(f).mtimeMs), 0);
+  const verouderd = !existsSync(motorBin) || statSync(motorBin).mtimeMs < bronTijd;
+  if (verouderd) {
+    console.log("Motor bouwen (cargo build --release)...");
+    execFileSync(
+      "cargo",
+      ["build", "--release", "-q", "-p", "section-properties", "--bin", "doorsnedemotor"],
+      { cwd: join(wortel, "src-tauri"), stdio: "inherit" },
+    );
+  }
+  const invoerPad = join(tmpdir(), `motor-invoer-${process.pid}.json`);
+  const uitvoerPad = join(tmpdir(), `motor-uitvoer-${process.pid}.json`);
+  writeFileSync(invoerPad, JSON.stringify(lijst), "utf8");
+  try {
+    execFileSync(motorBin, [invoerPad, uitvoerPad], { stdio: ["ignore", "ignore", "inherit"] });
+    return JSON.parse(readFileSync(uitvoerPad, "utf8"));
+  } finally {
+    for (const f of [invoerPad, uitvoerPad]) {
+      try { unlinkSync(f); } catch { /* al weg */ }
+    }
+  }
+}
+
+/**
+ * Welke grootheden de motor mag overschrijven, en waarom.
+ *
+ * Dit is bewust een KORTE lijst. De motor is exacter dan de generator waar
+ * het om de meetkunde gaat, maar de database bevat op een paar plekken
+ * genormeerde tabelwaarden die beter zijn dan wat een geometriemodel kan
+ * reproduceren — daar wint de database. De verantwoording per regel staat in
+ * docs/superpowers/specs/2026-09-02-profieldata-generatie.md, sectie 11.
+ */
+const MOTOR_OVERNAME = [
+  {
+    // Basisaudit nr 33: de overgetypte tabelwaarden van W_pl,z van de
+    // HEM-reeks staan tot 1,9 % te hoog (HEM 300: 1 950 000 tegen 1 913 180
+    // mm³ uit de exacte contour), en W_pl,y van HEM 220 0,74 %. Een te hoge
+    // W_pl geeft een te hoge buigweerstand (6.2.5) en een te gunstige
+    // interactie (6.61/6.62): onveilig. W_pl is een zuivere contourgrootheid
+    // (statisch moment om de plastische neutrale lijn), dus de motor is hier
+    // exact. Alleen regels die meer dan `drempel_pct` afwijken worden
+    // overschreven, zodat een afronding op drie cijfers niet honderd regels
+    // in beweging zet.
+    soorten: ["ISection"],
+    velden: ["wpl_y_mm3", "wpl_z_mm3"],
+    drempel_pct: 0.5,
+    reden:
+      "W_pl,y en W_pl,z van gewalste I-profielen die meer dan 0,5 % van de " +
+      "exacte contour afwijken (HEM-reeks tot +1,9 %). W_pl is een zuivere " +
+      "contourgrootheid; een te hoge waarde geeft een te hoge buigweerstand.",
+  },
+  {
+    soorten: ["Channel"],
+    velden: ["it_mm4"],
+    reden:
+      "It van alle 27 U-profielen staat te HOOG in de database (empirische " +
+      "benadering, gehalveerd voor twee uitrondingen). Te hoge It overschat " +
+      "Mcr en dus de kipcapaciteit: onveilig. De motor lost het probleem van " +
+      "Prandtl numeriek op en sluit de uitkomst in tussen een onder- en een " +
+      "bovengrens.",
+  },
+  {
+    soorten: ["ISection"],
+    velden: ["iw_mm6"],
+    reden:
+      "Iw van de I-profielen is in de database exact gelijkgesteld aan de " +
+      "bovengrens Iz*hs^2/4. Die grens haalt alleen een doorsnede die haar " +
+      "hele Iz in de flensmiddenvlakken heeft; lijf en uitrondingen dragen " +
+      "wel aan Iz bij maar nauwelijks aan het sectoriale moment. Te hoge Iw " +
+      "is onveilig voor kip.",
+  },
+];
+
+/**
+ * De velden die de motor voor een gegeven soort mag zetten, met per veld de
+ * drempel (in %) waaronder de databasewaarde blijft staan; 0 = altijd
+ * overschrijven.
+ */
+function motorVelden(kind) {
+  return MOTOR_OVERNAME.filter((r) => r.soorten.includes(kind))
+    .flatMap((r) => r.velden.map((k) => ({ k, drempel: r.drempel_pct ?? 0 })));
+}
+
+function motorValideer() {
+  const db = JSON.parse(readFileSync(bestaandPad, "utf8"));
+  const start = Date.now();
+  const uit = draaiMotor(db.map(motorInvoerVan));
+  const wand = (Date.now() - start) / 1000;
+  const opNaam = new Map(uit.map((u) => [u.naam, u]));
+
+  const perGrootheid = new Map(GROOTHEDEN.map((k) => [k, []]));
+  const perReeks = new Map();
+  let rekentijd = 0;
+  let ergsteMesh = 0;
+  let ergsteOnzekerheid = 0;
+  let kleinsteHoek = 90;
+
+  for (const p of db) {
+    const m = opNaam.get(p.name);
+    if (!m) throw new Error(`Motor gaf geen uitkomst voor ${p.name}`);
+    rekentijd += m.tijd_ms;
+    ergsteMesh = Math.max(ergsteMesh, Math.abs(m.a_mesh_afwijking));
+    ergsteOnzekerheid = Math.max(ergsteOnzekerheid, m.it_onzekerheid);
+    kleinsteHoek = Math.min(kleinsteHoek, m.kleinste_hoek_graden);
+    const reeks = reeksVan(p.name);
+    if (!perReeks.has(reeks)) perReeks.set(reeks, []);
+    for (const k of GROOTHEDEN) {
+      const oud = p.properties[k];
+      if (!Number.isFinite(oud) || oud === 0) continue;
+      // Iw van een gesloten doorsnede staat in beide bronnen op 0.
+      if (k === "iw_mm6" && m[k] === 0 && oud === 0) continue;
+      const pct = ((m[k] - oud) / oud) * 100;
+      perGrootheid.get(k).push({ naam: p.name, pct });
+      perReeks.get(reeks).push({ naam: `${p.name} ${k}`, pct });
+    }
+  }
+
+  console.log("=".repeat(74));
+  console.log("VALIDATIE VAN DE EXACTE MOTOR TEGEN DE DATABASE");
+  console.log("=".repeat(74));
+  console.log(
+    `${db.length} profielen, ${(rekentijd / 1000).toFixed(1)} s rekentijd ` +
+    `(${wand.toFixed(1)} s wandklok). Meshkwaliteit: |A_mesh - A_exact| ` +
+    `hoogstens ${(ergsteMesh * 100).toFixed(4)}%, kleinste driehoekshoek ` +
+    `${kleinsteHoek.toFixed(1)} graden, It-insluiting hoogstens ` +
+    `${(ergsteOnzekerheid * 100).toFixed(2)}% halve bandbreedte.`,
+  );
+  console.log("\nAfwijking (motor - database)/database, per grootheid:");
+  console.log(
+    `   ${"grootheid".padEnd(15)}${"n".padStart(5)}${"mediaan".padStart(10)}` +
+    `${"gemiddeld".padStart(11)}${"maximum".padStart(10)}  ergste`,
+  );
+  for (const k of GROOTHEDEN) {
+    const s = statistiek(perGrootheid.get(k));
+    if (!s) continue;
+    console.log(
+      `   ${k.padEnd(15)}${String(s.n).padStart(5)}` +
+      `${s.mediaan.toFixed(3).padStart(9)}%${s.gem.toFixed(3).padStart(10)}%` +
+      `${s.max.toFixed(3).padStart(9)}%  ${s.ergste.naam} ` +
+      `(${s.ergste.pct >= 0 ? "+" : ""}${s.ergste.pct.toFixed(2)}%)`,
+    );
+  }
+  console.log("\nPer reeks (grootste afwijking over alle grootheden):");
+  for (const [reeks, lijst] of [...perReeks].sort()) {
+    const s = statistiek(lijst);
+    if (!s) continue;
+    console.log(
+      `   ${reeks.padEnd(8)}${String(s.n).padStart(6)} waarden  ` +
+      `mediaan ${s.mediaan.toFixed(3)}%  max ${s.max.toFixed(2)}%  ` +
+      `(${s.ergste.naam})`,
+    );
+  }
+  return { db, opNaam };
+}
+
+/**
+ * Schrijft de grootheden uit MOTOR_OVERNAME terug in profiles.json. Alle
+ * andere waarden blijven byte-identiek.
+ */
+function motorHerstel() {
+  const ruw = readFileSync(bestaandPad, "utf8");
+  const crlf = ruw.includes("\r\n");
+  const eindNieuweRegel = /\n$/.test(ruw);
+  const db = JSON.parse(ruw);
+  const uit = draaiMotor(db.map(motorInvoerVan));
+  const opNaam = new Map(uit.map((u) => [u.naam, u]));
+
+  const regels = [];
+  for (const p of db) {
+    const velden = motorVelden(p.kind);
+    if (velden.length === 0) continue;
+    const m = opNaam.get(p.name);
+    const wijzigingen = [];
+    for (const { k, drempel } of velden) {
+      const oud = p.properties[k];
+      const nieuw = afgerond(m[k]);
+      if (!Number.isFinite(oud) || oud === nieuw) continue;
+      if (drempel > 0 && oud !== 0 && Math.abs((nieuw - oud) / oud) * 100 <= drempel) continue;
+      wijzigingen.push({
+        k,
+        oud,
+        nieuw,
+        pct: oud === 0 ? Infinity : ((nieuw - oud) / oud) * 100,
+      });
+      p.properties[k] = nieuw;
+    }
+    if (wijzigingen.length > 0) regels.push({ naam: p.name, wijzigingen });
+  }
+
+  let tekst = JSON.stringify(db, null, 2);
+  if (eindNieuweRegel) tekst += "\n";
+  if (crlf) tekst = tekst.replace(/\n/g, "\r\n");
+  writeFileSync(bestaandPad, tekst, "utf8");
+
+  console.log("=".repeat(74));
+  console.log("OVERNAME VAN DE EXACTE MOTOR");
+  console.log("=".repeat(74));
+  for (const r of MOTOR_OVERNAME) {
+    console.log(`\n${r.soorten.join(", ")} -> ${r.velden.join(", ")}`);
+    console.log(`   ${r.reden.replace(/(.{68}) /g, "$1\n   ")}`);
+  }
+  console.log(`\n${regels.length} profielen gewijzigd in ${bestaandPad}:`);
+  for (const { naam, wijzigingen } of regels) {
+    console.log(
+      `   ${naam.padEnd(16)} ` +
+      wijzigingen
+        .map((w) => `${w.k.replace(/_mm\d?$/, "")} ${w.oud.toPrecision(6)} -> ` +
+          `${w.nieuw.toPrecision(6)} (${w.pct >= 0 ? "+" : ""}${w.pct.toFixed(1)}%)`)
+        .join("  "),
+    );
+  }
+}
+
+/* ==================================================================== *
+ * 13. Eindcontrole op de HELE database                                 *
+ * ==================================================================== */
+
+/**
+ * Controleert alle profielen in profiles.json op de twee formulevrije
+ * bovengrenzen plus de interne consistentie. Dit is de acceptatietest van de
+ * herstelronde: er mag geen enkele overschrijding overblijven.
+ */
+function eindcontrole() {
+  const db = JSON.parse(readFileSync(bestaandPad, "utf8"));
+  const fouten = [];
+  const rel = (a, b) => Math.abs(a - b) / Math.abs(b);
+  let nHol = 0;
+  let nU = 0;
+
+  for (const p of db) {
+    const g = p.geometry;
+    const q = p.properties;
+    const t = g.t || g.tw;
+
+    if (["Shs", "Rhs", "Chs"].includes(p.kind)) {
+      nHol += 1;
+      // Scherpe-hoek bovengrens; bij een CHS is de ringformule exact.
+      const scherpA = p.kind === "Chs"
+        ? (Math.PI / 4) * (g.h ** 2 - (g.h - 2 * t) ** 2)
+        : g.b * g.h - (g.b - 2 * t) * (g.h - 2 * t);
+      const scherpY = p.kind === "Chs"
+        ? (Math.PI / 64) * (g.h ** 4 - (g.h - 2 * t) ** 4)
+        : (g.b * g.h ** 3 - (g.b - 2 * t) * (g.h - 2 * t) ** 3) / 12;
+      const scherpZ = p.kind === "Chs"
+        ? scherpY
+        : (g.h * g.b ** 3 - (g.h - 2 * t) * (g.b - 2 * t) ** 3) / 12;
+      if (q.area_mm2 > scherpA * 1.0001) fouten.push(`${p.name}: A boven de scherpe-hoek bovengrens`);
+      if (q.iy_mm4 > scherpY * 1.0001) fouten.push(`${p.name}: Iy boven de scherpe-hoek bovengrens`);
+      if (q.iz_mm4 > scherpZ * 1.0001) fouten.push(`${p.name}: Iz boven de scherpe-hoek bovengrens`);
+    }
+
+    if (p.kind === "Channel") {
+      nU += 1;
+      const grens = (q.iz_mm4 * (g.h - g.tf) ** 2) / 4;
+      if (q.iw_mm6 > grens) fouten.push(`${p.name}: Iw boven de bovengrens Iz*hs^2/4`);
+    }
+
+    // Interne consistentie. Tolerantie 0,5%: de handmatig ingevoerde regels
+    // die niet in deze herstelronde vallen staan op drie significante cijfers,
+    // en dan is Iy/(h/2) niet exact gelijk aan de afgeronde Wel;y.
+    if (rel(q.iy_radius_mm, Math.sqrt(q.iy_mm4 / q.area_mm2)) > 5e-3) {
+      fouten.push(`${p.name}: iy != sqrt(Iy/A)`);
+    }
+    if (rel(q.iz_radius_mm, Math.sqrt(q.iz_mm4 / q.area_mm2)) > 5e-3) {
+      fouten.push(`${p.name}: iz != sqrt(Iz/A)`);
+    }
+    if (rel(q.wel_y_mm3, q.iy_mm4 / (g.h / 2)) > 5e-3) {
+      fouten.push(`${p.name}: Wel;y != Iy/(h/2)`);
+    }
+    if (!(q.wpl_y_mm3 >= q.wel_y_mm3)) fouten.push(`${p.name}: Wpl;y < Wel;y`);
+    if (!(q.wpl_z_mm3 >= q.wel_z_mm3)) fouten.push(`${p.name}: Wpl;z < Wel;z`);
+    if (!(q.av_z_mm2 > 0 && q.av_z_mm2 < q.area_mm2)) fouten.push(`${p.name}: Av;z buiten (0, A)`);
+    if (!(q.av_y_mm2 > 0 && q.av_y_mm2 < q.area_mm2)) fouten.push(`${p.name}: Av;y buiten (0, A)`);
+    for (const k of ["area_mm2", "iy_mm4", "iz_mm4", "it_mm4"]) {
+      if (!(q[k] > 0)) fouten.push(`${p.name}: ${k} niet positief`);
+    }
+    if (!(q.iw_mm6 >= 0)) fouten.push(`${p.name}: Iw negatief`);
+  }
+
+  console.log("=".repeat(74));
+  console.log("EINDCONTROLE OP DE HELE DATABASE");
+  console.log("=".repeat(74));
+  console.log(
+    `${db.length} profielen: ${nHol} holle doorsneden tegen de scherpe-hoek ` +
+    `bovengrens, ${nU} U-profielen tegen Iz*hs^2/4, alle ${db.length} op interne ` +
+    `consistentie (iy = wortel(Iy/A), Wel;y = Iy/(h/2), Wpl >= Wel, 0 < Av < A).`,
+  );
+  if (fouten.length === 0) {
+    console.log("NUL overschrijdingen.");
+  } else {
+    console.log(`${fouten.length} overschrijdingen:`);
+    for (const f of fouten) console.log(`   FOUT  ${f}`);
+    process.exitCode = 1;
+  }
+}
+
+/* ==================================================================== *
+ * 14. Aansturing                                                       *
+ * ==================================================================== */
+
+const vlaggen = process.argv.slice(2);
+const alles = vlaggen.length === 0;
+if (vlaggen.includes("--herstel")) herstel();
+// De motorvlaggen zitten bewust NIET in de vlagloze uitvoering: zij hebben een
+// Rust-toolchain nodig en kosten een halve minuut rekentijd. De vlagloze run
+// blijft daarmee dependency-vrij.
+if (vlaggen.includes("--motor-herstel")) motorHerstel();
+if (vlaggen.includes("--motor-valideer")) motorValideer();
+if (alles || vlaggen.includes("--zelftests")) zelftests();
+if (alles || vlaggen.includes("--valideer")) valideer();
+if (alles || vlaggen.includes("--schrijf") || vlaggen.includes("--zelfcontrole")) {
+  const nieuw = (alles || vlaggen.includes("--schrijf"))
+    ? schrijf()
+    : bouwUitbreiding().nieuw;
+  if (alles || vlaggen.includes("--zelfcontrole")) zelfcontrole(nieuw);
+}
+if (alles || vlaggen.includes("--eindcontrole")) eindcontrole();

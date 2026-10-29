@@ -1,0 +1,106 @@
+# Tests on every push to main and on every pull request: the Rust kernels and
+# the MCP server, the TypeScript type check, the solver test battery and the
+# solver bundle that the MCP server embeds.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust kernels and MCP server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: src-tauri -> target
+      # Only the library crates and the MCP server: the desktop app crate needs
+      # WebKitGTK and is built by the release workflow.
+      - name: Test kernels
+        working-directory: src-tauri
+        run: cargo test -p mechanics -p section-properties -p steel-profiles -p open-fem-3d -p frame3d-solver -p openaec-native-fem -p toetsbrug
+      - name: Test MCP server
+        working-directory: src-tauri
+        env:
+          OPENAEC_MCP_SOLVE_TIMEOUT: "600"
+        run: cargo test -p openaec-mcp-server -- --test-threads=2
+
+  app-crate:
+    name: Desktop app (cargo check)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev libgtk-3-dev
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check -p open-fem-studio
+
+  frontend:
+    name: Type check, solver tests and bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('design-mockup/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      # Part of the tests call the Rust kernels as separate processes.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: src-tauri -> target
+      - name: Build kernels
+        working-directory: src-tauri
+        run: |
+          cargo build --release -p toetsbrug -p openaec-mcp-server -p open-fem-3d
+          cargo build -p toetsbrug -p open-fem-3d -p frame3d-solver -p openaec-native-fem --bins
+      - name: Install frontend dependencies
+        working-directory: design-mockup
+        run: npm ci
+      - name: Type check
+        working-directory: design-mockup
+        run: npx tsc --noEmit
+      # The MCP server embeds the solver bundle; it must be a faithful build of
+      # the source in this commit.
+      - name: Solver bundle is up to date
+        working-directory: design-mockup
+        run: |
+          npm run build:sidecar
+          git diff --exit-code -- ../src-tauri/crates/openaec-mcp-server/assets
+      - name: Solver test battery
+        working-directory: design-mockup
+        env:
+          OPENAEC_BROWSER: /usr/bin/google-chrome
+        run: node scripts/run-tests.mjs
+      - name: Adapter tests against the bundle
+        working-directory: design-mockup
+        run: node scripts/run-tests.mjs --bundel

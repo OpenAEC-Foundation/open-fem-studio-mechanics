@@ -1,0 +1,783 @@
+/* ProfielEditor — eigen doorsneden samenstellen, tekenen en van een gat voorzien. */
+
+.pe-wortel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  color: var(--theme-text);
+  font-size: 12px;
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────────────── */
+.pe-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 10px 0;
+  border-bottom: 1px solid var(--theme-border-subtle);
+  flex-shrink: 0;
+}
+.pe-tab {
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  background: none;
+  color: var(--theme-text-muted, var(--theme-text));
+  font-size: 12px;
+  cursor: pointer;
+}
+.pe-tab:hover { color: var(--theme-accent); }
+.pe-tab.actief {
+  color: var(--theme-accent);
+  font-weight: 600;
+  border-color: var(--theme-border-subtle);
+  background: var(--theme-bg);
+  margin-bottom: -1px;
+}
+
+/* ── Drie kolommen ────────────────────────────────────────────────────── */
+.pe-kolommen {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.pe-kolom {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  gap: 8px;
+}
+/* De bewerkingen staan in de balk bovenin, dus de linkerkolom mag smaller;
+   die ruimte gaat naar het tekenvlak. */
+.pe-kolom-links {
+  flex: 0 0 254px;
+  border-right: 1px solid var(--theme-border-subtle);
+}
+.pe-kolom-midden {
+  flex: 1;
+  padding: 0;
+  overflow: hidden;
+  background: var(--theme-bg);
+}
+.pe-kolom-rechts {
+  flex: 0 0 316px;
+  border-left: 1px solid var(--theme-border-subtle);
+}
+
+.pe-kop {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--theme-text-faint);
+  margin: 4px 0 2px;
+}
+/* Kop met de knoppen die erbij horen op dezelfde regel; passen ze niet, dan
+   zakt de knoppengroep als geheel naar de regel eronder. De rij blijft bij het
+   scrollen bovenaan plakken, zodat ＋ Lamel en ＋ Profiel altijd binnen bereik
+   staan — ook bij tien bouwstenen. */
+.pe-kop-rij {
+  /* top −8px: de kolom heeft 8px padding-top, en zonder die verschuiving
+     schuift er inhoud dóór de strook boven de vastgezette kop. */
+  position: sticky;
+  top: -8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-bottom: 0;
+  padding: 13px 0 5px;
+  background: var(--theme-dialog-bg, var(--theme-bg));
+}
+.pe-kop-rij > .pe-knoppen { margin-left: auto; }
+.pe-kop-rij > span:first-child {
+  cursor: help;
+}
+/* Eén regel voor "er is hier nog niets". */
+.pe-leeg {
+  font-size: 11px;
+  color: var(--theme-text-faint);
+}
+/* Maatregel van een catalogusprofiel: getallen, geen proza. */
+.pe-maatregel {
+  font-size: 10px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  color: var(--theme-text-muted, var(--theme-text-faint));
+  cursor: help;
+}
+.pe-melding {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(217, 119, 6, 0.4);
+  background: var(--theme-accent-soft, rgba(217, 119, 6, 0.08));
+  color: var(--theme-text);
+}
+.pe-melding-fout {
+  border-color: var(--theme-danger-color, #dc2626);
+  background: rgba(220, 38, 38, 0.08);
+}
+/* Meldingen van de motor: één regel elk, de hele zin in de tooltip. */
+.pe-meldingen {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+}
+.pe-melding-regel {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 6px;
+  cursor: help;
+}
+.pe-melding-merk {
+  flex: 0 0 auto;
+  font-weight: 700;
+  font-size: 10px;
+  color: var(--theme-accent);
+}
+.pe-melding-tekst {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Lijsten van bouwstenen ───────────────────────────────────────────── */
+.pe-lijst {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pe-item {
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg);
+  padding: 6px 8px;
+  cursor: pointer;
+}
+.pe-item.actief {
+  border-color: var(--theme-accent);
+  box-shadow: 0 0 0 1px var(--theme-accent) inset;
+}
+.pe-item-kop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 11px;
+}
+.pe-item-kop .pe-item-sub {
+  font-weight: 400;
+  color: var(--theme-text-muted, var(--theme-text-faint));
+}
+.pe-velden {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+  margin-top: 6px;
+}
+.pe-velden-3 { grid-template-columns: 1fr 1fr 1fr; }
+.pe-veld {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--theme-text-muted, var(--theme-text));
+}
+.pe-veld input,
+.pe-veld select {
+  padding: 4px 6px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+  color: var(--theme-text);
+  font-size: 12px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.pe-veld input:focus { outline: 1px solid var(--theme-accent); }
+.pe-veld-vink {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.pe-veld-vink input { width: auto; }
+
+.pe-knoppen {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pe-knop {
+  padding: 5px 10px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg);
+  color: var(--theme-text);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pe-knop:hover:not(:disabled) { border-color: var(--theme-accent); color: var(--theme-accent); }
+.pe-knop:disabled { opacity: 0.5; cursor: not-allowed; }
+.pe-knop-primair {
+  background: var(--theme-accent);
+  border-color: var(--theme-accent);
+  color: var(--theme-accent-text, #fff);
+  font-weight: 600;
+}
+.pe-knop-primair:hover:not(:disabled) { color: var(--theme-accent-text, #fff); background: var(--theme-accent-hover, var(--theme-accent)); }
+.pe-knop-gevaar:hover:not(:disabled) { border-color: var(--theme-danger-color, #dc2626); color: var(--theme-danger-color, #dc2626); }
+
+/* Profielkeuze (gat-tab): reeks en maat naast elkaar. */
+.pe-profielkeuze {
+  display: flex;
+  gap: 6px;
+}
+.pe-profielkeuze select { flex: 1; }
+
+/* ── Gereedschapsknoppen ──────────────────────────────────────────────── */
+.pe-tknop {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+  color: var(--theme-text);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pe-tknop:hover:not(:disabled) {
+  border-color: var(--theme-accent);
+  color: var(--theme-accent);
+  background: var(--theme-hover, var(--theme-accent-soft));
+}
+.pe-tknop:disabled { opacity: 0.45; cursor: not-allowed; }
+.pe-tknop.actief {
+  background: var(--theme-accent);
+  border-color: var(--theme-accent);
+  color: var(--theme-accent-text, #fff);
+  font-weight: 600;
+}
+.pe-tknop.actief:hover { color: var(--theme-accent-text, #fff); background: var(--theme-accent-hover, var(--theme-accent)); }
+.pe-tknop.actief .pe-kbd { color: inherit; border-color: currentColor; }
+.pe-tknop-icoon { padding: 0 6px; }
+.pe-tknop-kwart { padding: 0 7px; gap: 3px; font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; }
+.pe-tknop-toepas {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1;
+}
+.pe-tknop-mini { height: 19px; padding: 0 5px; font-size: 10px; gap: 3px; }
+.pe-tknop-gevaar:hover:not(:disabled) {
+  border-color: var(--theme-danger-color, #dc2626);
+  color: var(--theme-danger-color, #dc2626);
+  background: rgba(220, 38, 38, 0.06);
+}
+.pe-icoon { flex: 0 0 auto; display: block; }
+.pe-kbd {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 9px;
+  line-height: 1;
+  padding: 1px 3px;
+  border: 1px solid var(--theme-border);
+  border-radius: 3px;
+  color: var(--theme-text-faint);
+}
+
+/* ── Gereedschapsbalk boven de kolommen ───────────────────────────────── */
+.pe-balk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--theme-border-subtle);
+  background: var(--theme-docbar-bg, var(--theme-bg));
+  flex-shrink: 0;
+}
+.pe-balk-streep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: var(--theme-border);
+}
+/* Wat er bewerkt wordt: altijd zichtbaar, klikbaar om de selectie op te heffen. */
+.pe-doel {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  max-width: 200px;
+  padding: 0 8px;
+  border: 1px dashed var(--theme-border);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+  color: var(--theme-text);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pe-doel .pe-icoon { color: var(--theme-accent); }
+.pe-doel-naam { overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.pe-doel:not(:disabled):hover { border-color: var(--theme-accent); color: var(--theme-accent); }
+/* Het hele ontwerp is geen fouttoestand: de knop is dan alleen niet nodig. */
+.pe-doel:disabled { cursor: default; }
+.pe-doel:disabled .pe-doel-naam { font-weight: 400; color: var(--theme-text-muted, var(--theme-text)); }
+.pe-doel-leeg { opacity: 0.45; }
+
+/* Smal getalveld: teken vóór, eenheid ná het getal, allebei in het vakje. */
+.pe-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+}
+.pe-mini:focus-within { border-color: var(--theme-accent); }
+.pe-mini input {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--theme-text);
+  font-size: 11px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  text-align: right;
+}
+.pe-mini input:focus { outline: none; }
+.pe-mini-teken { font-size: 10px; color: var(--theme-text-muted, var(--theme-text-faint)); }
+.pe-mini-eenheid { font-size: 9px; color: var(--theme-text-faint); }
+
+/* Ankerpunt en korte melding, rechts in de balk. */
+.pe-balk-om {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  color: var(--theme-text-muted, var(--theme-text-faint));
+  white-space: nowrap;
+  cursor: help;
+}
+.pe-balk-om .pe-icoon { color: var(--theme-accent); }
+.pe-balk-melding {
+  flex: 1 1 100px;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--theme-accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* Startvormen: silhouet plus naam; de omschrijving zit in de tooltip. */
+.pe-presets {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+.pe-preset {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  text-align: left;
+  padding: 2px 6px 2px 2px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+  color: var(--theme-text);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+.pe-preset:hover { border-color: var(--theme-accent); color: var(--theme-accent); }
+.pe-preset-naam { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pe-miniatuur { flex: 0 0 auto; }
+.pe-miniatuur path {
+  fill: var(--theme-accent-soft, rgba(217, 119, 6, 0.12));
+  stroke: var(--theme-text-muted, #888);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.pe-preset:hover .pe-miniatuur path { stroke: var(--theme-accent); }
+
+/* Torsieschakelaar: één regel met de uitkomst, de uitleg in de tooltip. */
+.pe-schakelaar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding: 4px 6px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg);
+  font-size: 11px;
+  color: var(--theme-text);
+  cursor: pointer;
+}
+.pe-schakelaar input { width: auto; margin: 0; }
+.pe-schakelaar-status {
+  margin-left: auto;
+  font-size: 10px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  color: var(--theme-text-faint);
+}
+.pe-schakelaar-status.pe-aan { color: var(--theme-accent); }
+
+/* ── Tekenvlak ────────────────────────────────────────────────────────── */
+.pe-tekenvlak {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  user-select: none;
+}
+.pe-tekenvlak .pe-raster { stroke: var(--theme-border-subtle); }
+.pe-tekenvlak .pe-raster-hoofd { stroke: var(--theme-border); }
+.pe-tekenvlak .pe-materiaal {
+  fill: var(--theme-accent-soft, rgba(217, 119, 6, 0.12));
+  stroke: var(--theme-text);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  cursor: grab;
+}
+.pe-tekenvlak .pe-materiaal.pe-vast { cursor: default; }
+.pe-tekenvlak .pe-materiaal.actief {
+  fill: var(--theme-hover-strong, rgba(217, 119, 6, 0.25));
+  stroke: var(--theme-accent);
+  stroke-width: 2;
+}
+.pe-tekenvlak .pe-gat {
+  fill: var(--theme-bg);
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+  cursor: grab;
+}
+.pe-tekenvlak .pe-gat.actief { stroke-width: 2; }
+/* Lasnaad: een gevulde driehoek in de hoek tussen twee platen (of een streepje
+   bij een stompe las). Zwaarder gevuld dan het materiaal, zodat de naad opvalt
+   zonder de plaat eronder te verbergen. */
+.pe-tekenvlak .pe-las {
+  fill: var(--theme-accent);
+  fill-opacity: 0.55;
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  cursor: pointer;
+}
+.pe-tekenvlak .pe-las.actief {
+  fill-opacity: 0.9;
+  stroke-width: 2;
+}
+.pe-tekenvlak .pe-as {
+  stroke: var(--theme-text-muted, #888);
+  stroke-width: 0.8;
+  stroke-dasharray: 8 3 2 3;
+}
+.pe-tekenvlak .pe-hoofdas {
+  stroke: var(--theme-accent);
+  stroke-width: 0.8;
+  stroke-dasharray: 2 3;
+}
+.pe-tekenvlak .pe-tekst {
+  fill: var(--theme-text-muted, #666);
+  font-size: 10px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+.pe-tekenvlak .pe-maatlijn { stroke: var(--theme-text-faint, #888); stroke-width: 0.7; }
+.pe-tekenvlak .pe-zwaartepunt { fill: none; stroke: var(--theme-text); stroke-width: 1.2; }
+.pe-tekenvlak .pe-schuifmiddelpunt { stroke: var(--theme-accent); stroke-width: 1.4; }
+.pe-tekenvlak.verouderd .pe-materiaal { opacity: 0.75; }
+
+/*
+  Opsmuk vangt de muis niet. Het zwaartepuntkruis, de assen, de maatlijnen en
+  de teksten worden ná de bouwstenen getekend en liggen er dus bovenop: een gat
+  of een lamel precies onder dat kruisje was daardoor niet op te pakken — de
+  klik kwam op het kruisje terecht en hief de selectie juist op. Het raster
+  ligt eronder en vangt niets weg, maar hoort net zo goed niet aanwijsbaar te
+  zijn. Klikbaar blijft alleen wat je moet kunnen aanwijzen: de bouwstenen, de
+  gaten en het vlak van de knop "passend" (.pe-knopvlak, dat zijn eigen klik
+  afhandelt — zijn opschrift valt onder .pe-tekst en hoeft dat niet).
+*/
+.pe-tekenvlak .pe-raster,
+.pe-tekenvlak .pe-raster-hoofd,
+.pe-tekenvlak .pe-as,
+.pe-tekenvlak .pe-hoofdas,
+.pe-tekenvlak .pe-zwaartepunt,
+.pe-tekenvlak .pe-schuifmiddelpunt,
+.pe-tekenvlak .pe-maatlijn,
+.pe-tekenvlak .pe-tekst {
+  pointer-events: none;
+}
+
+.pe-tekenvlak-leeg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--theme-text-faint);
+  font-size: 12px;
+  text-align: center;
+  padding: 20px;
+}
+
+/* ── Eigenschappen ────────────────────────────────────────────────────── */
+.pe-eig-tabel {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.pe-eig-tabel th,
+.pe-eig-tabel td {
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--theme-border-subtle);
+  vertical-align: baseline;
+}
+.pe-eig-tabel th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--theme-text-muted, var(--theme-text));
+  white-space: normal;
+  line-height: 1.25;
+}
+.pe-eig-tabel td { width: 1%; }
+.pe-eig-tabel td {
+  text-align: right;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  white-space: nowrap;
+  color: var(--theme-text);
+}
+.pe-eig-tabel .pe-eenheid {
+  font-family: inherit;
+  color: var(--theme-text-faint);
+  font-size: 10px;
+}
+.pe-eig-tabel tr.pe-groep th {
+  padding-top: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--theme-text-faint);
+  border-bottom: none;
+}
+.pe-eig-tabel td.pe-niet-bepaald,
+.pe-eig-tabel .pe-niet-bepaald {
+  color: var(--theme-text-faint);
+  font-style: italic;
+  font-family: inherit;
+}
+.pe-eig-verouderd { opacity: 0.55; }
+
+/* ── Tabblad Spanning ─────────────────────────────────────────────────── */
+/* De unity check: één getal dat meteen moet zeggen of het goed is. */
+.pe-uc { font-weight: 600; }
+.pe-uc-ok { color: var(--theme-success, #15803d); }
+.pe-uc-fout { color: var(--theme-danger, #b91c1c); }
+.pe-eig-tabel tr.pe-rij-actief > th,
+.pe-eig-tabel tr.pe-rij-actief > td {
+  background: var(--theme-hover, rgba(217, 119, 6, 0.12));
+}
+.pe-eig-tabel tr[title] { cursor: default; }
+/* De figuur houdt haar eigen verhouding en staat daarom midden in de kolom in
+   plaats van tegen de bovenrand. */
+.pe-spanningsvlak {
+  justify-content: center;
+  padding: 8px 10px;
+}
+.pe-spanningsfiguur {
+  width: 100%;
+  height: auto;
+  max-height: 100%;
+  display: block;
+}
+.pe-spanningsfiguur.verouderd { opacity: 0.55; }
+.pe-status {
+  font-size: 10px;
+  color: var(--theme-text-faint);
+  min-height: 14px;
+}
+
+/* ── Voet ─────────────────────────────────────────────────────────────── */
+.pe-voet {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--theme-border-subtle);
+  flex-shrink: 0;
+}
+/* Label vóór het veld in plaats van erboven: scheelt een regel. */
+.pe-voet-veld {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--theme-text-muted, var(--theme-text));
+}
+.pe-voet-veld > span { white-space: nowrap; }
+.pe-voet-veld input,
+.pe-voet-veld select {
+  padding: 4px 6px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter, var(--theme-bg));
+  color: var(--theme-text);
+  font-size: 12px;
+  font-family: inherit;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.pe-voet-veld input:focus,
+.pe-voet-veld select:focus { outline: 1px solid var(--theme-accent); }
+.pe-voet-veld select { max-width: 280px; }
+.pe-voet-veld-breed { flex: 1; }
+.pe-voet-veld-breed input { flex: 1; }
+.pe-voet-melding {
+  align-self: center;
+  max-width: 220px;
+  font-size: 10px;
+  color: var(--theme-accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
+.pe-voet-rechts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* ── Bewaarde doorsneden ──────────────────────────────────────────────── */
+.pe-bewaard {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+  padding: 10px;
+  overflow-y: auto;
+}
+.pe-bewaard-kaart {
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 4px;
+  background: var(--theme-bg);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pe-bewaard-kaart svg { width: 100%; height: 120px; }
+.pe-bewaard-naam { font-weight: 600; font-size: 12px; }
+.pe-bewaard-sub { font-size: 10px; color: var(--theme-text-muted, var(--theme-text-faint)); }
+.pe-bewaard-leeg {
+  padding: 30px;
+  text-align: center;
+  color: var(--theme-text-faint);
+}
+
+/* ── Losse pagina (dev) ───────────────────────────────────────────────── */
+.pe-standalone {
+  min-height: 100vh;
+  background: var(--theme-bg);
+  color: var(--theme-text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.pe-standalone-balk {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.pe-standalone .pe-kader {
+  height: calc(100vh - 80px);
+  border: 1px solid var(--theme-border);
+  background: var(--theme-dialog-bg, var(--theme-bg));
+}
+
+/* ── Verplaats-/roteermodus in het tekenvlak ──────────────────────────── */
+.pe-tekenvlak.pe-modus,
+.pe-tekenvlak.pe-modus .pe-materiaal,
+.pe-tekenvlak.pe-modus .pe-gat {
+  cursor: crosshair;
+}
+.pe-modus-laag { pointer-events: none; }
+.pe-modus-lijn {
+  stroke: var(--theme-accent);
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+}
+.pe-modus-anker {
+  fill: none;
+  stroke: var(--theme-accent);
+  stroke-width: 1.4;
+}
+.pe-modus-band {
+  fill: var(--theme-accent);
+  opacity: 0.94;
+}
+.pe-modus-regel {
+  fill: var(--theme-accent-text, #fff);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+.pe-modus-bediening {
+  fill: var(--theme-accent-text, #fff);
+  font-size: 9px;
+  opacity: 0.85;
+}
+
+/* Waar de aanwijzer op vastklikt: vierkantje = hoekpunt, driehoekje = midden,
+   cirkeltje = hart, cirkel met kruis = zwaartepunt, kruisje = raster. */
+.pe-snap-laag { pointer-events: none; }
+.pe-snap {
+  fill: none;
+  stroke: var(--theme-accent);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+}
+.pe-snap-tekst {
+  fill: var(--theme-accent);
+  font-size: 9px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+
+/* Zoomregelaar in het tekenvlak. */
+.pe-knopvlak {
+  fill: var(--theme-bg, #fff);
+  stroke: var(--theme-border-subtle, #d0d0d0);
+  stroke-width: 1;
+}
+.pe-zoombalk text {
+  pointer-events: none;
+}

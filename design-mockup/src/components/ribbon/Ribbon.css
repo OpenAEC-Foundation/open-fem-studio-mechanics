@@ -1,0 +1,585 @@
+/* Ribbon Container */
+.ribbon-container {
+  background: var(--theme-bg);
+  border-bottom: none;
+  flex-shrink: 0;
+  user-select: none;
+  cursor: default;
+  margin-top: 32px; /* titlebar height */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: geometricPrecision;
+  transform: translateZ(0);
+}
+
+/* Ribbon Tabs */
+.ribbon-tabs {
+  background: var(--theme-bg);
+  border-bottom: 1px solid var(--theme-border);
+  display: flex;
+  padding: 0 8px;
+  gap: 2px;
+  height: 28px;
+  align-items: flex-end;
+  position: relative;
+  overflow: visible;
+}
+
+/* Ontwerp 0.4: de actieve tab krijgt een streep eronder (zie .ribbon-tab.active);
+   het meeschuivende kader en de opening in de lijn worden niet meer getoond. */
+.ribbon-tab-border,
+.ribbon-tab-gap {
+  display: none;
+}
+
+/* Animated border that slides between tabs */
+.ribbon-tab-border {
+  position: absolute;
+  border: 1px solid var(--theme-accent);
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), top 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1), height 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Gap that covers the amber bottom line under the active tab */
+.ribbon-tab-gap {
+  position: absolute;
+  bottom: -1px;
+  height: 2px;
+  background: var(--theme-bg);
+  transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Afmetingen zoals voorheen (zelfde plek voor elke tab); alleen de markering
+   van de actieve tab volgt ontwerp 0.4: een streep eronder (box-shadow, zodat
+   de maat niet verandert). */
+.ribbon-tab {
+  padding: 6px 16px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 1px solid transparent;
+  color: var(--theme-text);
+  font-weight: 500;
+  border-radius: 4px 4px 0 0;
+  cursor: default;
+  transition: background 0.15s ease, color 0.15s ease;
+  box-shadow: none;
+  margin-bottom: -1px;
+}
+
+.ribbon-tab:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+
+.ribbon-tab.active {
+  color: var(--theme-text);
+  box-shadow: inset 0 -2px 0 var(--theme-accent);
+}
+
+.ribbon-tab.file-tab {
+  background: var(--theme-file-tab-bg);
+  color: var(--theme-file-tab-text);
+  font-weight: 600;
+  border-color: var(--theme-file-tab-bg);
+}
+
+.ribbon-tab.file-tab:hover {
+  background: var(--theme-file-tab-hover);
+  color: var(--theme-file-tab-text);
+  border-color: var(--theme-file-tab-hover);
+}
+
+/* Ribbon Content */
+.ribbon-content-wrapper {
+  position: relative;
+  height: 94px;
+  overflow: hidden;
+  background: var(--theme-surface);
+  /* lijn onder het lint zonder extra hoogte */
+  box-shadow: inset 0 -1px 0 var(--theme-border);
+}
+
+.ribbon-content-panel {
+  position: absolute;
+  inset: 0;
+  padding: 4px 8px 0 2px;
+  display: flex;
+  align-items: stretch;
+}
+
+/* Schuift het lint horizontaal als het niet past (in elke tab). */
+.ribbon-content-panel .ribbon-content {
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.ribbon-content-panel .ribbon-content::-webkit-scrollbar {
+  height: 6px;
+}
+
+.ribbon-content-panel .ribbon-content::-webkit-scrollbar-thumb {
+  background: var(--theme-ribbon-group-separator);
+  border-radius: 3px;
+}
+
+/* Enter from right */
+.ribbon-panel-enter-right {
+  animation: slideInRight 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Enter from left */
+.ribbon-panel-enter-left {
+  animation: slideInLeft 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Exit to left */
+.ribbon-panel-exit-right {
+  animation: slideOutLeft 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Exit to right */
+.ribbon-panel-exit-left {
+  animation: slideOutRight 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(40px); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slideInLeft {
+  from { transform: translateX(-40px); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slideOutLeft {
+  from { transform: translateX(0); opacity: 1; }
+  to   { transform: translateX(-40px); opacity: 0; }
+}
+
+@keyframes slideOutRight {
+  from { transform: translateX(0); opacity: 1; }
+  to   { transform: translateX(40px); opacity: 0; }
+}
+
+.ribbon-groups {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0;
+  align-items: stretch;
+  height: 100%;
+}
+
+/* Ribbon Group */
+.ribbon-group {
+  display: flex;
+  flex-direction: column;
+  padding: 0 8px;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--theme-ribbon-group-separator);
+  min-width: 50px;
+  height: 100%;
+}
+
+.ribbon-group:last-child {
+  border-right: none;
+}
+
+.ribbon-open-fem3d-note {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  max-width: 280px;
+  padding: 3px 8px;
+  color: var(--theme-text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.ribbon-open-fem3d-note strong { color: var(--theme-text); }
+.ribbon-open-fem3d-unavailable { max-width: 190px; }
+
+.ribbon-group-content {
+  display: flex;
+  gap: 1px;
+  align-items: flex-start;
+  flex: 1;
+  padding: 1px 0;
+}
+
+.ribbon-group-label {
+  font-size: 9px;
+  color: var(--theme-text-secondary);
+  text-align: center;
+  font-weight: 500;
+  padding: 2px 0;
+  margin-top: auto;
+  white-space: nowrap;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  border-top: 1px solid transparent;
+}
+
+/* Button Stack */
+.ribbon-btn-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  height: 100%;
+  justify-content: flex-start;
+}
+
+/* Ribbon Buttons - Large (default) */
+.ribbon-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 3px 3px 1px 3px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: default;
+  transition: all 0.15s ease;
+  min-width: 44px;
+  gap: 1px;
+  height: 66px;
+  box-shadow: none;
+  color: var(--theme-text);
+}
+
+.ribbon-btn:hover {
+  background: var(--theme-ribbon-btn-hover);
+}
+
+.ribbon-btn.active {
+  background: var(--theme-ribbon-btn-active-bg);
+  border-color: var(--theme-ribbon-btn-active-border);
+}
+
+.ribbon-btn:active {
+  background: var(--theme-ribbon-btn-hover);
+}
+
+.ribbon-btn:focus-visible {
+  outline: 2px solid var(--theme-accent);
+  outline-offset: -2px;
+}
+
+.ribbon-btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.ribbon-btn-icon {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ribbon-btn-icon svg {
+  width: 24px;
+  height: 24px;
+  stroke: var(--theme-text);
+  shape-rendering: geometricPrecision;
+}
+
+.ribbon-btn:hover .ribbon-btn-icon svg {
+  stroke: var(--theme-text);
+}
+
+.ribbon-btn.active .ribbon-btn-icon svg {
+  stroke: var(--theme-ribbon-icon-active);
+}
+
+/* Blueprint-iconen (b2Icons.ts): de tekening kleurt met currentColor en het
+   accent met --icon-accent, zoals .oa-icon in het webpakket. De 16 px-tekening
+   staat naast de 24 px-tekening en verschijnt alleen bij kleine knoppen. */
+svg.b2 {
+  --icon-accent: var(--oa-accent-text);
+}
+svg.b2-16 {
+  display: none;
+}
+.ribbon-btn-icon {
+  color: var(--theme-text);
+}
+.ribbon-btn:hover .ribbon-btn-icon {
+  color: var(--theme-text);
+}
+.ribbon-btn.active .ribbon-btn-icon {
+  color: var(--theme-ribbon-icon-active);
+}
+.ribbon-btn.small .ribbon-btn-icon svg.b2-24 {
+  display: none;
+}
+.ribbon-btn.small .ribbon-btn-icon svg.b2-16 {
+  display: block;
+}
+
+.ribbon-btn-label {
+  font-size: 10px;
+  color: var(--theme-text);
+  text-align: center;
+  line-height: 1.15;
+  max-width: 58px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+
+.ribbon-btn:hover .ribbon-btn-label {
+  color: var(--theme-text);
+}
+
+.ribbon-btn.active .ribbon-btn-label {
+  color: var(--theme-ribbon-btn-active-text);
+  font-weight: 500;
+}
+
+/* Small ribbon buttons */
+.ribbon-btn.small {
+  flex-direction: row;
+  min-width: 70px;
+  height: 22px;
+  padding: 2px 6px;
+  gap: 6px;
+  justify-content: flex-start;
+  border-radius: 1px;
+}
+
+.ribbon-btn.small .ribbon-btn-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.ribbon-btn.small .ribbon-btn-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.ribbon-btn.small .ribbon-btn-label {
+  font-size: 11px;
+  text-align: left;
+  max-width: none;
+  white-space: nowrap;
+}
+
+/* Medium ribbon buttons */
+.ribbon-btn.medium {
+  flex-direction: row;
+  min-width: 70px;
+  height: 33px;
+  padding: 2px 6px;
+  gap: 6px;
+  justify-content: flex-start;
+  border-radius: 1px;
+}
+
+.ribbon-btn.medium .ribbon-btn-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.ribbon-btn.medium .ribbon-btn-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.ribbon-btn.medium .ribbon-btn-label {
+  font-size: 11px;
+  text-align: left;
+  max-width: none;
+  white-space: nowrap;
+}
+
+/* Lint Start: dichter opgezet dan de andere tabs (die blijven zoals ze
+   waren). Kleine knoppen in kolommen van drie naast elkaar, middelgrote in
+   kolommen van twee, minder opvulling. De namen staan er volledig. */
+.ribbon-content-panel:has(> .ribbon-content-home) {
+  padding: 2px 4px 0 2px;
+}
+
+.ribbon-content-home .ribbon-group {
+  padding: 0 3px;
+}
+
+.ribbon-content-home .ribbon-group-content {
+  padding: 0;
+}
+
+.ribbon-content-home .ribbon-group-label {
+  line-height: 11px;
+  flex-shrink: 0;
+  padding: 1px 0;
+}
+
+.ribbon-content-home .ribbon-btn-stack {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(3, 22px);
+  grid-auto-columns: max-content;
+  align-content: start;
+  height: auto;
+}
+
+.ribbon-content-home .ribbon-btn-stack:has(> .ribbon-btn.medium) {
+  grid-template-rows: repeat(2, 33px);
+}
+
+.ribbon-content-home .ribbon-btn.small,
+.ribbon-content-home .ribbon-btn.medium {
+  min-width: 28px;
+  padding: 2px 4px;
+  gap: 3px;
+}
+
+/* Krap lint (useRibbonCompact.ts): past het lint Start met volledige namen
+   niet in het venster, dan eerst de namen van de kleine en middelgrote
+   knoppen ingekort tot 72 px (met …). Alleen dan: met ruimte genoeg blijven
+   de namen heel. */
+.ribbon-content-home.ribbon-tight .ribbon-btn.small .ribbon-btn-label,
+.ribbon-content-home.ribbon-tight .ribbon-btn.medium .ribbon-btn-label {
+  display: block;
+  max-width: 72px;
+  text-overflow: ellipsis;
+}
+
+/* Compact lint (useRibbonCompact.ts): past het lint Start ook met ingekorte
+   namen niet, dan alleen de pictogrammen van de kleine en middelgrote
+   knoppen. De naam blijft in de tooltip en in aria-label. */
+.ribbon-content-home.ribbon-compact .ribbon-btn.small,
+.ribbon-content-home.ribbon-compact .ribbon-btn.medium {
+  width: 26px;
+  min-width: 26px;
+  padding: 2px;
+  gap: 0;
+  justify-content: center;
+}
+
+.ribbon-content-home.ribbon-compact .ribbon-btn.small .ribbon-btn-label,
+.ribbon-content-home.ribbon-compact .ribbon-btn.medium .ribbon-btn-label {
+  display: none;
+}
+
+/* Tooltip van een lintknop (RibbonButton.tsx), ontwerp 0.4: naam met
+   sneltoets, daaronder de uitleg. */
+.ribbon-tip {
+  position: fixed;
+  z-index: 10000;
+  max-width: 300px;
+  padding: 6px 10px;
+  background: var(--oa-raised);
+  color: var(--oa-text);
+  border: 1px solid var(--oa-border);
+  border-radius: var(--oa-radius-medium);
+  box-shadow: var(--oa-shadow-popup);
+  font-size: var(--oa-size-body);
+  line-height: 1.35;
+  pointer-events: none;
+}
+.ribbon-tip-kop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-weight: 600;
+}
+.ribbon-tip-uitleg {
+  margin-top: 2px;
+  color: var(--oa-text-secondary);
+}
+kbd {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 5px;
+  border: 1px solid var(--oa-border-strong);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--oa-panel);
+  color: var(--oa-text);
+  font: 600 11px/16px var(--oa-font-mono);
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* Ingeklapte groep (RibbonGroup.tsx): één knop met de groepsnaam en een
+   pijltje; de knoppen staan in een menu, in dezelfde volgorde. */
+.ribbon-group-pijl {
+  font-size: 8px;
+  line-height: 1;
+  color: var(--theme-text-secondary);
+}
+.ribbon-group-menu {
+  position: fixed;
+  z-index: 9000;
+  min-width: 220px;
+  max-height: calc(100vh - 160px);
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--oa-raised);
+  border: 1px solid var(--oa-border);
+  border-radius: var(--oa-radius-medium);
+  box-shadow: var(--oa-shadow-popup);
+}
+.ribbon-group-menu-kop {
+  padding: 4px 8px;
+  font: var(--oa-weight-medium) 10px var(--oa-font-mono);
+  letter-spacing: var(--oa-letter-spacing-mono-label);
+  text-transform: uppercase;
+  color: var(--oa-text-secondary);
+}
+.ribbon-group-menu .ribbon-group-content {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+}
+.ribbon-group-menu .ribbon-btn-stack {
+  display: contents;
+}
+.ribbon-group-menu .ribbon-btn {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  min-width: 0;
+}
+.ribbon-group-menu .ribbon-btn-icon,
+.ribbon-group-menu .ribbon-btn-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.ribbon-group-menu .ribbon-btn-icon svg.b2-24 {
+  display: none;
+}
+.ribbon-group-menu .ribbon-btn-icon svg.b2-16 {
+  display: block;
+}
+.ribbon-group-menu .ribbon-btn .ribbon-btn-label {
+  font-size: var(--oa-size-body);
+  max-width: none;
+  text-align: left;
+  white-space: nowrap;
+  -webkit-line-clamp: unset;
+  display: block;
+}

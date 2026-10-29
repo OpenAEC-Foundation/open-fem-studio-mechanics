@@ -1,0 +1,243 @@
+/* ============================================================
+   OpenAEC Theme System — design 0.4
+
+   Every colour comes from the 0.4 tokens in openaec/openaec-tokens.css,
+   the same tokens as the Rust library (openaec-ui) and the web package.
+   The theme is chosen with <html data-oa-theme="…">:
+
+   - light                — Licht (default)
+   - dark                 — Donker
+   - blueprint            — Blueprint
+   - high-contrast-dark   — High contrast donker
+   - high-contrast-light  — High contrast licht
+
+   The components use the --theme-* names below; change a colour in
+   design/ontwerp-0.4/tokens-0.4.json in the Blueprint repository, not here.
+
+   Overgenomen uit OpenAEC-Blueprint (style-book/project-templates/Tauri+React,
+   commit 6c9c896). De materiaalkleuren onderaan horen bij deze app.
+   ============================================================ */
+
+:root {
+  /* ─── Core palette ─── */
+  --theme-bg: var(--oa-frame);
+  --theme-bg-lighter: var(--oa-panel);
+  --theme-docbar-bg: var(--oa-docbar);
+  --theme-surface: var(--oa-panel);
+  --theme-border: var(--oa-border);
+  --theme-border-subtle: var(--oa-border);
+  --theme-text: var(--oa-text);
+  --theme-text-secondary: var(--oa-text-secondary);
+  --theme-text-muted: var(--oa-text-secondary);
+  --theme-text-faint: var(--oa-text-disabled);
+  --theme-accent: var(--oa-accent);
+  --theme-accent-hover: var(--oa-accent-hover);
+  --theme-accent-text: var(--oa-text-on-accent);
+  --theme-accent-soft: var(--oa-selected);
+  --theme-accent-tint: var(--oa-accent-text);
+  --theme-hover: var(--oa-hover);
+  --theme-hover-strong: var(--oa-pressed);
+  --theme-active: var(--oa-accent);
+
+  --theme-focus-color: var(--oa-focus);
+  --theme-danger-color: var(--oa-error);
+  --theme-danger-hover: var(--oa-error);
+
+  /* ─── Shadows ─── */
+  --theme-dialog-shadow: var(--oa-shadow-dialog);
+  --theme-panel-shadow: var(--oa-shadow-panel);
+  --theme-popover-shadow: var(--oa-shadow-popup);
+
+  /* ─── File tab / accent bar ─── */
+  --theme-file-tab-bg: var(--oa-accent);
+  --theme-file-tab-hover: var(--oa-accent-hover);
+  --theme-file-tab-text: var(--oa-text-on-accent);
+
+  /* ─── Content ─── */
+  --theme-content-bg: var(--oa-workspace);
+  --theme-placeholder-icon: var(--oa-text-disabled);
+  --theme-placeholder-heading: var(--oa-text-secondary);
+  --theme-placeholder-text: var(--oa-text-secondary);
+
+  /* ─── Ribbon ─── */
+  --theme-ribbon-btn-hover: var(--oa-hover);
+  --theme-ribbon-btn-hover-border: var(--oa-border);
+  --theme-ribbon-btn-active-bg: var(--oa-selected);
+  --theme-ribbon-btn-active-border: var(--oa-selected-bar);
+  --theme-ribbon-btn-active-text: var(--oa-accent-text);
+  --theme-ribbon-icon-active: var(--oa-accent-text);
+  --theme-ribbon-text-hover: var(--oa-text);
+  --theme-ribbon-group-separator: var(--oa-border);
+  --theme-ribbon-group-label: var(--oa-text-secondary);
+
+  /* ─── Status bar ─── */
+  --theme-status-bg: var(--oa-statusbar);
+  --theme-status-border: var(--oa-border);
+  --theme-status-text: var(--oa-statusbar-text);
+  --theme-status-text-label: var(--oa-statusbar-text);
+  --theme-status-hover: var(--oa-hover);
+  --theme-status-separator: var(--oa-border);
+
+  /* ─── Backstage (File menu) ─── */
+  --theme-backstage-item-shortcut: var(--oa-text-secondary);
+  --theme-backstage-item-shortcut-hover: var(--oa-accent-text);
+
+  /* ─── Dialogs ─── */
+  --theme-dialog-overlay: var(--oa-overlay);
+  --theme-dialog-bg: var(--oa-raised);
+  --theme-dialog-border: var(--oa-border);
+  --theme-dialog-header-bg: var(--oa-frame);
+  --theme-dialog-header-text: var(--oa-text);
+  --theme-dialog-sidebar-bg: var(--oa-frame);
+  --theme-dialog-sidebar-border: var(--oa-border);
+  --theme-dialog-tab-text: var(--oa-text);
+  --theme-dialog-tab-hover: var(--oa-hover);
+  --theme-dialog-tab-hover-text: var(--oa-text);
+  --theme-dialog-tab-active-bg: var(--oa-selected);
+  --theme-dialog-tab-active-text: var(--oa-accent-text);
+  --theme-dialog-tab-active-accent: var(--oa-selected-bar);
+  --theme-dialog-content-bg: var(--oa-raised);
+  --theme-dialog-content-text: var(--oa-text);
+  --theme-dialog-content-secondary: var(--oa-text-secondary);
+  --theme-dialog-input-bg: var(--oa-panel);
+  --theme-dialog-input-border: var(--oa-border-strong);
+  --theme-dialog-input-text: var(--oa-text);
+  --theme-dialog-btn-bg: var(--oa-accent);
+  --theme-dialog-btn-text: var(--oa-text-on-accent);
+  --theme-dialog-btn-hover: var(--oa-accent-hover);
+  --theme-dialog-section-border: var(--oa-border);
+
+  /* ─── Buttons ─── */
+  --theme-btn-primary-bg: var(--oa-accent);
+  --theme-btn-primary-text: var(--oa-text-on-accent);
+  --theme-btn-primary-border: var(--oa-accent);
+  --theme-btn-primary-hover-bg: var(--oa-accent-hover);
+  --theme-btn-primary-hover-text: var(--oa-text-on-accent);
+  --theme-btn-secondary-bg: var(--oa-raised);
+  --theme-btn-secondary-text: var(--oa-text);
+  --theme-btn-secondary-hover-bg: var(--oa-hover);
+  --theme-btn-secondary-hover-border: var(--oa-border-strong);
+
+  /* ─── Extra namen die Open FEM Studio gebruikt (niet in de template) ─── */
+  --theme-danger: var(--oa-error);
+  --theme-success: var(--oa-success);
+  --theme-warning: var(--oa-warning);
+  --theme-info: var(--oa-info);
+  --theme-bg-hover: var(--oa-hover);
+  --theme-hover-bg: var(--oa-hover);
+  --theme-surface-2: var(--oa-raised);
+}
+
+/* ─── Vage tekst in de donkere thema's ───
+   `--theme-text-faint` staat hierboven op `--oa-text-disabled`, de kleur voor
+   UITGESCHAKELDE bediening. De app gebruikt hem echter vooral voor leesbare
+   bijtekst (eenheden, hints, bronvermeldingen); in Donker (3,5:1) en Blueprint
+   (3,6:1) haalt die kleur op de achtergrond de 4,5:1 van WCAG 2.1 (1.4.3) niet,
+   terwijl release 2026.42 dat in elk donker thema wel deed
+   (test-thema-tekstcontrast.mjs). Daar dus de secundaire tekstkleur van 0.4.
+   High contrast donker (8,3:1) en de lichte thema's blijven zoals Blueprint ze
+   koppelt. */
+[data-oa-theme="dark"],
+[data-oa-theme="blueprint"] {
+  --theme-text-faint: var(--oa-text-secondary);
+}
+
+/* ─── B2 icons: main colour follows the text, the accent the theme ─── */
+.oa-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  --icon-accent: var(--oa-accent-text);
+}
+.oa-icon--24 {
+  width: 24px;
+  height: 24px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MATERIAALKLEUREN — het vlak van een doorsnede in de tekeningen
+   ═══════════════════════════════════════════════════════════════════════════
+   Dit zijn kleuren van het MATERIAAL en niet van het thema: beton is grijs in
+   élke tekening, of de app nu licht of donker staat. Daarom staan ze in één
+   blok op `:root`, ná de thema's, en niet in elk thema opnieuw. Een thema dat
+   ze tóch wil wijzigen kan dat; niets in de app gaat ervan uit dat ze vastliggen.
+
+   Ze bestonden hiervoor alleen als terugvalwaarde in de SVG's zelf
+   (`var(--theme-hout-vlak, #e9deca)`), en `ProfielMiniatuur` koos ertussen op
+   de VORM: alles wat een rechthoek was, kreeg de houtkleur. Een betonnen
+   rechthoek werd daardoor beige en een betonnen T-ligger blauwgrijs — twee
+   kleuren voor hetzelfde materiaal. De keuze hoort bij het materiaal en staat
+   nu bij de aanroeper. */
+:root {
+  /* Beton, 192-192-192. */
+  --theme-beton-vlak: #C0C0C0;
+  /* Hout: de kleur die er als terugval al in zat. */
+  --theme-hout-vlak: #E9DECA;
+  /* Omtrek en wapening liggen ÓP zo'n vlak, en die vlakken zijn licht in élk
+     thema. Met de themakleur voor tekst zou de omtrek in het donkere thema
+     bijna wit op lichtgrijs worden en waren de staven niet meer te zien. Dus
+     ook deze twee zijn materiaalkleuren en geen themakleuren. */
+  --theme-materiaal-lijn: #2A2A30;
+  --theme-materiaal-beugel: #55555E;
+
+  /* Selectiekader op een wit tekenvlak: het lichte thema, en het 3D-podium,
+     dat in élk thema wit is (de WebGL-scène heeft een witte achtergrond). */
+  --theme-select-window-stroke-light: #2563EB;
+  --theme-select-window-fill-light: rgba(37, 99, 235, 0.12);
+  --theme-select-crossing-stroke-light: #16A34A;
+  --theme-select-crossing-fill-light: rgba(22, 163, 74, 0.07);
+
+  /* View cube (een gebouwtje) rechtsboven op het 3D-podium. Dat podium is in
+     élk thema wit, dus één set kleuren voor het lichte én de donkere thema's,
+     afgestemd op wit: gevels in een lichte steentint, het dak in een lichte
+     pannentint, de vloer grijs, de ribben als iets donkerder hoeklijnen
+     (≥ 3:1 op wit). Hover en toetsenbordfocus hebben elk een eigen donkere
+     rand, ≥ 3:1 tegen elk vlak, de hovertint en het podium: de themakleur
+     voor focus (geel in Contrast, lichtblauw in Blueprint) haalt dat op wit
+     niet. De naam (tekst) haalt op elk vlak ruim 4,5:1. */
+  --theme-view-cube-gevel: #F3EEE6;
+  --theme-view-cube-dak: #E9CFC2;
+  --theme-view-cube-vloer: #E2E8F0;
+  --theme-view-cube-hoeklijn: #8C7B6A;
+  --theme-view-cube-ribbe: rgba(120, 96, 72, 0.06);
+  --theme-view-cube-tekst: #334155;
+  --theme-view-cube-maaiveld: #A8A29E;
+  --theme-view-cube-hover: rgba(217, 119, 6, 0.16);
+  --theme-view-cube-hover-rand: #92400E;
+  --theme-view-cube-focus: #1D4ED8;
+  --theme-view-cube-knop: #FFFFFF;
+  --theme-view-cube-menu-hover: #FFF7ED;
+  --theme-view-cube-menu-focus: #EFF6FF;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SELECTIEKADER (CAD) per thema — venster (van links naar rechts) met een
+   doorgetrokken rand, crossing (van rechts naar links) gestippeld met een
+   lichtere vulling. Waarden uit release 2026.42, nu per 0.4-thema.
+   ═══════════════════════════════════════════════════════════════════════════ */
+:root,
+[data-oa-theme="light"],
+[data-oa-theme="high-contrast-light"] {
+  --theme-select-window-stroke: var(--theme-select-window-stroke-light);
+  --theme-select-window-fill: var(--theme-select-window-fill-light);
+  --theme-select-crossing-stroke: var(--theme-select-crossing-stroke-light);
+  --theme-select-crossing-fill: var(--theme-select-crossing-fill-light);
+}
+[data-oa-theme="dark"] {
+  --theme-select-window-stroke: #60A5FA;
+  --theme-select-window-fill: rgba(96, 165, 250, 0.16);
+  --theme-select-crossing-stroke: #4ADE80;
+  --theme-select-crossing-fill: rgba(74, 222, 128, 0.08);
+}
+[data-oa-theme="blueprint"] {
+  --theme-select-window-stroke: #93C5FD;
+  --theme-select-window-fill: rgba(147, 197, 253, 0.16);
+  --theme-select-crossing-stroke: #4ADE80;
+  --theme-select-crossing-fill: rgba(74, 222, 128, 0.08);
+}
+[data-oa-theme="high-contrast-dark"] {
+  --theme-select-window-stroke: #00E5FF;
+  --theme-select-window-fill: rgba(0, 229, 255, 0.18);
+  --theme-select-crossing-stroke: #7CFC00;
+  --theme-select-crossing-fill: rgba(124, 252, 0, 0.10);
+}

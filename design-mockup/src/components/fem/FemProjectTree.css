@@ -1,0 +1,622 @@
+/* FEM project tree — matches OpenAEC panel-section visual rhythm */
+
+.fem-project-tree {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* Top tabs (PROJECT / RESULTATEN) */
+.fem-tree-tabs {
+  display: flex;
+  background: var(--theme-bg-lighter);
+  border-bottom: 1px solid var(--theme-border);
+  flex-shrink: 0;
+}
+.fem-tree-tab {
+  flex: 1;
+  height: 26px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--theme-text-secondary);
+  font: var(--oa-weight-medium) 11px/1 var(--oa-font-mono);
+  letter-spacing: var(--oa-letter-spacing-mono-label);
+  text-transform: uppercase;
+  cursor: default;
+  padding: 0;
+}
+.fem-tree-tab.active {
+  color: var(--theme-text);
+  border-bottom-color: var(--theme-accent);
+}
+.fem-tree-tab:hover:not(.active) {
+  color: var(--theme-text);
+  background: var(--theme-hover);
+}
+
+.fem-tree-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.explorer-view-tab {
+  padding: 2px 0 12px;
+}
+
+.explorer-view-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 8px 8px;
+  padding: 0 8px;
+  height: 28px;
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  background: var(--theme-bg-lighter);
+  color: var(--theme-text-faint);
+}
+
+.explorer-view-search:focus-within {
+  border-color: var(--theme-accent);
+  box-shadow: 0 0 0 2px var(--theme-accent-soft, transparent);
+  color: var(--theme-accent);
+}
+
+.explorer-view-search svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.explorer-view-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--theme-text);
+  font: 400 11.5px/1.2 "Inter", system-ui, sans-serif;
+}
+
+.explorer-view-search input::placeholder {
+  color: var(--theme-text-faint);
+}
+
+.explorer-view-section {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--theme-border);
+  margin-bottom: 8px;
+}
+
+.explorer-view-section:last-child {
+  border-bottom: 0;
+}
+
+.explorer-view-subtitle {
+  padding: 7px 10px 3px;
+  color: var(--theme-text-secondary);
+  font: var(--oa-weight-medium) 10px/1.2 var(--oa-font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--oa-letter-spacing-mono-label);
+}
+
+.explorer-view-toggle.sub {
+  padding-left: 24px;
+}
+/* Een lang label (Knopen op staven automatisch aansluiten, #63) loopt door op
+   een tweede regel in plaats van afgekapt te worden; de schakelaar blijft rechts. */
+.explorer-view-toggle.wrap .fem-results-toggle-label {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  font-size: 10.5px;
+}
+
+/* Opties van de hoeksnap (#53) onder de rij Hoek: tolerantie en extra hoeken. */
+.explorer-view-hoek-opties {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 2px 12px 6px 49px;
+  color: var(--theme-text-secondary);
+  font: 400 11px/1.3 "Inter", system-ui, sans-serif;
+}
+.explorer-view-hoek-opties.uit {
+  opacity: 0.5;
+}
+.explorer-view-hoek-veld,
+.explorer-view-hoek-vink {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.explorer-view-hoek-veld input,
+.explorer-view-invoer-rij input {
+  width: 44px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--theme-border);
+  border-radius: 3px;
+  background: var(--theme-bg-lighter);
+  color: var(--theme-text);
+  font: 500 11px/1 "JetBrains Mono", monospace;
+  text-align: right;
+}
+.explorer-view-hoek-veld input:focus,
+.explorer-view-invoer-rij input:focus {
+  outline: none;
+  border-color: var(--theme-accent);
+}
+.explorer-view-hoek-vink input {
+  margin: 0;
+  accent-color: var(--theme-accent);
+}
+/* Rij met een invoerveld op de plek van de schakelaar (#55, verbindingstolerantie):
+   dezelfde maat en inspringing als een sub-schakelrij. Het label wordt NIET
+   afgekapt (geen ellipsis zoals bij de schakelrijen): past het niet naast het
+   veld, dan schuift het veld met zijn eenheid naar een tweede regel, rechts
+   uitgelijnd. In een breder paneel staat alles op één regel. */
+.explorer-view-invoer-rij {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 8px;
+  padding: 5px 12px 5px 24px;
+  color: var(--theme-text-secondary);
+  font: 400 11.5px/1.3 "Inter", system-ui, sans-serif;
+  cursor: text;
+}
+.explorer-view-invoer-rij:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+.explorer-view-invoer-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+.explorer-view-invoer-veld {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  margin-left: auto;
+}
+.explorer-view-invoer-rij input {
+  flex: none;
+}
+.explorer-view-invoer-eenheid {
+  color: var(--theme-text-faint);
+  font: 400 11px/1 "Inter", system-ui, sans-serif;
+}
+
+.explorer-view-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  flex: none;
+  color: var(--theme-text-faint);
+}
+
+.explorer-view-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Blueprint-iconen: op 16 px de eigen 16 px-tekening (zie ribbon/b2Icons.ts). */
+.explorer-view-toggle-icon svg.b2-24 {
+  display: none;
+}
+.explorer-view-toggle-icon svg.b2-16 {
+  display: block;
+}
+
+.explorer-view-toggle.active .explorer-view-toggle-icon {
+  color: var(--theme-accent);
+}
+
+/* Tree rows */
+.fem-tree-node { display: block; }
+.fem-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 3px 8px;
+  background: transparent;
+  border: none;
+  color: var(--theme-text);
+  font: 400 var(--oa-size-body)/1.3 var(--oa-font-body);
+  text-align: left;
+  cursor: default;
+  border-radius: 2px;
+}
+.fem-tree-row:hover { background: var(--theme-hover); }
+
+/* Een kop met een actieknop rechts (bijv. "Alle selecteren"). */
+.fem-tree-row-with-action { display: flex; align-items: center; }
+.fem-tree-row-with-action > .fem-tree-row { flex: 1; min-width: 0; }
+.fem-tree-row-action {
+  flex: none;
+  margin-right: 6px;
+  padding: 1px 6px;
+  background: transparent;
+  border: 1px solid var(--theme-border);
+  border-radius: 3px;
+  color: var(--theme-text-secondary);
+  font: 500 11px/1.3 "Inter", system-ui, sans-serif;
+  cursor: pointer;
+}
+.fem-tree-row-action:hover { color: var(--theme-accent); border-color: var(--theme-accent); }
+.fem-tree-row-action:focus-visible { outline: 2px solid var(--theme-accent); outline-offset: 1px; }
+
+.fem-tree-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  color: var(--theme-text-secondary);
+  transition: transform 0.12s;
+}
+.fem-tree-chevron.open { transform: rotate(90deg); }
+.fem-tree-chevron-spacer { width: 12px; height: 12px; }
+
+.fem-tree-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--theme-accent);
+  flex-shrink: 0;
+}
+
+.fem-tree-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fem-tree-count {
+  font: 11px var(--oa-font-mono);
+  color: var(--theme-text-secondary);
+  padding: 0 5px;
+  min-width: 16px;
+  text-align: center;
+}
+
+.fem-tree-children {
+  padding-left: 14px;
+  border-left: 1px dotted var(--theme-border);
+  margin-left: 12px;
+}
+
+.fem-tree-leaf {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 2px 8px 2px 16px;
+  font: 400 11.5px/1.3 "Inter", system-ui, sans-serif;
+  color: var(--theme-text-secondary);
+}
+.fem-tree-leaf.clickable { cursor: default; }
+.fem-tree-leaf:hover { background: var(--theme-hover); color: var(--theme-text); }
+.fem-tree-leaf.active {
+  background: var(--theme-accent-soft, var(--theme-hover));
+  box-shadow: inset 3px 0 0 var(--oa-selected-bar);
+  color: var(--theme-text);
+  font-weight: 600;
+}
+.fem-tree-leaf-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fem-tree-leaf-value {
+  font-family: var(--oa-font-mono);
+  font-size: 10px;
+  color: var(--theme-text-secondary);
+  margin-left: 8px;
+}
+
+/*
+ * Een belastinggeval dat nergens meetelt (lib/combinatieBeheer), en de
+ * melding dat combinaties afwijken van de standaard. Rood: bij een fout telt
+ * de last van het geval in elke toets als nul.
+ */
+.fem-tree-melding-fout { color: var(--theme-danger-color); font-weight: 600; }
+.fem-tree-leaf.fem-tree-melding-fout .fem-tree-leaf-label { white-space: normal; }
+
+/* ── Resultaten-tab toggles (M/V/N/Δu/R) ─────────────────────────────── */
+.fem-results-tab {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0 12px;
+}
+.fem-results-empty {
+  padding: 16px 12px;
+  color: var(--theme-text-faint);
+  font: 400 11.5px/1.5 "Inter", system-ui, sans-serif;
+}
+.fem-results-section-title {
+  padding: 6px 12px 4px;
+  font: var(--oa-weight-medium) 10.5px/1 var(--oa-font-mono);
+  letter-spacing: var(--oa-letter-spacing-mono-label);
+  text-transform: uppercase;
+  color: var(--theme-text-secondary);
+  background: var(--theme-bg-lighter);
+  border-bottom: 1px solid var(--theme-border-subtle);
+}
+/* Scope picker — kies welke LC / combinatie / envelope wordt getoond. */
+.fem-results-scope-select {
+  margin: 6px 12px 10px;
+  padding: 6px 10px;
+  background: var(--theme-bg);
+  color: var(--theme-text);
+  border: 1px solid var(--theme-border);
+  border-radius: 4px;
+  font: 500 12px/1.2 "Inter", system-ui, sans-serif;
+  cursor: pointer;
+}
+.fem-results-scope-select:focus {
+  outline: none;
+  border-color: var(--theme-accent);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.15);
+}
+.fem-results-scope-select optgroup {
+  font-weight: 600;
+  color: var(--theme-text-faint);
+}
+
+.fem-results-toggle-list {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+
+/* Row container: toggle button + optional scale slider stacked below it. */
+.fem-results-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.fem-results-scale-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 12px 6px 30px;          /* indent under the toggle to align with label */
+  background: var(--theme-bg-lighter);
+  border-bottom: 1px solid var(--theme-border-subtle);
+}
+/* min-width: 0, anders houdt de regelaar zijn eigen breedte (±130 px) aan en
+   duwt hij in een smal paneel (240 px) de rest van de rij buiten beeld. */
+.fem-results-scale-slider {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 14px;
+  accent-color: var(--theme-accent);
+  cursor: pointer;
+}
+.fem-results-scale-value {
+  min-width: 36px;
+  text-align: right;
+  font: 500 10px/1 "JetBrains Mono", monospace;
+  color: var(--theme-text-faint);
+}
+/* De woorden aan de uiteinden van een regelaar (bv. Weinig … Veel). */
+.fem-results-scale-end {
+  font-size: 10px;
+  color: var(--theme-text-faint);
+  white-space: nowrap;
+}
+.fem-results-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 12px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--theme-text-secondary);
+  font: 400 11.5px/1.3 "Inter", system-ui, sans-serif;
+  transition: background 0.08s;
+}
+.fem-results-toggle:hover {
+  background: var(--theme-hover);
+  color: var(--theme-text);
+}
+.fem-results-toggle.active {
+  color: var(--theme-text);
+  background: var(--theme-accent-soft, transparent);
+}
+/* Stand zonder inhoud in het huidige resultaat: uitgegrijsd, niet klikbaar.
+   De reden staat als tekstregel eronder én als tooltip. */
+.fem-results-toggle.disabled,
+.fem-results-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.fem-results-toggle.disabled:hover,
+.fem-results-toggle:disabled:hover {
+  background: transparent;
+  color: var(--theme-text-secondary);
+}
+.fem-results-toggle-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  border: 1px solid var(--theme-border);
+  flex-shrink: 0;
+  opacity: 0.35;
+}
+.fem-results-toggle.active .fem-results-toggle-swatch {
+  opacity: 1;
+  border-color: transparent;
+  box-shadow: 0 0 0 1px var(--theme-accent);
+}
+.fem-results-toggle-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Moderne schuifschakelaar (vervangt de oude AAN/uit-tekstbadge). */
+.fem-switch {
+  flex: none;
+  display: inline-block;
+  width: 28px;
+  height: 16px;
+  border-radius: 8px;
+  background: var(--theme-border-subtle);
+  border: 1px solid var(--theme-border-subtle);
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.fem-switch-dot {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--theme-bg, #fff);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: left 0.15s ease;
+}
+.fem-switch.on {
+  background: var(--theme-accent);
+  border-color: var(--theme-accent);
+}
+.fem-switch.on .fem-switch-dot {
+  left: 13px;
+}
+/* Subkeuze onder een resultaat-toggle (bv. reactiecomponenten X/Z). */
+.fem-results-subcheck {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 10px;
+  font-size: 10px;
+  color: var(--theme-text-muted, var(--theme-text));
+  cursor: pointer;
+}
+.fem-results-subcheck input {
+  accent-color: var(--theme-accent);
+  width: 12px;
+  height: 12px;
+  margin: 0;
+}
+.fem-results-hint {
+  padding: 10px 12px;
+  margin: 8px 12px 0;
+  border-radius: 4px;
+  background: var(--theme-bg-lighter);
+  border: 1px dashed var(--theme-border);
+  color: var(--theme-text-faint);
+  font: 400 10.5px/1.5 "Inter", system-ui, sans-serif;
+}
+.fem-results-hint strong {
+  color: var(--theme-accent);
+  font-weight: 600;
+}
+
+/* Titel "Weergave op canvas" met het tandwiel naar het venster Zichtbaarheid
+   (issue #47). */
+.fem-results-section-title-met-knop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.fem-results-title-knop {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -4px -6px -4px 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--theme-text-secondary);
+  cursor: pointer;
+}
+.fem-results-title-knop:hover {
+  background: var(--theme-hover);
+  border-color: var(--theme-border);
+  color: var(--theme-accent);
+}
+
+/* Zoeken in de projectboom (ontwerp 0.4: veld met focusrand) */
+.fem-tree-zoek {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 8px 4px;
+  padding: 0 6px 0 8px;
+  height: 26px;
+  border: 1px solid var(--oa-border-strong);
+  border-radius: var(--oa-radius-small);
+  background: var(--oa-panel);
+  color: var(--theme-text-secondary);
+}
+.fem-tree-zoek:focus-within {
+  border-color: var(--oa-focus);
+  box-shadow: 0 0 0 1px var(--oa-focus);
+}
+.fem-tree-zoek svg {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.fem-tree-zoek input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--theme-text);
+  font: inherit;
+  font-size: var(--oa-size-body);
+}
+.fem-tree-zoek-wis {
+  border: 0;
+  background: transparent;
+  color: var(--theme-text-secondary);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.fem-tree-zoek-leeg {
+  padding: 12px;
+  color: var(--theme-text-secondary);
+}
+.fem-tree-body mark {
+  background: color-mix(in srgb, var(--oa-accent) 30%, transparent);
+  color: inherit;
+  border-radius: 2px;
+}
+
+/* Selectie op het canvas: de regel in de boom licht kort op. */
+.fem-tree-leaf.fem-tree-flits {
+  animation: fem-tree-flits 1.2s ease-out;
+}
+@keyframes fem-tree-flits {
+  from { background: var(--oa-accent); color: var(--oa-text-on-accent); }
+}

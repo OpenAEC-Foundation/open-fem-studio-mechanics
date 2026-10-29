@@ -1,0 +1,809 @@
+//! **De gezaghebbende doorsnedeberekening.** Eén ingang die uit geometrie een
+//! volledig gevulde [`SectionProperties`] maakt.
+//!
+//! Dit is de laag die de rest van het programma hoort te gebruiken. Hij bundelt
+//! de drie kernen die er onder zitten:
+//!
+//! | kern | wat | nauwkeurigheid |
+//! |------|-----|----------------|
+//! | [`crate::contour`] | `A`, zwaartepunt, `Iy`, `Iz`, `Iyz`, hoofdassen, `Wel`, `Wpl`, traagheidsstralen | **exact** — gesloten randintegralen per lijn- en boogsegment, geen discretisatie |
+//! | [`crate::torsie`] | `It`, `Iw`, schuifmiddelpunt | **numeriek convergent** — driehoekselementen, met een meegeleverde insluiting van `It` |
+//! | deze module | `Av;y`, `Av;z` | **normbepaald** — EN 1993-1-1 §6.2.6(3), geen meetkundige grootheid |
+//!
+//! Die driedeling is het hele punt. Wat als randintegraal te schrijven is,
+//! wordt niet benaderd; wat een randwaardeprobleem is, wordt opgelost in plaats
+//! van uit een tabel geraden; en wat een normkeuze is, wordt als normkeuze
+//! benoemd in plaats van als meetkunde vermomd.
+//!
+//! ## Voor wie het overtypen wil overslaan
+//!
+//! ```no_run
+//! use section_properties::motor::{Profielvorm, bereken};
+//! let p = bereken(&Profielvorm::IProfiel { h: 200.0, b: 100.0, tw: 5.6, tf: 8.5, r: 12.0 });
+//! println!("It = {:.0} mm⁴", p.it_mm4);
+//! ```
+//!
+//! Voor een doorsnede die niet in de catalogus staat gaat dezelfde weg via
+//! [`bereken_doorsnede`], met een zelf opgebouwde [`Doorsnede`].
+
+use crate::contour::{self, ContourEigenschappen, Doorsnede};
+use crate::torsie::{self, TorsieOpties, TorsieResultaat};
+use crate::SectionProperties;
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Profielvormen
+// ════════════════════════════════════════════════════════════════════════════
+
+/// De catalogusvormen, met **uitsluitend genormeerde basismaten** als invoer.
+///
+/// Alles wat verder in de database staat — oppervlak, traagheden, `Wpl`, `It`,
+/// `Iw` — volgt hieruit; er hoeft nergens meer een getal overgetypt te worden.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Profielvorm {
+    /// Gewalst I/H-profiel met vier walsuitrondingen (IPE, HEA, HEB, HEM).
+    IProfiel {
+        h: f64,
+        b: f64,
+        tw: f64,
+        tf: f64,
+        r: f64,
+    },
+    /// I-profiel met **toelopende** flenzen (INP, DIN 1025-1, 14 % schuinte).
+    IProfielSchuin {
+        h: f64,
+        b: f64,
+        tw: f64,
+        tf: f64,
+        r: f64,
+    },
+    /// U-profiel met **evenwijdige** flenzen (UPE, DIN 1026-2).
+    UProfiel {
+        h: f64,
+        b: f64,
+        tw: f64,
+        tf: f64,
+        r: f64,
+    },
+    /// U-profiel met **toelopende** flenzen (UNP, DIN 1026-1, 8 % schuinte).
+    UProfielSchuin {
+        h: f64,
+        b: f64,
+        tw: f64,
+        tf: f64,
+        r: f64,
+    },
+    /// Warmgewalste koker volgens EN 10210-2 (`r_o = 1,5·t`, `r_i = 1,0·t`).
+    Koker { h: f64, b: f64, t: f64 },
+    /// Warmgewalste ronde buis; `d` is de **buiten**diameter.
+    Buis { d: f64, t: f64 },
+    /// Massieve rechthoek (hout, vrije maatvoering).
+    Rechthoek { h: f64, b: f64 },
+    /// Gewalste hoeklijn (EN 10056-1), gelijk- of ongelijkbenig. `h` is het
+    /// **lange** been (langs z), `b` het korte (langs y) — de stand die
+    /// NEN-EN 1993-1-1 par. 1.7(2) voorschrijft. `r1` is de walsuitronding in
+    /// de holle hoek, `r2` de teenafronding aan het eind van elk been.
+    ///
+    /// Bij een hoeklijn zijn y-y en z-z **geen hoofdassen**: `iyz_mm4` is
+    /// ongelijk aan nul en de norm rekent volgens de OPMERKING bij par. 1.7
+    /// met u-u en v-v. Wie deze vorm doorrekent krijgt `iu_mm4`, `iv_mm4` en
+    /// `alpha_hoofdas_rad` mee en hoort ze te gebruiken.
+    Hoeklijn {
+        h: f64,
+        b: f64,
+        t: f64,
+        r1: f64,
+        r2: f64,
+    },
+    /// Massief rond staal met diameter `d` (EN 10060), de catalogusreeks
+    /// "RD <d>". Elke contourgrootheid heeft een gesloten vorm — A = πd²/4,
+    /// I = πd⁴/64, W_el = πd³/32, W_pl = d³/6 — en de torsieconstante ook:
+    /// I_t = πd⁴/32 (het polair traagheidsmoment; een cirkel welft niet, dus
+    /// I_w = 0). De catalogus schrijft die gesloten vormen weg; de motor rekent
+    /// dezelfde vorm na als controle, zie `scripts/genereer-rondstaal.mjs`.
+    RondStaal { d: f64 },
+}
+
+impl Profielvorm {
+    /// Controleert of de maten een bestaanbare doorsnede beschrijven.
+    ///
+    /// Zonder deze controle rekende de motor stilzwijgend door op onmogelijke
+    /// maten (basisaudit nr 35): een flens dikker dan de halve hoogte geeft
+    /// een zelfsnijdende contour waarop de mesher tot honderden megabytes
+    /// doorgroeit, een negatieve hoogte gaf een positief oppervlak met een
+    /// negatieve torsieconstante, een lijf breder dan de flens een oppervlak
+    /// groter dan h·b, en een buiswand dikker dan de halve diameter werd stil
+    /// een massieve staaf. Elke regel hieronder is meetkunde, geen normkeuze:
+    /// alle maten positief en eindig, plaatdikten kleiner dan de ruimte
+    /// waarin ze liggen, afrondingen niet groter dan het vlak waarop ze
+    /// staan.
+    pub fn controleer_maten(&self) -> Result<(), String> {
+        fn positief(naam: &str, v: f64) -> Result<(), String> {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(format!("{naam} = {v} moet een positief, eindig getal zijn"));
+            }
+            Ok(())
+        }
+        fn niet_negatief(naam: &str, v: f64) -> Result<(), String> {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("{naam} = {v} moet een eindig getal ≥ 0 zijn"));
+            }
+            Ok(())
+        }
+        match *self {
+            Profielvorm::IProfiel { h, b, tw, tf, r }
+            | Profielvorm::IProfielSchuin { h, b, tw, tf, r }
+            | Profielvorm::UProfiel { h, b, tw, tf, r }
+            | Profielvorm::UProfielSchuin { h, b, tw, tf, r } => {
+                positief("h", h)?;
+                positief("b", b)?;
+                positief("t_w", tw)?;
+                positief("t_f", tf)?;
+                niet_negatief("r", r)?;
+                if 2.0 * tf >= h {
+                    return Err(format!(
+                        "flensdikte t_f = {tf} mm laat geen lijf over bij h = {h} mm (eis 2·t_f < h)"
+                    ));
+                }
+                if tw >= b {
+                    return Err(format!(
+                        "lijfdikte t_w = {tw} mm is niet kleiner dan de flensbreedte b = {b} mm"
+                    ));
+                }
+                // Twee uitrondingen naast elkaar op een I, één op een U; en de
+                // uitronding mag de vrije lijfhoogte niet overschrijden.
+                let ruimte_breedte = match self {
+                    Profielvorm::IProfiel { .. } | Profielvorm::IProfielSchuin { .. } => {
+                        (b - tw) / 2.0
+                    }
+                    _ => b - tw,
+                };
+                if r > ruimte_breedte || 2.0 * r > h - 2.0 * tf {
+                    return Err(format!(
+                        "walsuitronding r = {r} mm past niet tussen lijf en flens (breedte {} mm, \
+                         lijfhoogte {} mm)",
+                        ruimte_breedte,
+                        h - 2.0 * tf
+                    ));
+                }
+                Ok(())
+            }
+            Profielvorm::Koker { h, b, t } => {
+                positief("h", h)?;
+                positief("b", b)?;
+                positief("t", t)?;
+                if 2.0 * t >= h.min(b) {
+                    return Err(format!(
+                        "wanddikte t = {t} mm laat geen holte over bij {b}×{h} mm (eis 2·t < min(b, h))"
+                    ));
+                }
+                // EN 10210-2: buitenhoekstraal 1,5·t moet in de halve zijde passen.
+                if 3.0 * t > h.min(b) {
+                    return Err(format!(
+                        "wanddikte t = {t} mm is te groot voor de hoekafronding 1,5·t bij {b}×{h} mm"
+                    ));
+                }
+                Ok(())
+            }
+            Profielvorm::Buis { d, t } => {
+                positief("d", d)?;
+                positief("t", t)?;
+                if 2.0 * t >= d {
+                    return Err(format!(
+                        "wanddikte t = {t} mm laat geen holte over bij d = {d} mm (eis 2·t < d)"
+                    ));
+                }
+                Ok(())
+            }
+            Profielvorm::Rechthoek { h, b } => {
+                positief("h", h)?;
+                positief("b", b)
+            }
+            Profielvorm::Hoeklijn { h, b, t, r1, r2 } => {
+                positief("h", h)?;
+                positief("b", b)?;
+                positief("t", t)?;
+                niet_negatief("r1", r1)?;
+                niet_negatief("r2", r2)?;
+                if t >= h.min(b) {
+                    return Err(format!(
+                        "beendikte t = {t} mm is niet kleiner dan het kortste been ({} mm)",
+                        h.min(b)
+                    ));
+                }
+                Ok(())
+            }
+            Profielvorm::RondStaal { d } => positief("d", d),
+        }
+    }
+
+    /// De exacte contour van deze vorm, linkeronderhoek op de oorsprong.
+    pub fn doorsnede(&self) -> Doorsnede {
+        match *self {
+            Profielvorm::IProfiel { h, b, tw, tf, r } => contour::i_profiel(h, b, tw, tf, r),
+            Profielvorm::IProfielSchuin { h, b, tw, tf, r } => contour::inp(h, b, tw, tf, r),
+            Profielvorm::UProfiel { h, b, tw, tf, r } => contour::u_profiel(h, b, tw, tf, r),
+            Profielvorm::UProfielSchuin { h, b, tw, tf, r } => contour::unp(h, b, tw, tf, r),
+            Profielvorm::Koker { h, b, t } => contour::koker_en10210(h, b, t),
+            Profielvorm::Buis { d, t } => contour::buis(d, t),
+            Profielvorm::Rechthoek { h, b } => contour::rechthoek(h, b),
+            Profielvorm::Hoeklijn { h, b, t, r1, r2 } => contour::hoeklijn(h, b, t, r1, r2),
+            Profielvorm::RondStaal { d } => contour::rond_staal(d),
+        }
+    }
+
+    /// De drie maten die als `h_mm`, `b_mm`, `tw_mm`, `tf_mm` en `r_mm` in
+    /// [`SectionProperties`] terechtkomen. Die velden zijn *administratie* —
+    /// ze beschrijven de invoer en worden niet uit de contour teruggerekend.
+    fn maten(&self) -> (f64, f64, f64, f64, f64) {
+        match *self {
+            Profielvorm::IProfiel { h, b, tw, tf, r }
+            | Profielvorm::IProfielSchuin { h, b, tw, tf, r }
+            | Profielvorm::UProfiel { h, b, tw, tf, r }
+            | Profielvorm::UProfielSchuin { h, b, tw, tf, r } => (h, b, tw, tf, r),
+            // De opgeslagen `r` van een koker is de BUITENhoekstraal 1,5·t.
+            Profielvorm::Koker { h, b, t } => (h, b, t, t, 1.5 * t),
+            Profielvorm::Buis { d, t } => (d, d, t, t, 0.0),
+            Profielvorm::Rechthoek { h, b } => (h, b, b, h, 0.0),
+            // Een hoeklijn heeft één dikte voor beide benen; die komt daarom
+            // zowel in `tw_mm` als in `tf_mm`. `r_mm` is de walsuitronding
+            // `r1`; de teenafronding `r2` past niet in deze vijf velden en
+            // hoort bij de GEOMETRIE (`ProfileGeometry.r2` in de catalogus),
+            // niet bij de doorsnedegrootheden.
+            Profielvorm::Hoeklijn { h, b, t, r1, .. } => (h, b, t, t, r1),
+            // Massief, dus net als bij de rechthoek is de "plaatdikte" de
+            // volle maat: t_w = t_f = d. Die dikte gaat in tabel 3.1 (f_y per
+            // dikteklasse): voor een massieve staaf is dat de diameter.
+            Profielvorm::RondStaal { d } => (d, d, d, d, 0.0),
+        }
+    }
+
+    /// `(Av;y, Av;z)` volgens EN 1993-1-1 §6.2.6(3), met `a` het **gemeten**
+    /// oppervlak uit de contour.
+    ///
+    /// Dit is de enige grootheid in de motor die niet uit de meetkunde volgt
+    /// maar uit een normregel: §6.2.6(3) geeft per doorsnedesoort een aparte
+    /// uitdrukking, met een ondergrens `η·h_w·t_w`. `η = 1,0` is de waarde die
+    /// de Nederlandse nationale bijlage toelaat en die de rest van de database
+    /// gebruikt; hoger zou onveilig zijn zolang lijfplooien niet wordt getoetst.
+    pub fn afschuifoppervlakken(&self, a: f64) -> (f64, f64) {
+        const ETA: f64 = 1.0;
+        match *self {
+            // (a) gewalste I/H, belasting evenwijdig aan het lijf. Voor de
+            // toelopende flens telt dezelfde regel met de nominale `tf`; de
+            // norm maakt daar geen onderscheid.
+            Profielvorm::IProfiel { h, b, tw, tf, r }
+            | Profielvorm::IProfielSchuin { h, b, tw, tf, r } => {
+                let hw = h - 2.0 * tf;
+                let av_z = (a - 2.0 * b * tf + (tw + 2.0 * r) * tf).max(ETA * hw * tw);
+                (2.0 * b * tf, av_z)
+            }
+            // (b) gewalste U: dezelfde vorm, met één uitronding per flens.
+            Profielvorm::UProfiel { h, b, tw, tf, r }
+            | Profielvorm::UProfielSchuin { h, b, tw, tf, r } => {
+                let hw = h - 2.0 * tf;
+                let av_z = (a - 2.0 * b * tf + (tw + r) * tf).max(ETA * hw * tw);
+                (2.0 * b * tf, av_z)
+            }
+            // (c) holle doorsnede van gelijkmatige dikte: A·h/(b+h) resp. A·b/(b+h).
+            Profielvorm::Koker { h, b, .. } => (a * b / (b + h), a * h / (b + h)),
+            // (d) ronde holle doorsnede: 2A/π.
+            Profielvorm::Buis { .. } => {
+                let av = 2.0 * a / std::f64::consts::PI;
+                (av, av)
+            }
+            // Massieve rechthoek: de schuifspanning is parabolisch, dus ⅔A.
+            Profielvorm::Rechthoek { .. } => (2.0 * a / 3.0, 2.0 * a / 3.0),
+            // Hoeklijn: §6.2.6(3) heeft GEEN rij voor hoekprofielen — de lijst
+            // loopt van (a) gewalste I/H tot (g) ronde buizen en slaat het
+            // hoekprofiel over. A_v valt hier dus onder de algemene regel
+            // §6.2.6(2), "A_v is de oppervlakte van het werkzame
+            // afschuifoppervlak", en die moet zelf bepaald worden.
+            //
+            // Genomen is het been dat EVENWIJDIG aan de kracht loopt, over
+            // zijn volle lengte: het lange been `h·t` draagt de dwarskracht in
+            // z, het korte been `b·t` die in y. De hiel (`t × t`) telt daardoor
+            // in beide richtingen mee — dat is dezelfde ruimhartigheid als
+            // §6.2.6(3)(a), die de walsuitrondingen ook bij het lijf optelt.
+            // Deze keuze is een normkeuze en geen meetkunde, en hoort daarom
+            // BIJ DE TOETS te worden gemeld; `steel-check` doet dat.
+            Profielvorm::Hoeklijn { h, b, t, .. } => (b * t, h * t),
+            // Massief rond: §6.2.6(3) heeft ook hier GEEN rij — (d) gaat over
+            // de ronde BUIS. A_v valt dus onder §6.2.6(2) en is zelf bepaald,
+            // met dezelfde redenering als de massieve rechthoek hierboven: de
+            // elastische schuifspanning mag nergens f_y/√3 overschrijden. Voor
+            // een cirkel is die spanning het grootst op de neutrale lijn,
+            // τ_max = 4V/(3A) (Jourawski over de koorde), dus
+            // V = τ·(3/4)·A en A_v = 0,75·A.
+            //
+            // Conservatief: een volledig plastische schuifverdeling zou A_v = A
+            // toelaten, en de buisregel 2A/π = 0,64·A is voor een massieve
+            // doorsnede niet afgeleid. Voor een windverband (vrijwel geen
+            // dwarskracht) maakt de keuze in de praktijk niets uit; zij staat
+            // bij de toets vermeld.
+            Profielvorm::RondStaal { .. } => (0.75 * a, 0.75 * a),
+        }
+    }
+
+    /// `true` als de doorsnede gesloten is; `Iw` speelt dan geen rol in de
+    /// kiptoetsing en wordt op nul gezet in plaats van numeriek bepaald.
+    fn is_gesloten(&self) -> bool {
+        matches!(*self, Profielvorm::Koker { .. } | Profielvorm::Buis { .. })
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Rekenen
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Wat er in `Av;y` / `Av;z` moet komen als de doorsnede niet uit de catalogus
+/// komt maar uit losse contouren.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Afschuiving {
+    /// Neem `Av = A` — geen normregel, gewoon het volle oppervlak.
+    VolOppervlak,
+    /// Neem de regel van een genoemde catalogusvorm.
+    AlsVorm(Profielvorm),
+    /// Zelf uitgerekende waarden `(Av;y, Av;z)`.
+    Gegeven(f64, f64),
+}
+
+/// De volledige uitkomst, inclusief de diagnostiek die nodig is om te kunnen
+/// *bewijzen* dat het getal klopt.
+#[derive(Clone, Copy, Debug)]
+pub struct MotorResultaat {
+    /// Wat de rest van het programma gebruikt.
+    pub props: SectionProperties,
+    /// De exacte contourgrootheden, met de uiterste vezels en de PNA.
+    pub contour: ContourEigenschappen,
+    /// De numerieke torsie-uitkomst, met de insluiting van `It` en het
+    /// meshverslag (aantal driehoeken, oppervlakcontrole, rekentijd).
+    pub torsie: TorsieResultaat,
+}
+
+/// Reken een catalogusvorm door met de standaardinstellingen van de
+/// torsiemotor (acht elementen door de dunste wand).
+pub fn bereken(vorm: &Profielvorm) -> SectionProperties {
+    bereken_uitgebreid(vorm, None).props
+}
+
+/// Idem, maar met de volledige diagnostiek erbij en desgewenst eigen
+/// mesh-instellingen.
+pub fn bereken_uitgebreid(vorm: &Profielvorm, opties: Option<TorsieOpties>) -> MotorResultaat {
+    let d = vorm.doorsnede();
+    let mut r = bereken_doorsnede_uitgebreid(&d, Afschuiving::AlsVorm(*vorm), opties);
+    let (h, b, tw, tf, straal) = vorm.maten();
+    r.props.h_mm = h;
+    r.props.b_mm = b;
+    r.props.tw_mm = tw;
+    r.props.tf_mm = tf;
+    r.props.r_mm = straal;
+    if vorm.is_gesloten() {
+        // Een gesloten doorsnede wringt via St.-Venant; de welvingsstijfheid is
+        // verwaarloosbaar en wordt in EN 1993-1-1 niet gebruikt. Nul zetten is
+        // hier dus geen gebrek maar de juiste modelkeuze — en conservatief.
+        r.props.iw_mm6 = 0.0;
+    }
+    if let Profielvorm::RondStaal { .. } = vorm {
+        // Een massieve cirkel welft niet: de welvingsfunctie is overal nul,
+        // dus I_w = 0 exact. De numerieke oplossing geeft er ruis omheen; de
+        // exacte waarde is hier bekend en gaat voor.
+        r.props.iw_mm6 = 0.0;
+    }
+    r
+}
+
+/// Reken een **willekeurige** doorsnede door: catalogusprofiel, samengestelde
+/// vorm of een met de hand opgebouwde contour, het maakt niet uit.
+pub fn bereken_doorsnede(d: &Doorsnede, av: Afschuiving) -> SectionProperties {
+    bereken_doorsnede_uitgebreid(d, av, None).props
+}
+
+/// De kern. Alles wat hierboven staat is verpakking.
+pub fn bereken_doorsnede_uitgebreid(
+    d: &Doorsnede,
+    av: Afschuiving,
+    opties: Option<TorsieOpties>,
+) -> MotorResultaat {
+    let e = d.bereken();
+    let t = match opties {
+        Some(o) => torsie::bereken_met(d, o),
+        None => torsie::bereken(d),
+    };
+
+    let (av_y, av_z) = match av {
+        Afschuiving::VolOppervlak => (e.a_mm2, e.a_mm2),
+        Afschuiving::AlsVorm(v) => v.afschuifoppervlakken(e.a_mm2),
+        Afschuiving::Gegeven(y, z) => (y, z),
+    };
+
+    // Wel;y en Wel;z zijn per conventie de MAATGEVENDE (kleinste) waarde: de
+    // uiterste vezel het verst van de zwaartepuntsas. De vezelgewijze waarden
+    // staan er los naast, want een U-profiel op zijn kant heeft er twee.
+    let wel_y = e.wel_y_boven_mm3.min(e.wel_y_onder_mm3);
+    let wel_z = e.wel_z_links_mm3.min(e.wel_z_rechts_mm3);
+
+    let props = SectionProperties {
+        area_mm2: e.a_mm2,
+        iy_mm4: e.iy_mm4,
+        iz_mm4: e.iz_mm4,
+        wel_y_mm3: wel_y,
+        wel_z_mm3: wel_z,
+        wpl_y_mm3: e.wpl_y_mm3,
+        wpl_z_mm3: e.wpl_z_mm3,
+        av_y_mm2: av_y,
+        av_z_mm2: av_z,
+        it_mm4: t.it_beste_mm4,
+        iw_mm6: if t.losse_delen { 0.0 } else { t.iw_mm6 },
+        iy_radius_mm: e.i_y_straal_mm,
+        iz_radius_mm: e.i_z_straal_mm,
+        // De vijf maatvelden beschrijven de invoergeometrie. Voor een losse
+        // contour is er geen "flensdikte", dus alleen de omhullende maat.
+        h_mm: e.z_max_mm - e.z_min_mm,
+        b_mm: e.y_max_mm - e.y_min_mm,
+        tw_mm: 0.0,
+        tf_mm: 0.0,
+        r_mm: 0.0,
+        y_c_mm: e.y_c_mm,
+        z_c_mm: e.z_c_mm,
+        wel_y_top_mm3: e.wel_y_boven_mm3,
+        wel_y_bot_mm3: e.wel_y_onder_mm3,
+        wel_z_left_mm3: e.wel_z_links_mm3,
+        wel_z_right_mm3: e.wel_z_rechts_mm3,
+        iyz_mm4: e.iyz_mm4,
+        iu_mm4: e.iu_mm4,
+        iv_mm4: e.iv_mm4,
+        alpha_hoofdas_rad: e.alpha_hoofdas_rad,
+        y_s_mm: if t.losse_delen { e.y_c_mm } else { t.y_s_mm },
+        z_s_mm: if t.losse_delen { e.z_c_mm } else { t.z_s_mm },
+    };
+
+    MotorResultaat {
+        props,
+        contour: e,
+        torsie: t,
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn rel(gemeten: f64, verwacht: f64) -> f64 {
+        ((gemeten - verwacht) / verwacht).abs()
+    }
+
+    /// De ronde buis is het enige catalogusprofiel waarvan **elke** grootheid
+    /// een gesloten vorm heeft — inclusief `It = 2·I`. Als de motor daar
+    /// exact op uitkomt, zit de fout nergens in de keten.
+    #[test]
+    fn buis_reproduceert_alle_gesloten_vormen() {
+        let (d, t) = (219.1, 10.0);
+        let p = bereken(&Profielvorm::Buis { d, t });
+        let (ro, ri) = (d / 2.0, d / 2.0 - t);
+        let a = PI * (ro * ro - ri * ri);
+        let i = PI * (ro.powi(4) - ri.powi(4)) / 4.0;
+
+        assert!(rel(p.area_mm2, a) < 1e-9, "A: {:.3e}", rel(p.area_mm2, a));
+        assert!(rel(p.iy_mm4, i) < 1e-9);
+        assert!(rel(p.iz_mm4, i) < 1e-9);
+        assert!(rel(p.wel_y_mm3, 2.0 * i / d) < 1e-9);
+        assert!(rel(p.wpl_y_mm3, (d.powi(3) - (d - 2.0 * t).powi(3)) / 6.0) < 1e-9);
+        assert!(rel(p.iy_radius_mm, (i / a).sqrt()) < 1e-9);
+        // Av = 2A/π volgens EN 1993-1-1 §6.2.6(3)(d).
+        assert!(rel(p.av_z_mm2, 2.0 * a / PI) < 1e-9);
+        // It = 2·I exact; de numerieke oplossing haalt dat op 0,1 %.
+        let f = rel(p.it_mm4, 2.0 * i);
+        assert!(f < 1e-3, "It wijkt {:.4} % af", f * 100.0);
+        // Gesloten doorsnede: Iw op nul.
+        assert_eq!(p.iw_mm6, 0.0);
+        // Dubbelsymmetrisch: schuifmiddelpunt = zwaartepunt.
+        assert!((p.y_s_mm - p.y_c_mm).abs() < 1e-6 * d);
+        assert!((p.z_s_mm - p.z_c_mm).abs() < 1e-6 * d);
+    }
+
+    /// Massief rond staal RD 24: elke grootheid heeft een gesloten vorm, en de
+    /// motor hoort er met de exacte kwartbogen op uit te komen. Met de hand:
+    ///   A    = π·24²/4  = 452,389 mm²
+    ///   I    = π·24⁴/64 = 16 286,0 mm⁴  (I_y = I_z)
+    ///   W_el = π·24³/32 = 1 357,17 mm³
+    ///   W_pl = 24³/6    = 2 304 mm³     (twee halve cirkels, arm 4r/3π)
+    ///   i    = d/4      = 6 mm
+    ///   I_t  = π·24⁴/32 = 32 572,0 mm⁴  (polair; numeriek, dus 0,5 %)
+    ///   A_v  = 0,75·A   = 339,292 mm²   (§6.2.6(2), elastische τ_max)
+    #[test]
+    fn rond_staal_reproduceert_alle_gesloten_vormen() {
+        let d = 24.0;
+        let p = bereken(&Profielvorm::RondStaal { d });
+        let a = PI * d * d / 4.0;
+        let i = PI * d.powi(4) / 64.0;
+        assert!(rel(p.area_mm2, 452.389_342) < 1e-8, "A = {}", p.area_mm2);
+        assert!(rel(p.area_mm2, a) < 1e-9);
+        assert!(rel(p.iy_mm4, 16_286.016_3) < 1e-8, "I_y = {}", p.iy_mm4);
+        assert!(rel(p.iz_mm4, i) < 1e-9);
+        assert!(
+            rel(p.wel_y_mm3, 1_357.168_03) < 1e-8,
+            "W_el = {}",
+            p.wel_y_mm3
+        );
+        assert!(rel(p.wel_z_mm3, PI * d.powi(3) / 32.0) < 1e-9);
+        assert!(rel(p.wpl_y_mm3, 2_304.0) < 1e-9, "W_pl,y = {}", p.wpl_y_mm3);
+        assert!(rel(p.wpl_z_mm3, 2_304.0) < 1e-9, "W_pl,z = {}", p.wpl_z_mm3);
+        assert!(rel(p.iy_radius_mm, 6.0) < 1e-9);
+        assert!(rel(p.iz_radius_mm, 6.0) < 1e-9);
+        let f = rel(p.it_mm4, 32_572.032_6);
+        assert!(f < 5e-3, "I_t wijkt {:.3} % af van πd⁴/32", f * 100.0);
+        assert_eq!(p.iw_mm6, 0.0, "een cirkel welft niet");
+        assert!(rel(p.av_z_mm2, 0.75 * a) < 1e-12 && rel(p.av_y_mm2, 0.75 * a) < 1e-12);
+        // De maatvelden: de volle maat, want massief (tabel 3.1 leest t = d).
+        assert_eq!(
+            (p.h_mm, p.b_mm, p.tw_mm, p.tf_mm, p.r_mm),
+            (d, d, d, d, 0.0)
+        );
+        assert!(Profielvorm::RondStaal { d: 0.0 }
+            .controleer_maten()
+            .is_err());
+    }
+
+    /// De EN 10210-2-koker moet de gepubliceerde waarde van de seed
+    /// HFRHS200X200X16 raken; die is op een externe referentie-berekening
+    /// geijkt en staat dus los van zowel de motor als de generator.
+    #[test]
+    fn koker_en10210_raakt_de_geijkte_seed() {
+        let p = bereken(&Profielvorm::Koker {
+            h: 200.0,
+            b: 200.0,
+            t: 16.0,
+        });
+        // A = 11501,30 mm² uit de externe referentie-berekening.
+        let f = rel(p.area_mm2, 11_501.30);
+        assert!(
+            f < 1e-4,
+            "A = {:.2} mm², {:.4} % naast 11501,30",
+            p.area_mm2,
+            f * 100.0
+        );
+        // Het concentrische model zou hier 1,4 % lager uitkomen; dat mag niet
+        // ongemerkt terugsluipen.
+        let concentrisch = contour::koker(200.0, 200.0, 16.0, 24.0).bereken().a_mm2;
+        assert!(
+            concentrisch < 11_400.0,
+            "concentrisch model verschilt niet meer"
+        );
+    }
+
+    /// De UNP-contour met 8 % schuinte moet het genormeerde oppervlak halen
+    /// dat uit de DIN 1026-1 massa per meter volgt; het prismatische model
+    /// ligt daar ~2 % boven.
+    #[test]
+    fn unp_schuinte_haalt_de_genormeerde_massa() {
+        // DIN 1026-1 massa per meter (kg/m) bij ρ = 7850 kg/m³.
+        for &(h, b, tw, tf, r, massa) in &[
+            (80.0, 45.0, 6.0, 8.0, 8.0, 8.64),
+            (140.0, 60.0, 7.0, 10.0, 10.0, 16.0),
+            (200.0, 75.0, 8.5, 11.5, 11.5, 25.3),
+            (300.0, 100.0, 10.0, 16.0, 16.0, 46.2),
+        ] {
+            let a_norm = massa / 7850.0 * 1e6; // kg/m → mm²
+            let schuin = bereken(&Profielvorm::UProfielSchuin { h, b, tw, tf, r }).area_mm2;
+            let recht = bereken(&Profielvorm::UProfiel { h, b, tw, tf, r }).area_mm2;
+            let f_schuin = rel(schuin, a_norm);
+            let f_recht = rel(recht, a_norm);
+            assert!(
+                f_schuin < 0.01,
+                "UNP {h}: schuin {schuin:.0} mm² tegen {a_norm:.0} mm² = {:.2} %",
+                f_schuin * 100.0
+            );
+            assert!(
+                f_recht > f_schuin,
+                "UNP {h}: het prismatische model ({:.2} %) hoort slechter te zijn \
+                 dan het schuine ({:.2} %)",
+                f_recht * 100.0,
+                f_schuin * 100.0
+            );
+        }
+    }
+
+    /// De INP-contour met 14 % schuinte moet de gedrukte DIN 1025-1-waarden
+    /// halen; het prismatische I-model ligt op `Iz` ruim 10 % te hoog, want
+    /// de schuinte haalt materiaal weg precies aan de flenstip.
+    #[test]
+    fn inp_schuinte_haalt_de_gedrukte_tabel() {
+        // DIN 1025-1: h, b, s, t, r₁ (mm); A (cm²), Iy, Iz (cm⁴).
+        for &(h, b, tw, tf, r, a_cm2, iy_cm4, iz_cm4) in &[
+            (80.0, 42.0, 3.9, 5.9, 3.9, 7.57, 77.8, 6.29),
+            (200.0, 90.0, 7.5, 11.3, 7.5, 33.4, 2140.0, 117.0),
+            (300.0, 125.0, 10.8, 16.2, 10.8, 69.0, 9800.0, 451.0),
+            (600.0, 215.0, 21.6, 32.4, 21.6, 254.0, 139_000.0, 4670.0),
+        ] {
+            let schuin = bereken(&Profielvorm::IProfielSchuin { h, b, tw, tf, r });
+            let recht = bereken(&Profielvorm::IProfiel { h, b, tw, tf, r });
+            for (naam, gemeten, tabel) in [
+                ("A", schuin.area_mm2, a_cm2 * 100.0),
+                ("Iy", schuin.iy_mm4, iy_cm4 * 1e4),
+                ("Iz", schuin.iz_mm4, iz_cm4 * 1e4),
+            ] {
+                let f = rel(gemeten, tabel);
+                assert!(
+                    f < 0.015,
+                    "INP {h}: {naam} schuin {gemeten:.0} tegen tabel {tabel:.0} = {:.2} %",
+                    f * 100.0
+                );
+            }
+            assert!(
+                rel(recht.iz_mm4, iz_cm4 * 1e4) > rel(schuin.iz_mm4, iz_cm4 * 1e4),
+                "INP {h}: het prismatische model hoort op Iz slechter te zijn dan het schuine"
+            );
+            // Dubbelsymmetrisch: zwaartepunt én schuifmiddelpunt in het hart
+            // (beide in het beschrijvingsstelsel, dus op y = b/2).
+            let u = bereken_uitgebreid(&Profielvorm::IProfielSchuin { h, b, tw, tf, r }, None);
+            assert!(
+                (u.props.y_c_mm - b / 2.0).abs() < 1e-6,
+                "y_c = {:.4}",
+                u.props.y_c_mm
+            );
+            assert!(
+                (u.props.y_s_mm - b / 2.0).abs() < 1e-3,
+                "y_s = {:.4}",
+                u.props.y_s_mm
+            );
+        }
+    }
+
+    /// Zonder schuinte en zonder tipafronding is de schuine I-contour de
+    /// gewone I-contour — dezelfde punten, dus dezelfde grootheden.
+    #[test]
+    fn i_profiel_schuin_zonder_schuinte_is_i_profiel() {
+        let (h, b, tw, tf, r) = (300.0, 150.0, 7.1, 10.7, 15.0);
+        let recht = contour::i_profiel(h, b, tw, tf, r).bereken();
+        let schuin = contour::i_profiel_schuin(h, b, tw, tf, r, 0.0, 0.0).bereken();
+        assert!(rel(schuin.a_mm2, recht.a_mm2) < 1e-12);
+        assert!(rel(schuin.iy_mm4, recht.iy_mm4) < 1e-12);
+        assert!(rel(schuin.iz_mm4, recht.iz_mm4) < 1e-12);
+        // En met een minieme schuinte blijft hij er vlak naast — de
+        // spiegeling om het lijf mag geen sprong in de contour geven.
+        let bijna = contour::i_profiel_schuin(h, b, tw, tf, r, 0.0, 1e-6).bereken();
+        assert!(rel(bijna.a_mm2, recht.a_mm2) < 1e-6);
+        assert!(rel(bijna.iz_mm4, recht.iz_mm4) < 1e-5);
+    }
+
+    /// Een UNP is niet symmetrisch om de z-as: het schuifmiddelpunt moet aan
+    /// de andere kant van het lijf liggen dan de flenzen, en `Iw` moet onder
+    /// de formulevrije bovengrens `Iz·h_s²/4` blijven.
+    #[test]
+    fn unp_schuifmiddelpunt_ligt_achter_het_lijf() {
+        let (h, b, tw, tf, r) = (200.0, 75.0, 8.5, 11.5, 11.5);
+        let m = bereken_uitgebreid(&Profielvorm::UProfielSchuin { h, b, tw, tf, r }, None);
+        let p = m.props;
+        assert!(p.y_s_mm < 0.0, "schuifmiddelpunt op y = {:.2} mm", p.y_s_mm);
+        assert!(p.y_c_mm > 0.0 && p.y_c_mm < b);
+        let grens = p.iz_mm4 * (h - tf).powi(2) / 4.0;
+        assert!(
+            p.iw_mm6 < grens,
+            "Iw {:.3e} ≥ bovengrens {:.3e}",
+            p.iw_mm6,
+            grens
+        );
+    }
+
+    /// Een gelijkbenige hoeklijn: het schuifmiddelpunt ligt op het snijpunt
+    /// van de twee beenmiddellijnen, dus op `(t/2, t/2)` — vlak bij de hiel en
+    /// ver van het zwaartepunt. Dat is de scherpste toets op de torsiemotor
+    /// voor deze vorm, want het volgt uit de dunwandige theorie en niet uit
+    /// een tabel. `A_v` volgt de eigen regel onder §6.2.6(2).
+    #[test]
+    fn hoeklijn_schuifmiddelpunt_ligt_op_de_hiel() {
+        let (h, b, t, r1, r2) = (100.0, 100.0, 10.0, 12.0, 6.0);
+        let m = bereken_uitgebreid(&Profielvorm::Hoeklijn { h, b, t, r1, r2 }, None);
+        let p = m.props;
+        // De maattabel geeft A = 1915 à 1920 mm² voor L 100×100×10.
+        assert!(rel(p.area_mm2, 1915.0) < 5e-3, "A = {:.1} mm²", p.area_mm2);
+        // Scherpe hoeklijn (geen stralen): de dunwandige theorie zegt dat het
+        // schuifmiddelpunt exact op het snijpunt van de twee beenmiddellijnen
+        // ligt, dus op (t/2, t/2). Dat is een uitkomst van de theorie en geen
+        // tabelwaarde, en daarom de scherpste toets op de torsiemotor.
+        // De theorie geldt in de limiet t/h → 0, dus de proef loopt over een
+        // reeks steeds dunnere benen: de fout hoort mee te krimpen.
+        let mut vorige = f64::INFINITY;
+        for dun in [10.0_f64, 5.0, 2.5] {
+            let s = bereken(&Profielvorm::Hoeklijn {
+                h,
+                b,
+                t: dun,
+                r1: 0.0,
+                r2: 0.0,
+            });
+            let fout = (s.y_s_mm - dun / 2.0)
+                .abs()
+                .max((s.z_s_mm - dun / 2.0).abs())
+                / dun;
+            assert!(
+                fout < vorige,
+                "t = {dun}: fout {:.4}·t hoort kleiner dan {:.4}·t",
+                fout,
+                vorige
+            );
+            vorige = fout;
+        }
+        assert!(
+            vorige < 0.02,
+            "dunwandige limiet niet gehaald: {vorige:.4}·t"
+        );
+        let scherp = bereken(&Profielvorm::Hoeklijn {
+            h,
+            b,
+            t,
+            r1: 0.0,
+            r2: 0.0,
+        });
+        assert!(
+            (scherp.y_s_mm - t / 2.0).abs() < 0.05 * t
+                && (scherp.z_s_mm - t / 2.0).abs() < 0.05 * t,
+            "scherp: schuifmiddelpunt op ({:.3}, {:.3}), verwacht ({:.1}, {:.1})",
+            scherp.y_s_mm,
+            scherp.z_s_mm,
+            t / 2.0,
+            t / 2.0
+        );
+        // Mét walsuitronding schuift het middelpunt naar buiten — de holle
+        // hoek is materiaal dat de dunwandige theorie niet kent. Het blijft
+        // wel bij de hiel en dus ver van het zwaartepunt; dat verschil is
+        // precies wat een hoeklijn zo torsiegevoelig maakt.
+        assert!(
+            (p.y_s_mm - t / 2.0).abs() < t && (p.z_s_mm - t / 2.0).abs() < t,
+            "schuifmiddelpunt op ({:.3}, {:.3})",
+            p.y_s_mm,
+            p.z_s_mm
+        );
+        assert!(p.y_s_mm < p.y_c_mm / 2.0 && p.z_s_mm < p.z_c_mm / 2.0);
+        // Zwaartepunt ligt op 28,22 mm van de hiel (tweede catalogus).
+        assert!((p.y_c_mm - 28.22).abs() < 0.1, "y_c = {:.2} mm", p.y_c_mm);
+        // A_v onder §6.2.6(2): het been evenwijdig aan de kracht.
+        assert_eq!(p.av_z_mm2, h * t);
+        assert_eq!(p.av_y_mm2, b * t);
+        // Open doorsnede van gelijke dikte: I_t ≈ ⅓·Σ l·t³ met l de
+        // middellijnlengte (h + b − t). De walsuitronding maakt hem wat
+        // groter, dus de dunwandige waarde is een ONDERgrens.
+        let it_dun = (h + b - t) * t.powi(3) / 3.0;
+        assert!(
+            p.it_mm4 > it_dun && p.it_mm4 < 1.6 * it_dun,
+            "I_t = {:.0} mm⁴ hoort tussen {:.0} en {:.0}",
+            p.it_mm4,
+            it_dun,
+            1.6 * it_dun
+        );
+        // De hoofdassen staan onder 45°, en de zwakke hoofdas is écht zwakker
+        // dan de z-as: dat is waarom kolomknik om u-u en v-v moet.
+        assert!((p.alpha_hoofdas_rad - PI / 4.0).abs() < 1e-9);
+        assert!(
+            p.iv_mm4 < p.iz_mm4,
+            "I_v = {:.4e} ≥ I_z = {:.4e}",
+            p.iv_mm4,
+            p.iz_mm4
+        );
+    }
+
+    /// De motor moet dezelfde uitkomst geven als je hem via de contour
+    /// aanroept in plaats van via de vorm — dat is de garantie dat er maar
+    /// één rekenweg is.
+    #[test]
+    fn vorm_en_losse_contour_geven_hetzelfde() {
+        let v = Profielvorm::IProfiel {
+            h: 300.0,
+            b: 150.0,
+            tw: 7.1,
+            tf: 10.7,
+            r: 15.0,
+        };
+        let a = bereken(&v);
+        let b = bereken_doorsnede(&v.doorsnede(), Afschuiving::AlsVorm(v));
+        assert_eq!(a.area_mm2, b.area_mm2);
+        assert_eq!(a.iy_mm4, b.iy_mm4);
+        assert_eq!(a.wpl_y_mm3, b.wpl_y_mm3);
+        assert_eq!(a.av_z_mm2, b.av_z_mm2);
+    }
+}

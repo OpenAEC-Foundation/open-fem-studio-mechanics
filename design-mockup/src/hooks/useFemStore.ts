@@ -1,0 +1,3429 @@
+/**
+ * useFemStore — single hook owning all FEM model state.
+ *
+ * Used by App.tsx so FemCanvas, FemProjectTree, FemProperties and the
+ * Ribbon buttons all consume the same model. Keeps state lifting tidy
+ * (no prop-drilling soup) without introducing an external store library.
+ *
+ * Includes a tiny undo/redo history stack — every mutating action pushes
+ * a Snapshot, Ctrl+Z restores the previous one.
+ */
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
+import type {
+  Node, Beam, BeamCheckConfig, BeamReleases, Plate, PlaatMeshCache, Support, Load, LoadCase,
+  Selection, Snapshot, SupportType, StructuralGrid, Analysetype,
+} from "../components/fem/femTypes";
+import {
+  DEFAULT_STRUCTURAL_GRID, PLATE_DEFAULTS, withPlateDefaults,
+  registreerPlaatMeshCacheCommitter, analysetypeUitBestand,
+} from "../components/fem/femTypes";
+/** Projectdata (betonspoor van de volledige editie); zelfde waarde als in betonStijfheid.ts. */
+const STANDAARD_SEGMENTLENGTE_MM = 400;
+// Modelcontrole: één implementatie van "ligt deze knoop op die staaf" en
+// "liggen deze twee knopen op elkaar", gedeeld door de controle in het canvas
+// en door de herstelbewerkingen hieronder.
+import {
+  CONTROLE_TOL_MM, controleerModel, opZelfdePlek, puntOpStaaf, tussenpuntOpStaaf,
+} from "../lib/modelControle";
+import { nederlands, vertaalWaarde, vt, type VertaalbareTekst } from "../lib/vertaalbareTekst";
+import type { SolverResult } from "../components/fem/solver/types";
+import type {
+  LoadCombination, Envelope,
+} from "../components/fem/solver/combinations";
+import { defaultCombinations, metScheefstandRichtingen } from "../components/fem/solver/combinations";
+import { veldpatroonMeldingen, voegVeldpatronenIn } from "../components/fem/solver/veldpatronen";
+import type { AlphaCrUitkomst } from "../components/fem/solver/alphaCr";
+import {
+  selecteerCombinaties, type OvergeslagenCombinatie,
+} from "../lib/combinatieSelectie";
+// Belastinggevallen en combinaties samen bijhouden: de regels staan in
+// lib/combinatieBeheer (puur, zodat de tests precies deze code aanroepen).
+import {
+  gevolgklasseBijOpenen, type KlasseBron,
+  bevestigEigenFactoren, herstelCombinaties, meldingenBelastinggevallen, openCombinatieStaat, synchroniseerStandaard,
+  trekBevestigingIn,
+  vervangDoorStandaard, vervangVerouderdeCombinaties, verwijderBelastinggeval, verwijderCombinatie,
+  voegBelastinggevalToe, voegCombinatieToe, volgendVrijId, wijzigBelastinggeval, wijzigCombinatie,
+  zetBijlage, zetGevolgklasse, bijlageUitKenmerk, verplaatsEigenGewichtNaarEigenGeval,
+  zorgVoorBelastinggevallen as zorgVoorGevallenInStaat,
+  type CombinatieAfwijking, type CombinatieStaat, type CombinatieVervanging, type GevalMelding,
+} from "../lib/combinatieBeheer";
+import { BIJLAGEN_GEVULD, STANDAARD_BIJLAGE, type NationaleBijlageCode } from "../lib/normAanduidingen";
+import i18next from "i18next";
+import {
+  EIGEN_GEWICHT_STANDAARD_AAN, STANDAARD_ACTIEF_GEVAL_ID, eigenGewichtNaGevalWijziging,
+  gevalNeemtHandmatigeLasten, standaardBelastinggevallen, type EigenGewichtUitReden,
+} from "../lib/eigenGewicht";
+import { matchSupportedTimberGrade } from "../lib/houtMateriaal";
+import {
+  bepaalEindstijfheidHout,
+  metEindtoestandVarianten,
+  type EindstijfheidUitkomst,
+} from "../lib/houtEindstijfheid";
+import { splitsVerlopendProfiel } from "../lib/verloopSplitsen";
+import {
+  STANDAARD_GEVOLGKLASSE, type Gevolgklasse,
+} from "../components/fem/solver/normcombinaties";
+// De scheefstandbron (vaste noemer of normformule) — de lijst met geldige
+// waarden hoort hier omdat het INLEZEN van een projectbestand een onbekende
+// waarde moet kunnen terugzetten op "vast".
+import { SCHEEFSTAND_BRONNEN, type ScheefstandBron } from "../lib/scheefstandNorm";
+import { rekenInstellingenVersie as bepaalRekenInstellingenVersie } from "../lib/rekenInstellingen";
+import { leesKruipInvoer, type KruipInvoerProject } from "../lib/kruipInvoer";
+
+// ── Defaults ───────────────────────────────────────────────────────────────
+//
+// HET STARTMODEL: DRIE LOSSE CONSTRUCTIES, DRIE MATERIALEN
+//
+// De app opent op een model dat alle drie de toetskernen tegelijk aan het werk
+// zet — staal (EN 1993), hout (EN 1995) en beton (EN 1992). Eén portaal alleen
+// liet twee van de drie kernen onbeproefd; wie de multi-materiaalketen wilde
+// nalopen moest eerst met de hand een houten en een betonnen ligger tekenen.
+//
+//   x =      0 … 12 000   stalen portaal, 12 × 5 m, IPE 270 / IPE 330 in S235
+//   x = 16 000 … 26 000   houten ligger op drie steunpunten, 2 × 5 m, GL24h
+//   x = 30 000 … 36 000   betonnen balk op twee steunpunten, 6 m, C30/37
+//
+// De drie delen raken elkaar niet. Dat is bewust: ze staan naast elkaar zoals
+// drie losse berekeningen in één project, en de modelcontrole heeft er geen
+// bezwaar tegen zolang ELK deel zelf voldoende is opgelegd (zie hieronder) —
+// zij eist geen samenhang tussen de delen, alleen dat geen enkel deel vrij kan
+// bewegen.
+//
+// De materiaal- en profielnamen zijn niet vrij gekozen. `materiaalVanStaaf`
+// (lib/variantInvoer.ts) leidt de toetskern uit `material` + `profile` af, dus
+// alleen namen die de kernen kennen leveren een getoetste staaf op:
+//   - "GL24h"  staat in SUPPORTED_TIMBER_GRADES (EN 14080);
+//   - "C30/37" staat in SUPPORTED_CONCRETE_CLASSES (tabel 3.1);
+//   - "160x400" en "300x600" zijn b×h en worden door respectievelijk
+//     `parseTimberRectMm` en `parseConcreteSection` gelezen.
+// Een naam die daarbuiten valt geeft geen fout maar een STIL overgeslagen
+// staaf, en dan is het startmodel waardeloos voor waar het voor bedoeld is.
+const DEFAULT_NODES: Node[] = [
+  // Stalen portaal.
+  { id: 1, x: 0,     z: 0 },
+  { id: 2, x: 12000, z: 0 },
+  { id: 3, x: 0,     z: 5000 },
+  { id: 4, x: 12000, z: 5000 },
+  // Houten ligger, twee velden van 5 m.
+  { id: 5, x: 16000, z: 0 },
+  { id: 6, x: 21000, z: 0 },
+  { id: 7, x: 26000, z: 0 },
+  // Betonnen balk, één veld van 6 m.
+  { id: 8, x: 30000, z: 0 },
+  { id: 9, x: 36000, z: 0 },
+];
+// Expliciet materiaal/profiel: zonder deze velden viel de solver stil terug
+// op dezelfde defaults (HEA 160 / S235) maar met een console-warning per
+// staaf per berekening, en presenteerde het rapport een impliciete default
+// als bewuste profielkeuze.
+const DEFAULT_BEAMS: Beam[] = [
+  { id: 1, from: 1, to: 3, material: "S235", profile: "IPE270" },
+  { id: 2, from: 2, to: 4, material: "S235", profile: "IPE270" },
+  {
+    id: 3, from: 3, to: 4, material: "S235", profile: "IPE330",
+    // Fracties van de staaflengte, zelfde conventie als
+    // LateralBracing.top_flange_positions in de rekenkern: 0,25 / 0,50 / 0,75
+    // van 12 m is h.o.h. 3,0 m.
+    checkConfig: { lateralRestraints: [0.25, 0.5, 0.75] },
+  },
+  { id: 4, from: 5, to: 6, material: "GL24h", profile: "160x400" },
+  { id: 5, from: 6, to: 7, material: "GL24h", profile: "160x400" },
+  {
+    id: 6, from: 8, to: 9, material: "C30/37", profile: "300x600",
+    checkConfig: {
+      betonKorf: {
+        cover_mm: 20,
+        stirrup_diameter_mm: 8,
+        top: { count: 2, diameter_mm: 12 },
+        bottom: { count: 4, diameter_mm: 20 },
+        // Ø8–200, tweebenig. Zonder deze twee velden zijn A_sw/s in (6.8) en
+        // ρ_w in (9.4) onbepaald en blijven §6.2 en drie eisen uit §9.2.2
+        // ongetoetst — zie de afleiding hierboven.
+        stirrup_spacing_mm: 200,
+        stirrup_legs: 2,
+      },
+      betonMilieuklasse: "XC1",
+      // Zonder dit veld vult de betonbouwer B500B in — dezelfde staalsoort,
+      // maar dan als stille default. Hier staat hij expliciet omdat dit model
+      // ook een VOORBEELD is: wie het openslaat hoort te kunnen zien met welk
+      // wapeningsstaal gerekend is, zonder het uit de kern af te leiden.
+      betonStaalsoort: "B500B",
+    },
+  },
+];
+// DE OPLEGGINGEN, EN WAAROM PRECIES DEZE
+//
+// De namen zeggen niet vanzelf welke richting vrij is. In de solver
+// (`applySupportToMesh`, solver/engine.ts) zetten ze dit vast:
+//   pinned   x én z vast, rotatie vrij       (scharnier)
+//   fixed    x, z én rotatie vast            (inklemming)
+//   xRoller  ALLEEN x vast, z vrij           (rol die horizontaal steunt)
+//   zRoller  ALLEEN z vast, x vrij           (rol die verticaal steunt)
+// De naam noemt dus de richting die de oplegging VASTHOUDT, niet de richting
+// waarin de rol loopt. Onder een horizontale ligger hoort daarom `zRoller`.
+//
+// Portaal: twee scharnieren aan de voet — een tweescharnierportaal, één keer
+// statisch onbepaald, en de horizontale kracht moet daar juist wél worden
+// opgenomen.
+//
+// Houten en betonnen ligger: ÉÉN scharnier plus verder rollen. Twee
+// scharnieren onder een rechte ligger zouden hem axiaal inklemmen: elke
+// zakking wil de ligger verlengen, en dan ontstaat er een normaalkracht die er
+// in werkelijkheid niet is (en die bij temperatuurlast pas echt uit de hand
+// loopt). Eén scharnier houdt het geheel op zijn plaats, de rollen dragen
+// alleen verticaal — statisch juist, geen mechanisme en geen dwang.
+const DEFAULT_SUPPORTS: Support[] = [
+  { nodeId: 1, type: "pinned" },
+  { nodeId: 2, type: "pinned" },
+  { nodeId: 5, type: "pinned" },
+  { nodeId: 6, type: "zRoller" },
+  { nodeId: 7, type: "zRoller" },
+  { nodeId: 8, type: "pinned" },
+  { nodeId: 9, type: "zRoller" },
+];
+const DEFAULT_PLATES: Plate[] = [];
+// Geëxporteerd om dezelfde reden als `makeInitialSnapshot`: de belastinggevallen
+// horen bij het startmodel en de test heeft ze nodig om het door te rekenen.
+//
+// Het geval "Eigen gewicht" staat VOOROP en heeft id 5; de vier handmatige
+// gevallen houden id 1–4, zodat de lasten hieronder (caseId 1 en 2) en elke
+// test die "geval 1 = permanent" aanneemt blijven kloppen. Eén bron met
+// Bestand → Nieuw: `standaardBelastinggevallen` in lib/eigenGewicht (issue #42).
+export const DEFAULT_LOAD_CASES: LoadCase[] = standaardBelastinggevallen();
+/**
+ * Staat het eigen gewicht in het startmodel aan? Geëxporteerd om dezelfde
+ * reden als de gevallen: de test rekent het startmodel door zoals de app het
+ * opent, en dat is mét eigen gewicht.
+ */
+export const DEFAULT_SELF_WEIGHT_ENABLED: boolean = EIGEN_GEWICHT_STANDAARD_AAN;
+// Elke last draagt een `omschrijving`. Dat veld verandert geen enkel getal —
+// de solver leest het niet — maar zonder omschrijving zegt een regel
+// "q = −4,00 kN/m op staaf 4" in de lastentabel van het rapport niets over
+// waar die last vandaan komt. Het startmodel laat daarom meteen zien dat het
+// veld bestaat en waar het opduikt.
+//
+// De omschrijvingen noemen wat er op de ligger RUST (dak, vloer, afwerking) en
+// niet "eigen gewicht" van de ligger zelf: dat laatste staat sinds issue #42 in
+// het eigen geval "Eigen gewicht" en wordt automatisch gegenereerd. Een
+// omschrijving "eigen gewicht en vloerafwerking" zou dan suggereren dat het
+// liggergewicht twee keer is meegenomen. De getallen zijn ongewijzigd.
+const DEFAULT_LOADS: Load[] = [
+  // Stalen portaal: alleen permanent, op de bovenregel.
+  { id: 1, type: "lineLoad", caseId: 1, beamId: 3, q: -5 /* kN/m */,
+    omschrijving: "dakopbouw en dakbedekking" },
+  // Houten ligger: beide velden, permanent én veranderlijk.
+  { id: 2, type: "lineLoad", caseId: 1, beamId: 4, q: -4,
+    omschrijving: "vloeropbouw en afwerking" },
+  { id: 3, type: "lineLoad", caseId: 1, beamId: 5, q: -4,
+    omschrijving: "vloeropbouw en afwerking" },
+  { id: 4, type: "lineLoad", caseId: 2, beamId: 4, q: -2.5,
+    omschrijving: "veranderlijke belasting vloer" },
+  { id: 5, type: "lineLoad", caseId: 2, beamId: 5, q: -2.5,
+    omschrijving: "veranderlijke belasting vloer" },
+  // Betonnen balk.
+  { id: 6, type: "lineLoad", caseId: 1, beamId: 6, q: -15,
+    omschrijving: "vloeropbouw en afwerking" },
+  { id: 7, type: "lineLoad", caseId: 2, beamId: 6, q: -10,
+    omschrijving: "veranderlijke belasting vloer" },
+];
+
+/**
+ * De melding na "Ongedaan maken" van een vervanging bij het openen (Ctrl+Z op
+ * die stap, of de knop). Ongedaan maken zet een set terug die de gevallen en de
+ * gevolgklasse niet volgt; zonder melding viel dat niet op. Gemeten: oud
+ * CC3-bestand, G = 10 en Q = 5 kN/m op een ligger van 6 m — na ongedaan maken
+ * 87,75 kNm waar (1,3·10 + 1,65·5)·4,5 = 95,625 kNm hoort (NEN-EN 1990 NB tabel
+ * NB.5), stil. De controle zelf staat in `meldingenBelastinggevallen`; deze
+ * melding wijst ernaar.
+ */
+function meldVervangingOngedaan(aantal: number, opnieuw: string): void {
+  void import("../io/notify").then(({ notifyWarning }) =>
+    notifyWarning(
+      "Vervanging van de combinaties ongedaan gemaakt",
+      `De ${aantal} combinatie(s) uit het projectbestand staan terug, en het project rekent weer met ` +
+        "die set. De app past ze niet aan maar controleert ze: ontbreken er combinaties voor de " +
+        "belastinggevallen en de gevolgklasse van dit project, dan staat er een FOUT bij " +
+        `Belastinggevallen & combinaties en in het rapport. ${opnieuw}`,
+    ));
+}
+
+/**
+ * De melding dat het eigen gewicht is uitgezet omdat zijn geval verdween
+ * (issue #42, punt 6). Nooit stil: zonder melding zou het project verder
+ * rekenen zonder eigen gewicht terwijl niemand dat koos.
+ */
+function meldEigenGewichtUit(reden: EigenGewichtUitReden, naam: string): void {
+  void import("../io/notify").then(({ notifyWarning }) =>
+    notifyWarning(
+      i18next.t("common:eigenGewicht.uitgezetTitel"),
+      i18next.t(`common:eigenGewicht.uitgezet.${reden}`, { naam }),
+      { duur: 12000 },
+    ));
+}
+
+/** Een last hoort niet in het geval van het automatische eigen gewicht. */
+function meldGeenHandmatigeLast(naam: string): void {
+  void import("../io/notify").then(({ notifyWarning }) =>
+    notifyWarning(
+      i18next.t("common:eigenGewicht.geenHandmatigeLastTitel"),
+      i18next.t("common:eigenGewicht.geenHandmatigeLast", { naam }),
+    ));
+}
+
+/**
+ * Zet de modelref METEEN op de nieuwe stand, niet pas na de render. Het
+ * tekenvlak doet in één klik soms twee bewerkingen na elkaar: een knoop
+ * plaatsen (die een staaf kan splitsen) en daarna een staaf of oplegging op
+ * die knoop. Las de tweede bewerking de oude stand, dan schreef hij de
+ * splitsing weer weg: een kolom getekend tot op een ligger stond er los op
+ * (gevonden bij issue #55). Het effect in de hook zet na de render dezelfde
+ * waarden.
+ */
+function werkBij<T extends object>(ref: { current: T }, deel: Partial<T>): void {
+  ref.current = { ...ref.current, ...deel };
+}
+
+/**
+ * Snapshot zoals de undo-historie hem bewaart: het model PLUS het stramien.
+ * Het stramien zit bewust in de historie sinds een as-verplaatsing de knopen
+ * op die as meeneemt (zie `verplaatsStramienAs`): as en knopen horen dan bij
+ * elkaar en moeten met één Ctrl+Z samen terug. Het veld is optioneel zodat
+ * bestaande snapshot-constructies (en `Snapshot` zelf, dat het model-contract
+ * voor de solver/IO beschrijft) ongewijzigd blijven werken.
+ *
+ * `combinatieStap`: deze stap VERVANGT verouderde combinaties (bij het openen
+ * van een ouder projectbestand, zie lib/combinatieBeheer). Belastinggevallen en
+ * combinaties zitten verder niet in de historie, dus draagt deze stap zelf wat
+ * er terug moet: Ctrl+Z zet de lijst van ervoor terug (`herstelCombinaties`),
+ * Ctrl+Y vervangt opnieuw (`vervangVerouderdeCombinaties`).
+ *
+ * `eigenGewichtStap`: deze stap gaf het project een eigen geval "Eigen
+ * gewicht" (het aanbod van issue #42). Om dezelfde reden draagt hij zelf de
+ * staat van ervoor en erna: Ctrl+Z zet gevallen en combinaties terug, Ctrl+Y
+ * zet ze opnieuw. Eén stap, zoals het issue vraagt.
+ */
+type HistorieSnapshot = Snapshot & {
+  structuralGrid?: StructuralGrid;
+  combinatieStap?: CombinatieVervanging;
+  eigenGewichtStap?: { voor: CombinatieStaat; na: CombinatieStaat; actiefVoor: number };
+};
+
+/**
+ * Het startmodel zoals de app het opent. Geëxporteerd zodat de testbatterij
+ * hem kan nalopen zonder React te starten: dit model is de eerste indruk van
+ * de app én het model waarmee de multi-materiaalketen wordt uitgeprobeerd, en
+ * dan moet vaststaan dat het rekent, valideert en toetsbaar is. Zonder deze
+ * export zou een test het model moeten OVERSCHRIJVEN, en dan bewaakt hij een
+ * kopie in plaats van het echte startmodel.
+ */
+export function makeInitialSnapshot(): HistorieSnapshot {
+  return {
+    nodes: [...DEFAULT_NODES],
+    beams: [...DEFAULT_BEAMS],
+    supports: [...DEFAULT_SUPPORTS],
+    plates: [...DEFAULT_PLATES],
+    loads: [...DEFAULT_LOADS],
+    structuralGrid: DEFAULT_STRUCTURAL_GRID,
+  };
+}
+
+const HISTORY_LIMIT = 100;
+
+/** Tolerantie waarmee een knoop "op" een stramienas ligt (mm). */
+export const STRAMIEN_TOL_MM = 1;
+
+/**
+ * Knoop-ids die op een stramienas liggen.
+ *  - `as: "x"` → verticale stramienas: knopen met x ≈ `positieMm`.
+ *  - `as: "z"` → niveau (horizontale as): knopen met z ≈ `positieMm`.
+ * De tolerantie is standaard 1 mm; het model rekent in mm en assen worden op
+ * hele mm gezet, dus dat vangt afrondingsruis zonder buurknopen op te pikken.
+ */
+export function knopenOpStramienAs(
+  nodes: Pick<Node, "id" | "x" | "z">[],
+  as: "x" | "z",
+  positieMm: number,
+  tolMm: number = STRAMIEN_TOL_MM,
+): number[] {
+  return nodes
+    .filter(n => Math.abs((as === "x" ? n.x : n.z) - positieMm) <= tolMm)
+    .map(n => n.id);
+}
+
+/** Resultaat van `berekenStramienVerplaatsing`. */
+export interface StramienVerplaatsing {
+  /** Verplaatsing van de as zelf (mm), positief = naar +x resp. +z. */
+  delta: number;
+  /** Zelfde verplaatsing uitgesplitst voor `translateNodes`. */
+  dx: number;
+  dz: number;
+  /** Knopen die op de as liggen en dus meebewegen. */
+  nodeIds: number[];
+}
+
+/**
+ * Pure rekenkern achter het verslepen van een stramienas via de maatlijn.
+ *
+ * GEKOZEN GEDRAG — "lokale maat", niet "kettingmaat":
+ * alléén de as die bij de bewerkte maat hoort verschuift. Staat het stramien
+ * A-B-C en wijzig je de maat A-B, dan schuift B (plus alles wat OP B staat);
+ * C blijft op zijn absolute positie en de maat B-C verandert dus zichtbaar
+ * mee. Reden: de bewerking blijft lokaal en volledig zichtbaar — er verplaatst
+ * nooit een deel van het model dat je niet in beeld had. Bij de kettingvariant
+ * (C schuift mee) zou ook alles rechts van C verschuiven, inclusief knopen die
+ * NIET op een as liggen en dus achterblijven — precies de stille vervorming
+ * die deze functie moet voorkomen. Hetzelfde geldt één-op-één voor niveaus:
+ * alleen het bewerkte niveau schuift, hogere niveaus blijven staan.
+ *
+ * Knopen "verderop" (voorbij de verplaatste as) blijven staan, tenzij ze zelf
+ * exact op de verplaatste as liggen. Meerdere knopen op dezelfde as (een
+ * kolomlijn over meerdere verdiepingen) gaan allemaal mee.
+ */
+export function berekenStramienVerplaatsing(
+  nodes: Pick<Node, "id" | "x" | "z">[],
+  as: "x" | "z",
+  huidigePositie: number,
+  nieuwePositie: number,
+  tolMm: number = STRAMIEN_TOL_MM,
+): StramienVerplaatsing {
+  const delta = nieuwePositie - huidigePositie;
+  return {
+    delta,
+    dx: as === "x" ? delta : 0,
+    dz: as === "z" ? delta : 0,
+    nodeIds: knopenOpStramienAs(nodes, as, huidigePositie, tolMm),
+  };
+}
+
+/**
+ * Wat het splitsen aan toetsconfiguratie heeft gewist (zie `splitsCheckConfig`),
+ * als melding op het scherm. Niets te melden = geen toast.
+ */
+function meldSplitsing(meldingen: string[]): void {
+  // De toetsconfiguratie is projectdata; de mechanica-editie meldt haar aanpassing niet.
+  void meldingen;
+}
+
+/**
+ * Eén staaf die op een knoop in twee delen is gesplitst (issue #55): wat de
+ * gebruiker na verbinden, plaatsen of herstellen te horen krijgt.
+ */
+export interface Splitsing {
+  /** De oorspronkelijke staaf; hij bestaat na het splitsen niet meer. */
+  staafId: number;
+  /** De knoop waarop gesplitst is. */
+  knoopId: number;
+  /** De twee nieuwe delen: van de beginknoop naar de knoop, en verder. */
+  delen: [number, number];
+  /**
+   * Afstand (mm) van de knoop tot de as van de oorspronkelijke staaf. Niet
+   * nul: de twee delen maken op de knoop een knik. Ontbreekt = op de as.
+   */
+  afwijkingMm?: number;
+}
+
+/**
+ * "Knoop 3 verbonden met staaf 1: die is gesplitst in staaf 5 en staaf 6."
+ * Lag de knoop naast de staafas (afgerond minstens 0,1 mm), dan zegt een
+ * tweede zin hoe ver: daar zit nu een knik in de staaf (issue #55).
+ */
+export function splitsingRegel(s: Splitsing): VertaalbareTekst {
+  const basis = `Knoop ${s.knoopId} verbonden met staaf ${s.staafId}: die is gesplitst in staaf ${s.delen[0]} en staaf ${s.delen[1]}.`;
+  const waarden = { knoop: s.knoopId, staaf: s.staafId, deel1: s.delen[0], deel2: s.delen[1] };
+  const afwijking = Math.round((s.afwijkingMm ?? 0) * 10) / 10;
+  if (afwijking <= 0) return vt("common:canvas.modelCheck.splitLine", basis, waarden);
+  const mm = String(afwijking).replace(".", ",");
+  return vt("common:canvas.modelCheck.splitLineOffset",
+    `${basis} De knoop lag ${mm} mm naast de staafas; daar zit nu een knik.`,
+    { ...waarden, mm });
+}
+
+/** "Knoop 3 samengevoegd met knoop 2." */
+export function samenvoegRegel(bewaarId: number, verwijderId: number): VertaalbareTekst {
+  return vt("common:canvas.modelCheck.mergeLine",
+    `Knoop ${verwijderId} samengevoegd met knoop ${bewaarId}.`,
+    { verwijderd: verwijderId, bewaard: bewaarId });
+}
+
+/**
+ * Meld in de gekozen taal wat er gesplitst of samengevoegd is. Een regel is
+ * een vertaalbare tekst, of een (Nederlandse) melding over het hermappen van
+ * de toetsconfiguratie, direct onder zijn splitsing. Niets te melden = geen
+ * toast.
+ */
+function meldVerbonden(titel: string, regels: (VertaalbareTekst | string)[]): void {
+  if (regels.length === 0) return;
+  const t = (sleutel: string, waarden?: Record<string, string | number>) => i18next.t(sleutel, waarden);
+  const tekst = regels.map((r) => vertaalWaarde(t, r)).join("\n");
+  void import("../io/notify").then(({ notifyInfo }) => notifyInfo(titel, tekst));
+}
+
+/**
+ * Pure splitslogica voor `splitBeamAt` — losgetrokken uit de hook zodat hij
+ * unit-testbaar is (zie design-mockup/test-splitsen.mjs).
+ *
+ * Gedrag:
+ *  - Beide nieuwe staven erven materiaal + profiel van de oorspronkelijke staaf.
+ *  - Releases: de start-releases (startTx/startTz/startRy) gaan mee met deel 1
+ *    (startzijde), de eind-releases (endTx/endTz/endRy) met deel 2 (eindzijde).
+ *    De nieuwe tussenknoop is momentvast: geen releases aan de binnenzijden.
+ *  - Lijnlasten op de gesplitste staaf gaan over op beide delen: uniform →
+ *    zelfde q op beide delen; trapezium (qStart ≠ qEnd) → lineair
+ *    geïnterpoleerd op het splitspunt (deel 1: qStart→qMid, deel 2: qMid→qEnd).
+ *    Deellasten (startFrac/endFrac) worden HERMAPT naar de delen: het belaste
+ *    interval wordt met het splitspunt gesneden en per deel opnieuw als
+ *    fracties uitgedrukt; een deel zonder belast interval krijgt geen last.
+ *    Trapeziumwaarden worden daarbij op de snijgrens geïnterpoleerd over het
+ *    belaste interval.
+ *  - Temperatuurlasten (deltaT) worden op beide delen gedupliceerd.
+ *  - Knoopgebonden lasten (pointForce/pointMoment) verwijzen naar knopen, niet
+ *    naar staven, en blijven ongemoeid. Een eventueel toekomstig staafgebonden
+ *    lasttype dat hier niet bekend is wordt behoudend ongewijzigd gelaten.
+ *
+ * Retourneert null wanneer de staaf of zijn eindknopen niet bestaan.
+ *
+ * Met `tolMm` (de verbindingstolerantie, issue #55; het subknoop-gereedschap
+ * geeft hem mee) komt de nieuwe knoop op het voetpunt op de staafas, zodat de
+ * staaf recht blijft, en wordt er NIET gesplitst (null) wanneer dat voetpunt
+ * binnen de tolerantie van een uiteinde valt: daar staat al een knoop, en
+ * splitsen gaf een staaf van (vrijwel) lengte nul — zie `tussenpuntOpStaaf`.
+ * Zonder `tolMm`: splitsen op (x, z) zelf, zoals vóór issue #55 (bestaande
+ * aanroepers en tests, o.a. test-splitsen).
+ */
+export function computeBeamSplit(
+  cur: Pick<Snapshot, "nodes" | "beams" | "loads">,
+  beamId: number, x: number, z: number,
+  tolMm?: number,
+): { nodes: Node[]; beams: Beam[]; loads: Load[]; newNodeId: number; meldingen: string[] } | null {
+  const beam = cur.beams.find(b => b.id === beamId);
+  if (!beam) return null;
+  const nodeA = cur.nodes.find(n => n.id === beam.from);
+  const nodeB = cur.nodes.find(n => n.id === beam.to);
+  if (!nodeA || !nodeB) return null;
+  if (tolMm !== undefined) {
+    const p = tussenpuntOpStaaf(cur.nodes, beam, x, z, tolMm);
+    if (!p || p.eindknoop !== null) return null;
+    x = p.x;
+    z = p.z;
+  }
+
+  const newNodeId = cur.nodes.length === 0 ? 1 : Math.max(...cur.nodes.map(n => n.id)) + 1;
+  const nodes = [...cur.nodes, { id: newNodeId, x, z }];
+  const deel = computeBeamSplitOpKnoop(
+    { nodes, beams: cur.beams, loads: cur.loads }, beamId, newNodeId);
+  if (!deel) return null;
+  return { nodes, beams: deel.beams, loads: deel.loads, newNodeId, meldingen: deel.meldingen };
+}
+
+/**
+ * Splitsen op een BESTAANDE knoop — de rekenkern achter `computeBeamSplit` en
+ * achter de herstelactie "verbind knoop met staaf" uit de modelcontrole. De
+ * knoop moet al in `cur.nodes` staan en (vrijwel) op de staaf liggen; alle
+ * gedragsregels staan hierboven bij `computeBeamSplit`.
+ *
+ * Bewust losgetrokken zodat ÉÉN knoop MEERDERE staven kan splitsen (kruisende
+ * staven, of een kolomvoet op een doorgaande ligger die ook nog eens een
+ * plaatrand raakt): elke aanroep werkt op de uitkomst van de vorige, met
+ * dezelfde knoop-id — een lus over `computeBeamSplit` zou per staaf een nieuwe
+ * knoop op dezelfde plek maken, en dat is precies het gebrek dat we bestrijden.
+ *
+ * Retourneert null wanneer de staaf, de knoop of een eindknoop ontbreekt, of
+ * wanneer de knoop zélf al een uiteinde van de staaf is (splitsen zou dan een
+ * staaf met lengte nul opleveren).
+ *
+ * `delen` zijn de ids van de twee nieuwe staven (begin → knoop, knoop →
+ * eind), en `afwijkingMm` de afstand van de knoop tot de oorspronkelijke
+ * staafas (de knik die het splitsen maakt), voor de melding aan de
+ * gebruiker (issue #55).
+ */
+export function computeBeamSplitOpKnoop(
+  cur: Pick<Snapshot, "nodes" | "beams" | "loads">,
+  beamId: number, knoopId: number,
+): {
+  beams: Beam[]; loads: Load[]; meldingen: string[]; delen: [number, number]; afwijkingMm: number;
+} | null {
+  const beam = cur.beams.find(b => b.id === beamId);
+  if (!beam) return null;
+  const nodeA = cur.nodes.find(n => n.id === beam.from);
+  const nodeB = cur.nodes.find(n => n.id === beam.to);
+  const knoop = cur.nodes.find(n => n.id === knoopId);
+  if (!nodeA || !nodeB || !knoop) return null;
+  if (knoopId === beam.from || knoopId === beam.to) return null;
+  const newNodeId = knoopId;
+  const x = knoop.x, z = knoop.z;
+
+  // Relatieve positie van het splitspunt op de staaf (0 = start, 1 = eind) —
+  // nodig voor de interpolatie van trapeziumlasten.
+  const len = Math.hypot(nodeB.x - nodeA.x, nodeB.z - nodeA.z);
+  const t = len > 1e-9
+    ? Math.min(1, Math.max(0, Math.hypot(x - nodeA.x, z - nodeA.z) / len))
+    : 0.5;
+  // Afstand van de knoop tot de staafas (kruisproduct / lengte).
+  const afwijkingMm = len > 1e-9
+    ? Math.abs((x - nodeA.x) * (nodeB.z - nodeA.z) - (z - nodeA.z) * (nodeB.x - nodeA.x)) / len
+    : 0;
+
+  const maxBeamId = Math.max(...cur.beams.map(b => b.id));
+  const rel = beam.releases;
+  const startRel: BeamReleases | undefined =
+    rel && (rel.startTx || rel.startTz || rel.startRy)
+      ? { startTx: rel.startTx, startTz: rel.startTz, startRy: rel.startRy }
+      : undefined;
+  const endRel: BeamReleases | undefined =
+    rel && (rel.endTx || rel.endTz || rel.endRy)
+      ? { endTx: rel.endTx, endTz: rel.endTz, endRy: rel.endRy }
+      : undefined;
+  // Veren volgen dezelfde regel als de releases: de startveren met deel 1,
+  // de eindveren met deel 2; de tussenknoop is star.
+  const v = beam.veren;
+  const startVeren = v && ((v.startTx ?? 0) > 0 || (v.startTz ?? 0) > 0 || (v.startRy ?? 0) > 0)
+    ? { startTx: v.startTx, startTz: v.startTz, startRy: v.startRy }
+    : undefined;
+  const endVeren = v && ((v.endTx ?? 0) > 0 || (v.endTz ?? 0) > 0 || (v.endRy ?? 0) > 0)
+    ? { endTx: v.endTx, endTz: v.endTz, endRy: v.endRy }
+    : undefined;
+  // `...beam` neemt materiaal/profiel (en toekomstige velden) mee; id/from/to/
+  // releases/veren worden expliciet overschreven. De TOETSCONFIGURATIE gaat
+  // NIET letterlijk mee: kipsteunen staan als fractie van de staaflengte en
+  // betonzones in mm vanaf de beginknoop, en die horen per deel te worden
+  // hermapt — zie `splitsCheckConfig` (basisaudit nr 5).
+  const cfg1 = splitsCheckConfig(beam.checkConfig, t, len, 1, beamId);
+  const cfg2 = splitsCheckConfig(beam.checkConfig, t, len, 2, beamId);
+  const beam1: Beam = { ...beam, id: maxBeamId + 1, from: beam.from, to: newNodeId, releases: startRel, veren: startVeren };
+  const beam2: Beam = { ...beam, id: maxBeamId + 2, from: newNodeId, to: beam.to, releases: endRel, veren: endVeren };
+  // VERLOPEND PROFIEL. `...beam` heeft `profile` én `profileEnd` letterlijk
+  // naar beide delen gekopieerd; dat is voor élk ander veld goed maar hier
+  // fout: dan droegen beide helften het VOLLE verloop en zat er op de
+  // splitsplaats een sprong in de doorsnede die er niet is. Beide delen worden
+  // daarom zelf verlopend, met de geïnterpoleerde doorsnede op de splitsplaats
+  // als eind resp. begin (ontwerp 15-09-2026, §6). Omdat het verloop lineair
+  // is, is A(x) en I(x) van de twee delen samen exact die van de hele staaf —
+  // splitsen verandert geen enkel getal; zie test-verlopend-splitsen.mjs.
+  const tussen = splitsVerlopendProfiel(beam.material, beam.profile, beam.profileEnd, t);
+  if (tussen !== null) {
+    beam1.profileEnd = tussen;
+    beam2.profile = tussen;
+    beam2.profileEnd = beam.profileEnd;
+  }
+  if (cfg1.config) beam1.checkConfig = cfg1.config; else delete beam1.checkConfig;
+  if (cfg2.config) beam2.checkConfig = cfg2.config; else delete beam2.checkConfig;
+  const meldingen = [...cfg1.meldingen, ...cfg2.meldingen];
+  const beams = cur.beams.filter(b => b.id !== beamId).concat([beam1, beam2]);
+
+  let nextLoadId = cur.loads.length === 0 ? 1 : Math.max(...cur.loads.map(l => l.id)) + 1;
+  const loads: Load[] = [];
+  for (const l of cur.loads) {
+    if (l.beamId !== beamId) { loads.push(l); continue; }
+    if (l.type === "lineLoad") {
+      // Belast interval als fracties op de OORSPRONKELIJKE staaf.
+      const a = Math.min(1, Math.max(0, l.startFrac ?? 0));
+      const b = Math.min(1, Math.max(0, l.endFrac ?? 1));
+      const isTrapezium = l.qStart !== undefined && l.qEnd !== undefined && l.qStart !== l.qEnd;
+      // q op een fractie s van het BELASTE interval [a,b] (trapezium
+      // loopt lineair over het belaste deel, niet over de hele staaf).
+      const qAt = (s: number) => {
+        if (!isTrapezium) return undefined;
+        const rel = b > a ? (s - a) / (b - a) : 0;
+        return l.qStart! + rel * (l.qEnd! - l.qStart!);
+      };
+      // Deel 1 (0..t): belast interval [a, min(b,t)] → fracties /t.
+      if (a < t && t > 1e-12) {
+        const b1 = Math.min(b, t);
+        const full1 = a <= 0 && b1 >= t; // dekt deel 1 volledig
+        loads.push({
+          ...l, id: nextLoadId++, beamId: beam1.id,
+          ...(isTrapezium ? { qStart: l.qStart, qEnd: qAt(b1) } : {}),
+          startFrac: full1 ? undefined : a / t,
+          endFrac:   full1 ? undefined : b1 / t,
+        });
+      }
+      // Deel 2 (t..1): belast interval [max(a,t), b] → fracties −t, /(1−t).
+      if (b > t && 1 - t > 1e-12) {
+        const a2 = Math.max(a, t);
+        const full2 = a2 <= t && b >= 1; // dekt deel 2 volledig
+        loads.push({
+          ...l, id: nextLoadId++, beamId: beam2.id,
+          ...(isTrapezium ? { qStart: qAt(a2), qEnd: l.qEnd } : {}),
+          startFrac: full2 ? undefined : (a2 - t) / (1 - t),
+          endFrac:   full2 ? undefined : (b - t) / (1 - t),
+        });
+      }
+    } else if (l.type === "thermal") {
+      loads.push({ ...l, id: nextLoadId++, beamId: beam1.id });
+      loads.push({ ...l, id: nextLoadId++, beamId: beam2.id });
+    } else if (l.type === "pointForce" && l.posFrac !== undefined) {
+      // Staafgebonden puntlast (vrije positie): hij hoort bij het deel waarin
+      // zijn positie valt; de fractie wordt naar dat deel hermapt. Zelfde
+      // regels als de deellast-fracties hierboven.
+      const s = Math.min(1, Math.max(0, l.posFrac));
+      if (t > 1e-12 && s <= t) {
+        loads.push({ ...l, id: nextLoadId++, beamId: beam1.id, posFrac: s / t });
+      } else if (1 - t > 1e-12) {
+        loads.push({ ...l, id: nextLoadId++, beamId: beam2.id, posFrac: (s - t) / (1 - t) });
+      } else {
+        loads.push({ ...l, id: nextLoadId++, beamId: beam1.id, posFrac: 1 });
+      }
+    } else {
+      // Knoopgebonden of onbekend lasttype — ongewijzigd laten staan.
+      loads.push(l);
+    }
+  }
+  return { beams, loads, meldingen, delen: [beam1.id, beam2.id], afwijkingMm };
+}
+
+/**
+ * De toetsconfiguratie van één DEEL van een gesplitste staaf.
+ *
+ * Tot september 2026 ging `checkConfig` letterlijk naar beide delen. Voor de
+ * velden die een PLAATS op de staaf beschrijven is dat fout, en de kiptoets
+ * werd er stil gunstiger van (basisaudit nr 5: een regel van 12 m met
+ * kipsteunen op ¼, ½ en ¾ — L_st = 3000 mm, UC_kip 0,444 — kreeg na een
+ * splitsing op 6 m op élk deel drie steunen op de halve afstand: L_st =
+ * 1500 mm, UC_kip 0,371, zonder melding).
+ *
+ * Regels, met t = de splitsfractie op de oorspronkelijke staaf:
+ *  - Kipsteunen (boven- én onderflens, fracties 0..1 vanaf de beginknoop):
+ *    een steun op fractie f komt op deel 1 als f/t wanneer f ≤ t, en op deel 2
+ *    als (f − t)/(1 − t) wanneer f ≥ t. Een steun PRECIES op de splitsknoop
+ *    wordt fractie 1 van deel 1 én fractie 0 van deel 2: de toetsbouwer laat
+ *    de uiteinden weg (daar geldt de staafeind-aanname), maar de herkenning
+ *    van een doorgaande lijn leest eraan af dat de tussenknoop zijdelings
+ *    gesteund is.
+ *  - Betonzones (mm vanaf de beginknoop): geknipt op t·L en voor deel 2
+ *    verschoven; een zone die geheel buiten het deel valt vervalt. De kern
+ *    eist dat de zones de staaf precies bedekken, en dat blijft zo.
+ *  - Zeeg: GEWIST, met een melding. Een zeeg hoort bij een overspanning als
+ *    geheel; op twee losse delen zou de toetsing tweemaal de volle zeeg tegen
+ *    een deel van de zakking zetten.
+ *  - Kniklengtes, kipsteunafstand (hout), doorbuigingsklasse, klimaat- en
+ *    duurklasse, korf en de overige beton- en spanningsvelden: ongewijzigd.
+ *    Een OPGEGEVEN kniklengte is een absolute maat die de gebruiker voor de
+ *    hele staaf bedoelde; die blijft op beide delen staan. Een LEEG veld blijft
+ *    leeg — de toetsbouwer herkent de doorgaande lijn en toetst dan de hele
+ *    lijn als één staaf, niet het deel (basisaudit nr 29).
+ *
+ * Levert `config: undefined` wanneer er na het hermappen niets overblijft.
+ */
+export function splitsCheckConfig(
+  cfg: BeamCheckConfig | undefined,
+  t: number,
+  lengteMm: number,
+  deel: 1 | 2,
+  beamId: number,
+): { config: BeamCheckConfig | undefined; meldingen: string[] } {
+  if (!cfg) return { config: undefined, meldingen: [] };
+  const meldingen: string[] = [];
+  const uit: BeamCheckConfig = { ...cfg };
+  const eps = 1e-9;
+
+  const hermap = (fracties: number[] | undefined): number[] | undefined => {
+    if (!Array.isArray(fracties)) return undefined;
+    const res: number[] = [];
+    for (const f of fracties) {
+      if (!Number.isFinite(f)) continue;
+      if (deel === 1) {
+        if (f <= t + eps && t > eps) res.push(Math.min(1, Math.max(0, f / t)));
+      } else if (f >= t - eps && 1 - t > eps) {
+        res.push(Math.min(1, Math.max(0, (f - t) / (1 - t))));
+      }
+    }
+    // Afronden op 12 decimalen: (0,5 − 0,375)/(1 − 0,375) is in dubbele
+    // precisie niet exact 0,2, en de gebruiker hoort in het paneel 0,2 te zien.
+    return [...new Set(res.map((f) => Math.round(f * 1e12) / 1e12))].sort((a, b) => a - b);
+  };
+  if (cfg.lateralRestraints !== undefined) {
+    const r = hermap(cfg.lateralRestraints);
+    if (r && r.length > 0) uit.lateralRestraints = r; else delete uit.lateralRestraints;
+  }
+  if (cfg.lateralRestraintsBottom !== undefined) {
+    const r = hermap(cfg.lateralRestraintsBottom);
+    if (r && r.length > 0) uit.lateralRestraintsBottom = r; else delete uit.lateralRestraintsBottom;
+  }
+
+  if (cfg.betonZones) {
+    const xs = t * lengteMm;
+    const knip = <Z extends { x_start_mm: number; x_end_mm: number }>(zones: Z[] | undefined): Z[] => {
+      const res: Z[] = [];
+      for (const z of zones ?? []) {
+        if (deel === 1) {
+          if (z.x_start_mm < xs - eps) {
+            res.push({ ...z, x_end_mm: Math.min(z.x_end_mm, xs) });
+          }
+        } else if (z.x_end_mm > xs + eps) {
+          res.push({ ...z, x_start_mm: Math.max(z.x_start_mm, xs) - xs, x_end_mm: z.x_end_mm - xs });
+        }
+      }
+      return res;
+    };
+    uit.betonZones = {
+      longitudinal: knip(cfg.betonZones.longitudinal),
+      stirrups: knip(cfg.betonZones.stirrups),
+    };
+  }
+
+  if (cfg.preCamber_mm !== undefined) {
+    delete uit.preCamber_mm;
+    if (deel === 1 && cfg.preCamber_mm !== 0) {
+      meldingen.push(
+        `Zeeg van ${cfg.preCamber_mm} mm van staaf ${beamId} is bij het splitsen gewist: een ` +
+        "zeeg hoort bij de overspanning als geheel en niet bij een deel ervan. Geef hem " +
+        "opnieuw op bij het deel waaronder de toetsing de doorgaande lijn beschouwt.",
+      );
+    }
+  }
+
+  return { config: Object.keys(uit).length > 0 ? uit : undefined, meldingen };
+}
+
+/**
+ * Knoop plaatsen op (x, z) en meteen AANSLUITEN op alles waar hij op ligt.
+ *
+ * Dit is de bewerking achter "zet een steunpunt halverwege een ligger": ligt
+ * het punt in het inwendige van een of meer staven, dan worden die daar
+ * gesplitst in twee delen die materiaal, profiel, belastingtype en releases
+ * erven en hun lasten (inclusief deellast-fracties) meenemen — zie
+ * `computeBeamSplitOpKnoop`. Zonder dat splitsen zou de nieuwe knoop een los
+ * uiteinde zijn dat de staaf niet raakt: geometrisch goed, constructief een
+ * mechanisme, en de solver meldt alleen "singuliere matrix".
+ *
+ * Ligt er al een knoop binnen `tolMm` (`opZelfdePlek`), dan wordt de
+ * DICHTSTBIJZIJNDE daarvan hergebruikt (er komt nooit een tweede knoop op
+ * dezelfde plek, en de uitkomst hangt niet af van de volgorde van de knopen)
+ * en worden staven die er doorheen lopen alsnog op hem gesplitst.
+ *
+ * `tolMm` is de verbindingstolerantie (issue #55): de app geeft de instelling
+ * mee. Bestaande knopen verschuiven nooit. Een NIEUWE knoop die op precies
+ * één staaf valt, komt op het voetpunt op de staafas: zo blijft die staaf
+ * recht, ook als het punt bijvoorbeeld door ortho of een getypte lengte tot
+ * de volle tolerantie naast de as lag. Valt dat voetpunt op dezelfde plek als
+ * een bestaande knoop (bij een schuine staaf vlak bij zijn einde), dan wordt
+ * die knoop hergebruikt. Een hergebruikte knoop, of een nieuwe op een
+ * kruising van staven, splitst op zijn eigen plek; ligt die naast een
+ * staafas, dan zegt de melding hoeveel mm (`Splitsing.afwijkingMm`).
+ *
+ * `gewijzigd` is false wanneer er niets te doen viel — de aanroeper kan dan
+ * een history-push overslaan. `splitsingen` zegt welke staaf op welke knoop
+ * in welke delen is gesplitst, voor de melding.
+ */
+export function computeKnoopMetSplitsing(
+  cur: Pick<Snapshot, "nodes" | "beams" | "loads">,
+  x: number, z: number,
+  tolMm: number = CONTROLE_TOL_MM,
+): {
+  nodes: Node[]; beams: Beam[]; loads: Load[];
+  nodeId: number; gesplitsteStaven: number[]; gewijzigd: boolean;
+  splitsingen: Splitsing[];
+  /** Wat er bij het hermappen van de toetsconfiguratie is gewist (zie `splitsCheckConfig`). */
+  meldingen: string[];
+} {
+  /** De dichtstbijzijnde knoop op dezelfde plek als (px, pz), of undefined. */
+  const dichtstbij = (px: number, pz: number): Node | undefined => {
+    let best: { n: Node; d: number } | undefined;
+    for (const n of cur.nodes) {
+      if (!opZelfdePlek(n, { x: px, z: pz }, tolMm)) continue;
+      const d = Math.hypot(n.x - px, n.z - pz);
+      if (!best || d < best.d) best = { n, d };
+    }
+    return best?.n;
+  };
+  let bestaand = dichtstbij(x, z);
+  let nx = x, nz = z;
+  if (!bestaand) {
+    const onder = cur.beams.filter(b => puntOpStaaf(cur.nodes, b, x, z, tolMm) !== null);
+    if (onder.length === 1) {
+      const p = tussenpuntOpStaaf(cur.nodes, onder[0], x, z, tolMm);
+      if (p) {
+        nx = p.x;
+        nz = p.z;
+        bestaand = dichtstbij(nx, nz);
+      }
+    }
+  }
+  const nodeId = bestaand
+    ? bestaand.id
+    : (cur.nodes.length === 0 ? 1 : Math.max(...cur.nodes.map(n => n.id)) + 1);
+  // Bij hergebruik telt de positie van de BESTAANDE knoop, niet de klik: zo
+  // blijft de splitsing exact op de knoop liggen die we aansluiten.
+  const px = bestaand ? bestaand.x : nx;
+  const pz = bestaand ? bestaand.z : nz;
+  let nodes = bestaand ? cur.nodes : [...cur.nodes, { id: nodeId, x: px, z: pz }];
+  let beams = cur.beams;
+  let loads = cur.loads;
+
+  // Welke staven lopen door dit punt? Bepaald op de UITGANGSSITUATIE: de
+  // delen die tijdens het splitsen ontstaan hebben het punt als eindknoop en
+  // komen dus per definitie niet opnieuw in aanmerking.
+  const gesplitsteStaven: number[] = [];
+  const splitsingen: Splitsing[] = [];
+  const meldingen: string[] = [];
+  for (const b of cur.beams) {
+    if (b.from === nodeId || b.to === nodeId) continue;
+    if (puntOpStaaf(nodes, b, px, pz, tolMm) === null) continue;
+    const deel = computeBeamSplitOpKnoop({ nodes, beams, loads }, b.id, nodeId);
+    if (!deel) continue;
+    beams = deel.beams;
+    loads = deel.loads;
+    gesplitsteStaven.push(b.id);
+    splitsingen.push({ staafId: b.id, knoopId: nodeId, delen: deel.delen, afwijkingMm: deel.afwijkingMm });
+    meldingen.push(...deel.meldingen);
+  }
+  return {
+    nodes, beams, loads, nodeId, gesplitsteStaven, splitsingen,
+    gewijzigd: !bestaand || gesplitsteStaven.length > 0,
+    meldingen,
+  };
+}
+
+/**
+ * Twee knopen die op dezelfde plek liggen samenvoegen: `verwijderId` verdwijnt
+ * en alles wat naar hem verwees gaat over op `bewaarId`.
+ *
+ * Regels:
+ *  - Staven: elke verwijzing wordt omgezet. Een staaf die daardoor van en naar
+ *    dezelfde knoop loopt (lengte nul) verdwijnt, net als een staaf die een
+ *    al bestaande staaf zou dupliceren — twee identieke staven tellen hun
+ *    stijfheid dubbel mee.
+ *  - Opleggingen: de oplegging van `bewaarId` wint; had alleen `verwijderId`
+ *    er een, dan verhuist die. Nooit twee opleggingen op één knoop.
+ *  - Platen: hoekverwijzingen worden omgezet en direct opeenvolgende
+ *    duplicaten vallen weg. Houdt een plaat minder dan drie hoeken over, dan
+ *    is het geen plaat meer en verdwijnt hij.
+ *  - Lasten: knoopverwijzingen gaan over; lasten op een verdwenen staaf
+ *    verdwijnen mee (ze zouden anders naar een niet-bestaande staaf wijzen).
+ *
+ * Retourneert null bij gelijke of onbekende knopen.
+ */
+export function computeKnopenSamenvoegen(
+  cur: Pick<Snapshot, "nodes" | "beams" | "supports" | "plates" | "loads">,
+  bewaarId: number, verwijderId: number,
+): { nodes: Node[]; beams: Beam[]; supports: Support[]; plates: Plate[]; loads: Load[] } | null {
+  if (bewaarId === verwijderId) return null;
+  if (!cur.nodes.some(n => n.id === bewaarId)) return null;
+  if (!cur.nodes.some(n => n.id === verwijderId)) return null;
+
+  const nodes = cur.nodes.filter(n => n.id !== verwijderId);
+  const om = (id: number) => (id === verwijderId ? bewaarId : id);
+
+  const beams: Beam[] = [];
+  const verdwenenStaven = new Set<number>();
+  const gezien = new Set<string>();
+  for (const b of cur.beams) {
+    const from = om(b.from), to = om(b.to);
+    const sleutel = from < to ? `${from}-${to}` : `${to}-${from}`;
+    if (from === to || gezien.has(sleutel)) { verdwenenStaven.add(b.id); continue; }
+    gezien.add(sleutel);
+    beams.push({ ...b, from, to });
+  }
+
+  const behouden = cur.supports.find(s => s.nodeId === bewaarId);
+  const verhuizend = cur.supports.find(s => s.nodeId === verwijderId);
+  const supports: Support[] = cur.supports.filter(
+    s => s.nodeId !== bewaarId && s.nodeId !== verwijderId);
+  const winnaar = behouden ?? (verhuizend ? { ...verhuizend, nodeId: bewaarId } : undefined);
+  if (winnaar) supports.push(winnaar);
+
+  const plates: Plate[] = [];
+  for (const p of cur.plates) {
+    const hoeken: number[] = [];
+    for (const id of p.nodeIds) {
+      const nieuw = om(id);
+      if (hoeken.length > 0 && hoeken[hoeken.length - 1] === nieuw) continue;
+      hoeken.push(nieuw);
+    }
+    // Ook de naad tussen laatste en eerste hoek kan door de samenvoeging
+    // dubbel worden.
+    if (hoeken.length > 1 && hoeken[0] === hoeken[hoeken.length - 1]) hoeken.pop();
+    if (hoeken.length >= 3) plates.push({ ...p, nodeIds: hoeken });
+  }
+
+  const loads: Load[] = [];
+  for (const l of cur.loads) {
+    if (l.beamId !== undefined && verdwenenStaven.has(l.beamId)) continue;
+    loads.push(l.nodeId === verwijderId ? { ...l, nodeId: bewaarId } : l);
+  }
+  return { nodes, beams, supports, plates, loads };
+}
+
+/**
+ * Voer ALLE automatisch herstelbare bevindingen van de modelcontrole uit.
+ *
+ * Iteratief en niet in één veeg: elke bewerking verandert de staaf-ids
+ * (splitsen) of de knoop-ids (samenvoegen), waardoor een vooraf verzamelde
+ * lijst bevindingen na de eerste stap verouderd is. Daarom wordt na elke stap
+ * opnieuw gecontroleerd. De ronde-limiet is een vangnet tegen een bewerking
+ * die zijn eigen bevinding niet opheft; hij hoort nooit bereikt te worden.
+ *
+ * `tolMm` is de verbindingstolerantie (issue #55): de app geeft de instelling
+ * mee. Herstellen verschuift geen knoop: verbinden splitst de staaf op de
+ * knoop waar hij staat, samenvoegen houdt de plek van de blijvende knoop
+ * (welke dat is, staat bij `zoekDubbeleKnopen`: een plaathoek of oplegging
+ * gaat voor).
+ *
+ * `stappen` zijn de Nederlandse regels (ook voor tests en logboek); `regels`
+ * zijn dezelfde stappen voor de melding in de gekozen taal: per splitsing
+ * welke staaf op welke knoop in welke delen is gesplitst, en hoeveel mm de
+ * knoop naast de staafas lag (de knik).
+ *
+ * Retourneert null wanneer er niets te herstellen viel.
+ */
+export function computeModelHerstel(
+  cur: Pick<Snapshot, "nodes" | "beams" | "supports" | "plates" | "loads">,
+  tolMm: number = CONTROLE_TOL_MM,
+  maxRondes = 200,
+): {
+  nodes: Node[]; beams: Beam[]; supports: Support[]; plates: Plate[]; loads: Load[];
+  stappen: string[]; regels: (VertaalbareTekst | string)[];
+} | null {
+  let staat = {
+    nodes: cur.nodes, beams: cur.beams, supports: cur.supports,
+    plates: cur.plates, loads: cur.loads,
+  };
+  const regels: (VertaalbareTekst | string)[] = [];
+  for (let ronde = 0; ronde < maxRondes; ronde++) {
+    const bevinding = controleerModel(staat, tolMm).find(b => b.herstel);
+    if (!bevinding?.herstel) break;
+    const h = bevinding.herstel;
+    if (h.soort === "verbind") {
+      const deel = computeBeamSplitOpKnoop(staat, h.beamId, h.nodeId);
+      if (!deel) break;
+      staat = { ...staat, beams: deel.beams, loads: deel.loads };
+      regels.push(splitsingRegel({
+        staafId: h.beamId, knoopId: h.nodeId, delen: deel.delen, afwijkingMm: deel.afwijkingMm,
+      }));
+      regels.push(...deel.meldingen);
+    } else {
+      const r = computeKnopenSamenvoegen(staat, h.bewaarId, h.verwijderId);
+      if (!r) break;
+      staat = r;
+      regels.push(samenvoegRegel(h.bewaarId, h.verwijderId));
+    }
+  }
+  const stappen = regels.map(nederlands);
+  return regels.length > 0 ? { ...staat, stappen, regels } : null;
+}
+
+// ── Pure transformatielogica ───────────────────────────────────────────────
+// Losgetrokken uit de hook zodat hij unit-testbaar is (zie
+// design-mockup/test-transform.mjs), naar het voorbeeld van computeBeamSplit.
+
+/**
+ * Verzamel alle knoop-ids die een Selection raakt: geselecteerde knopen +
+ * eindknopen van geselecteerde staven + hoekknopen van geselecteerde platen.
+ * Een gedeelde knoop (bv. de gezamenlijke knoop van twee geselecteerde staven)
+ * zit er precies één keer in (Set), zodat een transformatie hem nooit dubbel
+ * toepast. Een lastselectie of lege selectie levert een lege set.
+ */
+export function collectSelectionNodeIds(
+  cur: Pick<Snapshot, "beams" | "plates">,
+  sel: Selection,
+): Set<number> {
+  const ids = new Set<number>();
+  if (!sel) return ids;
+  if (sel.type === "node") {
+    ids.add(sel.id);
+  } else if (sel.type === "beam") {
+    const b = cur.beams.find(bb => bb.id === sel.id);
+    if (b) { ids.add(b.from); ids.add(b.to); }
+  } else if (sel.type === "plate") {
+    const p = cur.plates.find(pp => pp.id === sel.id);
+    if (p) p.nodeIds.forEach(id => ids.add(id));
+  } else if (sel.type === "multi") {
+    sel.nodeIds.forEach(id => ids.add(id));
+    for (const bid of sel.beamIds) {
+      const b = cur.beams.find(bb => bb.id === bid);
+      if (b) { ids.add(b.from); ids.add(b.to); }
+    }
+    for (const pid of sel.plateIds) {
+      const p = cur.plates.find(pp => pp.id === pid);
+      if (p) p.nodeIds.forEach(id => ids.add(id));
+    }
+  }
+  return ids;
+}
+
+/**
+ * Openingen zijn coördinaten en geen knopen; ze reizen mee met hun plaat
+ * wanneer ÁLLE hoekknopen van die plaat worden getransformeerd (dan
+ * verhuist de plaat als geheel). Verplaatst de gebruiker maar één hoek, dan
+ * vervormt de plaat en blijven de openingen staan; ligt een opening daarna
+ * buiten de omtrek, dan meldt de modelcontrole dat en weigert de engine.
+ * Bewust géén afronding hier: `f` rondt zelf waar de knopen ook afgerond
+ * worden (roteren, spiegelen), zodat opening en hoek dezelfde regel volgen.
+ */
+export function transformeerPlaatOpeningen(
+  plates: Plate[], bewogenKnopen: Set<number>,
+  f: (p: { x: number; z: number }) => { x: number; z: number },
+): Plate[] {
+  return plates.map(p => {
+    if (!p.openingen || p.openingen.length === 0) return p;
+    if (!p.nodeIds.every(id => bewogenKnopen.has(id))) return p;
+    return { ...p, openingen: p.openingen.map(o => ({ ...o, punten: o.punten.map(f) })) };
+  });
+}
+
+/**
+ * Verplaats de selectie over (dx, dz). Retourneert null wanneer de selectie
+ * geen knopen raakt (lege selectie / lastselectie) — de aanroeper toont dan
+ * feedback in plaats van stilzwijgend niets te doen.
+ */
+export function computeSelectionTranslate(
+  cur: Pick<Snapshot, "nodes" | "beams" | "plates">,
+  sel: Selection, dx: number, dz: number,
+): { nodes: Node[]; plates: Plate[] } | null {
+  const ids = collectSelectionNodeIds(cur, sel);
+  if (ids.size === 0) return null;
+  const nodes = cur.nodes.map(n =>
+    ids.has(n.id) ? { ...n, x: n.x + dx, z: n.z + dz } : n);
+  const plates = transformeerPlaatOpeningen(cur.plates, ids, p => ({ x: p.x + dx, z: p.z + dz }));
+  return { nodes, plates };
+}
+
+/**
+ * Roteer de selectie om (cx, cz) met `angleRad` (positief = van +x naar +z).
+ * Coördinaten worden op hele mm afgerond, consistent met de bestaande
+ * enkelvoudige flow en het mm-integer-model. Null wanneer de selectie geen
+ * knopen raakt.
+ */
+export function computeSelectionRotate(
+  cur: Pick<Snapshot, "nodes" | "beams" | "plates">,
+  sel: Selection, cx: number, cz: number, angleRad: number,
+): { nodes: Node[]; plates: Plate[] } | null {
+  const ids = collectSelectionNodeIds(cur, sel);
+  if (ids.size === 0) return null;
+  const cs = Math.cos(angleRad), sn = Math.sin(angleRad);
+  const roteer = (p: { x: number; z: number }) => {
+    const rx = p.x - cx, rz = p.z - cz;
+    return { x: Math.round(cx + rx * cs - rz * sn), z: Math.round(cz + rx * sn + rz * cs) };
+  };
+  const nodes = cur.nodes.map(n => ids.has(n.id) ? { ...n, ...roteer(n) } : n);
+  const plates = transformeerPlaatOpeningen(cur.plates, ids, roteer);
+  return { nodes, plates };
+}
+
+/**
+ * Spiegel de selectie om de lijn door (x1,z1)-(x2,z2). Coördinaten op hele mm
+ * (zie computeSelectionRotate). Null wanneer de selectie geen knopen raakt of
+ * de spiegelas gedegenereerd is (lengte ~0).
+ */
+export function computeSelectionMirror(
+  cur: Pick<Snapshot, "nodes" | "beams" | "plates">,
+  sel: Selection, x1: number, z1: number, x2: number, z2: number,
+): { nodes: Node[]; plates: Plate[] } | null {
+  const ids = collectSelectionNodeIds(cur, sel);
+  if (ids.size === 0) return null;
+  const dx = x2 - x1, dz = z2 - z1;
+  const denom = dx * dx + dz * dz;
+  if (denom < 1e-6) return null;
+  const spiegel = (p: { x: number; z: number }) => {
+    const t = ((p.x - x1) * dx + (p.z - z1) * dz) / denom;
+    const fx = x1 + t * dx, fz = z1 + t * dz;
+    return { x: Math.round(2 * fx - p.x), z: Math.round(2 * fz - p.z) };
+  };
+  const nodes = cur.nodes.map(n => ids.has(n.id) ? { ...n, ...spiegel(n) } : n);
+  // Spiegelen keert de omloopzin van een opening om; dat mag (beide
+  // windingsrichtingen zijn toegestaan, zoals bij de plaatomtrek).
+  const plates = transformeerPlaatOpeningen(cur.plates, ids, spiegel);
+  return { nodes, plates };
+}
+
+/**
+ * Volwaardige kopie van de selectie op offset (dx, dz).
+ *
+ * Regels:
+ *  - Knopen krijgen nieuwe id's; `...n`-spread behoudt eventuele extra velden.
+ *  - Staven behouden ALLE velden — materiaal/profiel/releases/checkConfig én
+ *    toekomstige velden via spread; from/to worden herbonden aan de nieuwe
+ *    knoop-id's. (Geneste objecten worden per referentie gedeeld, conform de
+ *    immutable-update-conventie van de store: patches vervangen subobjecten.)
+ *  - Platen krijgen nieuwe id's met herbonden hoekknopen.
+ *  - Opleggingen op gekopieerde knopen gaan mee naar de nieuwe knoop-id's.
+ *  - Staafgebonden lasten (lineLoad/thermal) gaan mee naar de nieuwe staaf-id
+ *    in HETZELFDE belastinggeval; knoopgebonden lasten (pointForce/pointMoment)
+ *    naar de nieuwe knoop-id.
+ *
+ * Retourneert null wanneer de selectie niets kopieerbaars bevat. De functie
+ * muteert `cur` niet — de aanroepende mutatie pusht het resultaat als één
+ * history-snapshot, zodat één Ctrl+Z de hele kopie ongedaan maakt.
+ * `cur` is de bron op het moment van kopiëren; `into` is het huidige doelmodel
+ * bij plakken. Daardoor blijft Ctrl+V werken als het origineel intussen is
+ * verwijderd, en krijgen alle gekopieerde onderdelen vrije doel-id's.
+ */
+export function computeSelectionCopy(
+  cur: Snapshot,
+  sel: Selection, dx: number, dz: number,
+  into: Snapshot = cur,
+): {
+  nodes: Node[]; beams: Beam[]; supports: Support[]; plates: Plate[]; loads: Load[];
+  nodeIdMap: Map<number, number>; beamIdMap: Map<number, number>;
+} | null {
+  const copyNodeIds = collectSelectionNodeIds(cur, sel);
+  if (copyNodeIds.size === 0) return null;
+  const copyBeamIds = new Set<number>();
+  const copyPlateIds = new Set<number>();
+  if (sel && sel.type === "beam") copyBeamIds.add(sel.id);
+  else if (sel && sel.type === "plate") copyPlateIds.add(sel.id);
+  else if (sel && sel.type === "multi") {
+    sel.beamIds.forEach(id => copyBeamIds.add(id));
+    sel.plateIds.forEach(id => copyPlateIds.add(id));
+  }
+
+  let nextNodeId  = into.nodes.length  === 0 ? 1 : Math.max(...into.nodes.map(n => n.id)) + 1;
+  let nextBeamId  = into.beams.length  === 0 ? 1 : Math.max(...into.beams.map(b => b.id)) + 1;
+  let nextPlateId = into.plates.length === 0 ? 1 : Math.max(...into.plates.map(p => p.id)) + 1;
+  let nextLoadId  = into.loads.length  === 0 ? 1 : Math.max(...into.loads.map(l => l.id)) + 1;
+
+  // Knopen — itereren over cur.nodes (niet over de Set) zodat kopieën in
+  // modelvolgorde ontstaan en dangling ids in de selectie stil vervallen.
+  const nodeIdMap = new Map<number, number>();
+  const newNodes: Node[] = [];
+  for (const n of cur.nodes) {
+    if (!copyNodeIds.has(n.id)) continue;
+    const clone: Node = { ...n, id: nextNodeId++, x: n.x + dx, z: n.z + dz };
+    nodeIdMap.set(n.id, clone.id);
+    newNodes.push(clone);
+  }
+
+  const beamIdMap = new Map<number, number>();
+  const newBeams: Beam[] = [];
+  for (const b of cur.beams) {
+    if (!copyBeamIds.has(b.id)) continue;
+    const from = nodeIdMap.get(b.from), to = nodeIdMap.get(b.to);
+    if (from === undefined || to === undefined) continue; // eindknoop ontbreekt
+    const clone: Beam = { ...b, id: nextBeamId++, from, to };
+    beamIdMap.set(b.id, clone.id);
+    newBeams.push(clone);
+  }
+
+  const plateIdMap = new Map<number, number>();
+  const newPlates: Plate[] = [];
+  for (const p of cur.plates) {
+    if (!copyPlateIds.has(p.id)) continue;
+    const mapped = p.nodeIds.map(id => nodeIdMap.get(id));
+    if (mapped.some(id => id === undefined)) continue;
+    // Openingen zijn coördinaten: verschuiven met dezelfde offset als de
+    // hoekknopen, anders zou de kopie een gat op de plek van het origineel
+    // hebben. De meshcache blijft geldig: de handtekening is
+    // positie-afhankelijk, dus het canvas regenereert hem voor de kopie.
+    const clone: Plate = {
+      ...p, id: nextPlateId++, nodeIds: mapped as number[],
+      ...(p.openingen && p.openingen.length > 0
+        ? { openingen: p.openingen.map(o => ({ ...o, punten: o.punten.map(q => ({ x: q.x + dx, z: q.z + dz })) })) }
+        : {}),
+    };
+    plateIdMap.set(p.id, clone.id);
+    newPlates.push(clone);
+  }
+
+  const newSupports: Support[] = [];
+  for (const s of cur.supports) {
+    const mapped = nodeIdMap.get(s.nodeId);
+    if (mapped !== undefined) newSupports.push({ ...s, nodeId: mapped });
+  }
+
+  const newLoads: Load[] = [];
+  for (const l of cur.loads) {
+    if (l.beamId !== undefined && beamIdMap.has(l.beamId)) {
+      newLoads.push({ ...l, id: nextLoadId++, beamId: beamIdMap.get(l.beamId)! });
+    } else if (l.nodeId !== undefined && nodeIdMap.has(l.nodeId)) {
+      newLoads.push({ ...l, id: nextLoadId++, nodeId: nodeIdMap.get(l.nodeId)! });
+    } else if (l.plateId !== undefined && plateIdMap.has(l.plateId)) {
+      // Plaatlast (randlast, of puntlast op een plaatrand) volgt zijn
+      // gekopieerde plaat; het randadres en de fracties blijven gelijk.
+      newLoads.push({ ...l, id: nextLoadId++, plateId: plateIdMap.get(l.plateId)! });
+    }
+  }
+
+  return {
+    nodes: [...into.nodes, ...newNodes],
+    beams: [...into.beams, ...newBeams],
+    supports: [...into.supports, ...newSupports],
+    plates: [...into.plates, ...newPlates],
+    loads: [...into.loads, ...newLoads],
+    nodeIdMap, beamIdMap,
+  };
+}
+
+// ── Lasten kopiëren tussen belastinggevallen ─────────────────────────────
+//
+// Werkwijze in de UI: selecteer één last, kies in het contextmenu "selecteer
+// alle <soort> in dit belastinggeval", Ctrl+C, wissel van belastinggeval,
+// Ctrl+V. De drie stappen hieronder zijn puur (geen React) zodat de
+// testbatterij ze rechtstreeks kan naspelen.
+
+/**
+ * De id's van alle lasten van DEZELFDE SOORT in HETZELFDE belastinggeval als
+ * de last `lastId`, in modelvolgorde. "Soort" is het lasttype (lijnlast,
+ * puntlast, moment, temperatuur, randlast) — niet de richting of de waarde:
+ * wie "alle lijnlasten" vraagt bedoelt ook de horizontale.
+ *
+ * Bestaat `lastId` niet, dan is het resultaat leeg (de aanroeper meldt dat).
+ * De referentielast zelf zit altijd in het resultaat.
+ */
+export function selecteerLastenVanZelfdeSoort(
+  loads: Load[], lastId: number,
+): number[] {
+  const ref = loads.find(l => l.id === lastId);
+  if (!ref) return [];
+  return loads
+    .filter(l => l.type === ref.type && l.caseId === ref.caseId)
+    .map(l => l.id);
+}
+
+/**
+ * Vergelijkingssleutel van een last, ZONDER id, belastinggeval en herkomst.
+ * Twee lasten met dezelfde sleutel zijn inhoudelijk identiek: zelfde soort,
+ * zelfde aangrijpingspunt, zelfde waarden. Wordt gebruikt om bij het plakken
+ * te herkennen dat een last er al staat.
+ *
+ * De sleutel loopt over de GESORTEERDE eigen sleutels van het object, zodat
+ * de volgorde waarin velden zijn gezet niet meetelt en toekomstige velden
+ * automatisch meedoen.
+ */
+function lastSignatuur(l: Omit<Load, "id">): string {
+  // `omschrijving` telt bewust NIET mee. De signatuur bewaakt één ding: dat
+  // een tweede plakactie de belasting niet stilzwijgend verdubbelt. Twee
+  // lasten met dezelfde q op dezelfde staaf verdubbelen die belasting ook
+  // als de een "sneeuw" heet en de ander "sneeuw op overstek" — de naam is
+  // documentatie, geen mechanisch verschil. Zou hij meetellen, dan glipt een
+  // dubbele last er langs zodra iemand hem hernoemt.
+  const overslaan = new Set(["id", "caseId", "gegenereerdDoor", "omschrijving"]);
+  const paren = Object.keys(l)
+    .filter(k => !overslaan.has(k))
+    .filter(k => (l as Record<string, unknown>)[k] !== undefined)
+    .sort()
+    .map(k => `${k}=${JSON.stringify((l as Record<string, unknown>)[k])}`);
+  return paren.join("|");
+}
+
+/**
+ * De GEOMETRISCHE identiteit van het aangrijpingspunt van een klembordlast.
+ *
+ * Waarom dit bestaat (basisaudit ruw 31): id's worden uitgedeeld als
+ * `Math.max(bestaande) + 1`. Verwijder de staaf met het hoogste nummer en
+ * teken een nieuwe, dan krijgt die hetzelfde nummer. Een last die op het
+ * klembord staat voor de OUDE staaf 6 landde daarna zonder één woord op de
+ * NIEUWE staaf 6 — in de meting een q van −15 en −10 kN/m van een betonbalk op
+ * een stalen staaf, geteld als "geplakt", met "verweesd = 0".
+ *
+ * De vingerafdruk is de plaats: de twee eindknopen van de staaf, de
+ * coördinaten van de knoop, of de hoeken van de plaat. Dat is precies wat een
+ * gebruiker "dezelfde staaf" noemt. Verschuift de staaf tussen kopiëren en
+ * plakken, dan is het óók een ander aangrijpingspunt en hoort de last niet
+ * blind mee te verhuizen.
+ */
+export interface Lastherkomst {
+  /** "staaf" | "knoop" | "plaat" — waar de last aan hing. */
+  soort: "staaf" | "knoop" | "plaat";
+  /** Het id ten tijde van het kopiëren; alleen voor de melding. */
+  id: number;
+  /** De coördinaten die de plek vastleggen, afgerond op 1/1000 mm. */
+  punten: number[];
+}
+
+/** Een last op het canvasklembord: de last zelf plus zijn herkomst. */
+export type KlembordLast = Omit<Load, "id"> & { herkomst?: Lastherkomst };
+
+/** Afronden op 1/1000 mm: de tekentolerantie is 1 mm, dit is ruim daaronder. */
+const rond = (v: number) => Math.round(v * 1000) / 1000;
+
+/** De vingerafdruk van het aangrijpingspunt van `last` in `model`, of `undefined`. */
+export function lastHerkomst(
+  last: Pick<Load, "beamId" | "nodeId" | "plateId">,
+  model: Pick<Snapshot, "nodes" | "beams" | "plates">,
+): Lastherkomst | undefined {
+  const knoop = (id: number) => model.nodes.find((n) => n.id === id);
+  if (last.beamId !== undefined) {
+    const b = model.beams.find((x) => x.id === last.beamId);
+    const a = b && knoop(b.from);
+    const c = b && knoop(b.to);
+    if (!a || !c) return undefined;
+    return { soort: "staaf", id: last.beamId, punten: [a.x, a.z, c.x, c.z].map(rond) };
+  }
+  if (last.nodeId !== undefined) {
+    const n = knoop(last.nodeId);
+    if (!n) return undefined;
+    return { soort: "knoop", id: last.nodeId, punten: [n.x, n.z].map(rond) };
+  }
+  if (last.plateId !== undefined) {
+    const p = model.plates.find((x) => x.id === last.plateId);
+    if (!p) return undefined;
+    const hoeken = p.nodeIds.map(knoop);
+    if (hoeken.some((h) => h === undefined)) return undefined;
+    return {
+      soort: "plaat", id: last.plateId,
+      punten: (hoeken as { x: number; z: number }[]).flatMap((h) => [rond(h.x), rond(h.z)]),
+    };
+  }
+  return undefined;
+}
+
+/** Ligt het aangrijpingspunt nog op dezelfde plek als bij het kopiëren? */
+function herkomstKlopt(
+  herkomst: Lastherkomst,
+  last: Pick<Load, "beamId" | "nodeId" | "plateId">,
+  model: Pick<Snapshot, "nodes" | "beams" | "plates">,
+): boolean {
+  const nu = lastHerkomst(last, model);
+  if (!nu || nu.soort !== herkomst.soort) return false;
+  if (nu.punten.length !== herkomst.punten.length) return false;
+  return nu.punten.every((v, i) => v === herkomst.punten[i]);
+}
+
+/**
+ * Neem de geselecteerde lasten mee naar het klembord: de volledige lasten
+ * ZONDER id (die wordt bij het plakken opnieuw uitgedeeld) en zonder
+ * generatorherkomst.
+ *
+ * Waarom `gegenereerdDoor` eraf gaat: een windlast is eigendom van de
+ * windgenerator en wordt bij een volgende generatie vervangen. Een met de
+ * hand geplakte kopie hoort daar niet meer bij — die is handwerk en moet
+ * blijven staan. Zie `vervangGegenereerdeBelasting`.
+ *
+ * Waarom `omschrijving` er WEL op blijft: je kopieert lasten juist om
+ * "sneeuw op overstek" ook in het volgende belastinggeval te hebben staan.
+ * De naam achterlaten zou de kopie naamloos maken en het rapport onleesbaar
+ * — precies het tegenovergestelde van waarvoor het veld bestaat.
+ */
+export function kopieerLastenNaarKlembord(
+  loads: Load[], ids: number[],
+  /**
+   * Het model waaruit gekopieerd wordt. OPTIONEEL zodat bestaande aanroepers
+   * blijven werken; zonder dit argument draagt de klembordlast geen herkomst
+   * en gedraagt het plakken zich als voorheen.
+   */
+  model?: Pick<Snapshot, "nodes" | "beams" | "plates">,
+): KlembordLast[] {
+  const gewild = new Set(ids);
+  return loads
+    .filter(l => gewild.has(l.id))
+    .map(l => {
+      const { id: _id, gegenereerdDoor: _bron, ...rest } = l;
+      void _id; void _bron;
+      const herkomst = model ? lastHerkomst(l, model) : undefined;
+      return { ...rest, ...(herkomst ? { herkomst } : {}) } as KlembordLast;
+    });
+}
+
+/**
+ * Plak de klembordlasten in belastinggeval `doelCaseId`.
+ *
+ * Drie uitkomsten per last, alle drie geteld zodat de UI ze kan melden:
+ *  - GEPLAKT      — toegevoegd met een nieuw id en het doel-belastinggeval;
+ *  - OVERGESLAGEN — er stond al een inhoudelijk identieke last in dat geval
+ *    (zelfde soort, zelfde aangrijpingspunt, zelfde waarden). Zo verdubbelt
+ *    een tweede Ctrl+V in hetzelfde geval de belasting niet stilzwijgend;
+ *  - VERWEESD     — de staaf, knoop of plaat waar de last aan hing bestaat
+ *    niet meer (tussen kopiëren en plakken verwijderd), OF hij bestaat wel
+ *    maar het is een ANDER onderdeel met hetzelfde nummer. Dat laatste is geen
+ *    gezochte randgeval: id's lopen als `Math.max + 1`, dus het nummer van een
+ *    verwijderde staaf wordt aan de eerstvolgende nieuwe staaf gegeven en de
+ *    klembordlast landde daar stilzwijgend op (basisaudit ruw 31). De
+ *    klembordlast draagt daarom de PLAATS van zijn aangrijpingspunt mee (zie
+ *    `lastHerkomst`); klopt die niet meer, dan wordt de last niet geplakt.
+ *
+ * Nieuwe id's lopen door op het hoogste bestaande id; de bestaande lasten
+ * blijven ongemoeid. De aanroepende mutatie pusht het resultaat als één
+ * history-snapshot, dus één Ctrl+Z maakt de hele plakactie ongedaan.
+ */
+export function computeLastenPlakken(
+  cur: Pick<Snapshot, "loads" | "beams" | "nodes" | "plates">,
+  klembord: KlembordLast[],
+  doelCaseId: number,
+): {
+  loads: Load[]; geplakt: number; overgeslagen: number; verweesd: number;
+  /**
+   * Hoeveel van de verweesde lasten een onderdeel met hetzelfde nummer VONDEN
+   * dat op een andere plaats ligt. Aparte telling, want de melding luidt
+   * anders: niet "bestaat niet meer" maar "is niet meer dezelfde".
+   */
+  verplaatst: number;
+} {
+  const beamIds = new Set(cur.beams.map(b => b.id));
+  const nodeIds = new Set(cur.nodes.map(n => n.id));
+  const plateIds = new Set(cur.plates.map(p => p.id));
+  // Signaturen van wat er al in het DOELgeval staat — inclusief de lasten die
+  // we in deze plakactie zelf toevoegen, zodat een klembord met twee gelijke
+  // lasten er ook maar één oplevert.
+  const aanwezig = new Set(
+    cur.loads.filter(l => l.caseId === doelCaseId).map(l => lastSignatuur(l)));
+
+  let volgendId = cur.loads.length === 0
+    ? 1 : Math.max(...cur.loads.map(l => l.id)) + 1;
+  const nieuw: Load[] = [];
+  let overgeslagen = 0, verweesd = 0, verplaatst = 0;
+
+  for (const bron of klembord) {
+    const doelBestaat =
+      bron.beamId !== undefined  ? beamIds.has(bron.beamId)  :
+      bron.nodeId !== undefined  ? nodeIds.has(bron.nodeId)  :
+      bron.plateId !== undefined ? plateIds.has(bron.plateId) :
+      false;
+    if (!doelBestaat) { verweesd++; continue; }
+    // Het nummer bestaat — maar is het nog hetzelfde onderdeel? Draagt de
+    // klembordlast een herkomst (elke kopie sinds september 2026), dan moet de
+    // plaats kloppen. Zonder herkomst blijft het gedrag als voorheen, zodat
+    // een oude aanroeper niet stil anders gaat werken.
+    const { herkomst, ...zonderHerkomst } = bron;
+    if (herkomst && !herkomstKlopt(herkomst, bron, cur)) {
+      verweesd++; verplaatst++; continue;
+    }
+    const kandidaat: Omit<Load, "id"> = { ...zonderHerkomst, caseId: doelCaseId };
+    const sig = lastSignatuur(kandidaat);
+    if (aanwezig.has(sig)) { overgeslagen++; continue; }
+    aanwezig.add(sig);
+    nieuw.push({ ...kandidaat, id: volgendId++ });
+  }
+
+  return {
+    loads: nieuw.length > 0 ? [...cur.loads, ...nieuw] : cur.loads,
+    geplakt: nieuw.length,
+    overgeslagen,
+    verweesd,
+    verplaatst,
+  };
+}
+
+/**
+ * Wat de rekengang over de veldsgewijze plaatsing teruggeeft (issue #219):
+ * de varianten, de deelgevallen als belastinggevallen en eventuele meldingen.
+ */
+export interface VeldpatroonOutputs {
+  combinaties: LoadCombination[];
+  gevallen: LoadCase[];
+  meldingen: string[];
+  /** De invoer met de deelgevallen, voor de P-Δ-toets per variant (issue #199 met #219). */
+  input?: import("../components/fem/solver/types").MultiInput;
+}
+
+export interface FemStore {
+  // Model
+  nodes: Node[];
+  beams: Beam[];
+  supports: Support[];
+  plates: Plate[];
+  loads: Load[];
+  loadCases: LoadCase[];
+  activeLoadCaseId: number;
+
+  // Combinations / envelope (step 2d/2e)
+  /**
+   * De VOLLEDIGE combinatielijst zoals hij in het projectbestand staat en in
+   * de combinatie-editor bewerkt wordt. Wat er werkelijk doorgerekend wordt
+   * staat in `actieveCombinaties` — zie daar.
+   */
+  combinations: LoadCombination[];
+  /**
+   * De combinaties die dit model werkelijk nodig heeft (afgeleid uit
+   * `combinations` + het model). Bij een zuivere staalconstructie zonder
+   * vloer- of dakeis (alleen verticale staven) vallen de ongewijzigde
+   * standaardcombinaties 6.15 en 6.16 hier af; zie
+   * lib/combinatieSelectie.ts. Alles wat rekent, toetst of resultaten toont
+   * gebruikt DEZE lijst — opslaan en bewerken gebruikt `combinations`.
+   */
+  actieveCombinaties: LoadCombination[];
+  /** De volledige combinatielijst in dezelfde ontvouwing als `actieveCombinaties` (rapport). */
+  combinatiesVoorRapport: LoadCombination[];
+  /** Wat er is weggelaten en waarom. Leeg = de volledige lijst wordt gebruikt. */
+  overgeslagenCombinaties: OvergeslagenCombinatie[];
+  /**
+   * Gevolgklasse van het project. Bepaalt de partiële factoren van de
+   * standaardcombinaties (NB tabel NB.4/NB.5); App.tsx zet hem vanuit de
+   * projectgegevens. Zie `setGevolgklasse`.
+   */
+  gevolgklasse: Gevolgklasse;
+  /**
+   * De nationale bijlage waarmee de standaardcombinaties WERKELIJK rekenen
+   * (normnaad): γ en ψ komen uit haar rij. Volgt `nationaleBijlage` uit de
+   * projectgegevens zodra die een gevulde bijlage noemt; een onbekende code
+   * laat haar staan (de kernen weigeren die dan zelf).
+   */
+  combinatieBijlage: NationaleBijlageCode;
+  /**
+   * Belastinggevallen die niet (volledig) in de doorgerekende combinaties
+   * meetellen, en eigen gewicht zonder blijvend geval. Afgeleid, nooit
+   * opgeslagen; projectboom, combinatievenster en rapport tonen deze lijst.
+   */
+  belastingMeldingen: GevalMelding[];
+  /**
+   * De eindstijfheid van hout (NEN-EN 1995-1-1 2.3.2.2): of er
+   * eindtoestandvarianten zijn, en met welke k_def per houtstaaf. De rekengang
+   * lost daarmee de eindtoestand op; de meldingen staan ook in
+   * `belastingMeldingen`.
+   */
+  eindstijfheid: EindstijfheidUitkomst;
+  /**
+   * Wat er bij het OPENEN van het project verder te melden was — weggehaalde
+   * wees-factoren, een blijvend geval met vreemde factoren in een eigen
+   * combinatie — of null.
+   */
+  combinatieAfwijking: CombinatieAfwijking | null;
+  /**
+   * Wat er bij het openen is VERVANGEN (de standaardset van versie 0.3.11 en
+   * ouder, standaardcombinaties van een andere klasse, verouderde
+   * windgeneratorcombinaties), met de lijst van ervoor; null als er niets is
+   * vervangen of als het ongedaan is gemaakt.
+   */
+  combinatieVervanging: CombinatieVervanging | null;
+  /**
+   * De tekst voor het rapport en het projectbestand: van de vervanging in deze
+   * sessie, of uit het bestand (een eerdere sessie vervangen en opgeslagen).
+   * null = bij dit project nooit vervangen.
+   */
+  combinatieVervangingTekst: string | null;
+  /**
+   * Tellers voor nieuwe id's; lopen nooit terug en reizen mee in het
+   * projectbestand, zodat een verwijderd id nooit terugkomt.
+   */
+  idTellers: { belastinggeval: number; combinatie: number };
+  /** Selected combination for canvas display; null = show active LC or envelope. */
+  activeCombinationId: number | null;
+  /** When true, canvas shows envelope view instead of a single result. */
+  envelopeView: boolean;
+  /** Per-case solver outputs from the last "Toetsen uitvoeren" run. */
+  multiLcResult: Map<number, SolverResult> | null;
+  /** Combined SolverResult per combination id. */
+  combinationResults: Map<number, SolverResult> | null;
+  /** Envelope across all combinations. */
+  envelope: Envelope | null;
+  /**
+   * De kritieke lastfactor α_cr per UGT-combinatie van de laatste rekengang
+   * (`solver/alphaCr.ts`, basisaudit nr 27); null = niet gerekend. Gaat met
+   * de andere uitkomsten mee en wordt met hen gewist.
+   */
+  stabiliteit: AlphaCrUitkomst[] | null;
+
+  // UI
+  selection: Selection;
+
+  // Setters (snapshot-aware)
+  setSelection: (s: Selection) => void;
+  setActiveLoadCaseId: (id: number) => void;
+  setActiveCombinationId: (id: number | null) => void;
+  setEnvelopeView: (v: boolean) => void;
+  setSolverOutputs: (m: {
+    stabiliteit?: AlphaCrUitkomst[];
+    perCase: Map<number, SolverResult>;
+    combinationResults: Map<number, SolverResult>;
+    envelope: Envelope;
+    veldpatronen?: VeldpatroonOutputs | null;
+  } | null) => void;
+  /**
+   * De veldpatroonvarianten van de laatste (lineaire) rekengang (issue #219,
+   * solver/veldpatronen.ts); null = geen veranderlijk vloergeval over meer
+   * velden, of geen uitkomsten.
+   */
+  veldpatronen: VeldpatroonOutputs | null;
+  /**
+   * De combinaties waarmee de laatste rekengang WERKELIJK rekende:
+   * `actieveCombinaties` met de veldpatroonvarianten elk direct achter hun
+   * basis. Alles wat uitkomsten toont of toetst, zoekt hierin op id.
+   */
+  rekenCombinaties: LoadCombination[];
+  /**
+   * `loadCases` plus de deelgevallen per veld (zelfde type en categorie als
+   * hun geval), voor de toetsbouwers (belastingduur, ψ).
+   */
+  rekenBelastinggevallen: LoadCase[];
+
+  // Mutations (each pushes a history snapshot)
+  addNode: (x: number, z: number) => number;          // returns new node id
+  updateNode: (id: number, x: number, z: number) => void;
+  addBeam: (fromId: number, toId: number) => number | null;
+  updateBeam: (id: number, updates: Partial<Beam>) => void;
+  /**
+   * Dezelfde wijziging op meerdere staven, in ÉÉN history-stap en één
+   * herberekening. Een lus over `updateBeam` zou per staaf een undo-stap en
+   * een solverrun opleveren — zie ook `vervangGegenereerdeBelasting`.
+   */
+  updateBeams: (ids: number[], updates: Partial<Beam>) => void;
+  /**
+   * Voeg een plaat toe (rechthoek óf polygoon, P4.2) en geef het nieuwe id
+   * terug. Voor een polygonplaat levert het canvas de zojuist gegenereerde
+   * CDT-meshcache direct mee, zodat plaat + mesh in één history-snapshot
+   * landen (geen halve modellen bij undo).
+   */
+  addPlate: (nodeIds: number[], meshCache?: PlaatMeshCache) => number;
+  updatePlate: (id: number, updates: Partial<Plate>) => void;
+  /**
+   * Vervang de CDT-meshcache van een polygonplaat (P4.2) — ZONDER
+   * history-snapshot: de cache is afgeleide data van geometrie + meshSize,
+   * geen bewerkstap. Undo/redo herstelt platen inclusief hun cache via de
+   * gewone snapshots; het canvas regenereert wanneer de signatuur niet klopt.
+   */
+  setPlateMeshCache: (id: number, cache: PlaatMeshCache | undefined) => void;
+  addSupport: (nodeId: number, type: SupportType, k?: number) => void;
+  removeSupport: (nodeId: number) => void;
+  addLoad: (l: Omit<Load, "id">) => void;
+  updateLoad: (id: number, updates: Partial<Load>) => void;
+  // Verwijderen op id (tabel-editor) — zelfde cascade-regels als
+  // deleteSelected, maar zonder dat het element geselecteerd hoeft te zijn.
+  removeNode: (id: number) => void;
+  removeBeam: (id: number) => void;
+  removeLoad: (id: number) => void;
+  removePlate: (id: number) => void;
+  deleteSelected: () => void;
+  /**
+   * Subknoop: splits `beamId` op een nieuwe knoop bij (x, z). Met `tolMm` (de
+   * verbindingstolerantie, issue #55) op het voetpunt op de staafas, en niet
+   * binnen de tolerantie van een uiteinde — zie `computeBeamSplit`.
+   */
+  splitBeamAt: (beamId: number, x: number, z: number, tolMm?: number) => void;
+  /**
+   * Knoop plaatsen op (x, z) en meteen aansluiten op elke staaf waar hij
+   * middenop ligt (die staaf wordt daar gesplitst) — zie
+   * `computeKnoopMetSplitsing`. Retourneert het knoop-id, ook wanneer een
+   * bestaande knoop is hergebruikt. Eén history-stap voor knoop + splitsingen.
+   * `tolMm` is de verbindingstolerantie (issue #55; standaard
+   * `CONTROLE_TOL_MM`). Is er gesplitst, dan meldt de app welke staaf op
+   * welke knoop in welke delen.
+   */
+  addNodeMetSplitsing: (x: number, z: number, tolMm?: number) => number;
+  /**
+   * Herstelactie uit de modelcontrole: splits `beamId` op de bestaande knoop
+   * `nodeId`, zodat een knoop die alleen maar ÓP een staaf lag er ook echt aan
+   * vastzit, en meld welke delen er zijn ontstaan. Retourneert false wanneer
+   * dat niet kan.
+   */
+  verbindKnoopMetStaaf: (nodeId: number, beamId: number) => boolean;
+  /**
+   * Herstelactie uit de modelcontrole: voeg twee samenvallende knopen samen —
+   * `verwijderId` verdwijnt, alles verhuist naar `bewaarId`.
+   */
+  voegKnopenSamen: (bewaarId: number, verwijderId: number) => boolean;
+  /**
+   * Voer alle automatisch herstelbare bevindingen van de modelcontrole uit in
+   * ÉÉN history-stap, en meld de stappen (welke staaf op welke knoop is
+   * gesplitst, welke knopen zijn samengevoegd). `tolMm` is de
+   * verbindingstolerantie (issue #55). Retourneert de uitgevoerde stappen in
+   * het Nederlands (leeg = niets te doen).
+   */
+  herstelModel: (tolMm?: number) => string[];
+  // Transformaties — multi-selectie-bewust. Retourneren `false` wanneer de
+  // selectie niets transformeerbaars bevat (lege selectie / lastselectie),
+  // zodat de aanroeper feedback kan tonen in plaats van een stille no-op.
+  translateSelection: (sel: Selection, dx: number, dz: number) => boolean;
+  copySelection: (sel: Selection, dx: number, dz: number, source?: Snapshot) => boolean;
+  rotateSelection: (sel: Selection, cx: number, cz: number, angleRad: number) => boolean;
+  mirrorSelection: (sel: Selection, x1: number, z1: number, x2: number, z2: number) => boolean;
+  /**
+   * Plak klembordlasten in een belastinggeval — één history-snapshot, dus
+   * één Ctrl+Z maakt de hele plakactie ongedaan. Retourneert de telling
+   * (geplakt / al aanwezig / doel verdwenen) plus de naam van het
+   * belastinggeval, zodat de aanroeper precies kan melden wat er gebeurd is.
+   * Zie `computeLastenPlakken` voor de regels.
+   */
+  plakLasten: (klembord: KlembordLast[], doelCaseId: number) => {
+    geplakt: number; overgeslagen: number; verweesd: number;
+    /** Daarvan: een onderdeel met hetzelfde nummer, maar op een andere plaats. */
+    verplaatst: number;
+    gevalNaam: string;
+  };
+  /**
+   * Nieuw belastinggeval met een id van de teller. Zonder type wordt het
+   * "other": de app raadt geen type, en `belastingMeldingen` meldt het geval
+   * tot de gebruiker kiest. Met een type vullen de standaardcombinaties het
+   * meteen aan.
+   */
+  addLoadCase: (name: string, type?: LoadCase["type"]) => void;
+  /**
+   * Het aanbod van issue #42: eigen geval "Eigen gewicht" toevoegen en het
+   * eigen gewicht daarheen verplaatsen, als één undo-stap. Geeft het id van
+   * het nieuwe geval, of null als er niets te verplaatsen viel.
+   */
+  verplaatsEigenGewicht: () => number | null;
+  /**
+   * Zorg dat deze gevallen bestaan (hergebruik op naam en type, het
+   * gekenmerkte eigen-gewichtgeval op zijn kenmerk) en geef hun id's in
+   * dezelfde volgorde. Voor generatoren die een heel model maken, zoals de
+   * wizard "Stalen hal". Zie `zorgVoorBelastinggevallen` in combinatieBeheer.
+   */
+  zorgVoorBelastinggevallen: (gevallen: readonly Pick<LoadCase, "name" | "type" | "eigenGewicht">[]) => number[];
+
+  /**
+   * Vervang in ÉÉN stap alles wat een generator (vandaag: de windbelasting-
+   * generator) eerder heeft aangemaakt: de gegenereerde belastinggevallen, de
+   * gegenereerde lasten en de gegenereerde combinaties. Handmatig ingevoerde
+   * gevallen, lasten en combinaties blijven onaangeroerd.
+   *
+   * Eén aanroep = één history-snapshot (dus één keer Ctrl+Z), en één enkele
+   * `loads`-identiteitswissel, zodat de live-rekencyclus in App.tsx precies
+   * één keer opnieuw rekent in plaats van per last.
+   *
+   * `combinatieHoortBijGeneratie` bepaalt welke bestaande combinaties worden
+   * opgeruimd; de aanroeper levert dat criterium, zodat deze store niets van
+   * de windmodule hoeft te weten.
+   */
+  vervangGegenereerdeBelasting: (p: {
+    gevallen: LoadCase[];
+    lasten: Omit<Load, "id">[];
+    combinaties: Omit<LoadCombination, "id">[];
+    gevalHoortBijGeneratie: (c: LoadCase) => boolean;
+    lastHoortBijGeneratie: (l: Load) => boolean;
+    combinatieHoortBijGeneratie: (c: LoadCombination) => boolean;
+  }) => void;
+
+  /** Bulk translate a set of nodes by (dx, dz) — used by drag-to-move / G-grab. */
+  translateNodes: (nodeIds: number[], dx: number, dz: number) => void;
+
+  /** Structural grid (stramien) — defaults are 2×2 letters/numbers for the default portal. */
+  structuralGrid: StructuralGrid;
+  setStructuralGrid: (g: StructuralGrid | ((prev: StructuralGrid) => StructuralGrid)) => void;
+  /**
+   * Verplaats een stramienas én de knopen die erop liggen, als één undo-stap.
+   * Retourneert het aantal meegeschoven knopen (null = as onbekend of delta 0).
+   */
+  verplaatsStramienAs: (as: "x" | "z", axisId: string, nieuwePositie: number) => number | null;
+
+  /**
+   * Gevallen, combinaties en id-tellers uit een API-document overnemen, met de
+   * 2D-lasten, het actieve geval en het eigen gewicht die erbij horen. De
+   * API-commando's (src/api/commands/project.ts) rekenen ze uit met dezelfde
+   * lib/combinatieBeheer als de mutatoren hieronder; dit zet de uitkomst in
+   * de store langs dezelfde `pasCombiStaatToe`.
+   */
+  zetGevallenUitDocument: (p: {
+    loadCases: LoadCase[];
+    combinations: LoadCombination[];
+    idTellers?: { belastinggeval: number; combinatie: number };
+    loads: Load[];
+    activeLoadCaseId: number;
+    selfWeightEnabled: boolean;
+  }) => void;
+
+  /** Solver options. */
+  selfWeightEnabled: boolean;
+  setSelfWeightEnabled: (v: boolean) => void;
+  /**
+   * Analysetype: eerste orde, geometrisch tweede orde (het oude
+   * `nonlinearEnabled = true`) of geometrisch én fysisch tweede orde.
+   * Zie `Analysetype` in femTypes.
+   */
+  analysetype: Analysetype;
+  setAnalysetype: (v: Analysetype) => void;
+  axialMaterialLoadPath: number[];
+  setAxialMaterialLoadPath: (v: number[]) => void;
+  /**
+   * Gewenste segmentlengte in mm voor de fysisch niet-lineaire berekening —
+   * besluit B3: instelbaar, 400 mm als beginwaarde, geen automatische
+   * vergroving. Alleen van invloed bij `analysetype = tweedeOrdeFysisch`.
+   */
+  betonSegmentLengteMm: number;
+  setBetonSegmentLengteMm: (v: number) => void;
+  /**
+   * De eindwaarde van de kruipcoëfficiënt φ(∞,t₀) van het PROJECT, art. 3.1.4.
+   * `null` = niet opgegeven, en dat is iets anders dan 0 ("geen kruip").
+   *
+   * Een OPGEGEVEN waarde. Het §5.8-blok van een staaf gaat vóór deze
+   * projectwaarde, en deze projectwaarde gaat vóór de berekening volgens
+   * bijlage B (`betonKruipInvoer`).
+   *
+   * Zonder waarde en zonder bijlage-B-invoer rekent de fysisch niet-lineaire
+   * lus met φ_ef = 0 en meldt de kern dat luid; de zakking is dan te klein (de
+   * onveilige kant).
+   */
+  betonKruipcoefficient: number | null;
+  setBetonKruipcoefficient: (v: number | null) => void;
+  /**
+   * De projectinvoer om φ(∞,t₀) volgens bijlage B te laten BEREKENEN: de
+   * relatieve vochtigheid, de ouderdom t₀ bij belasten en de cementklasse. h₀
+   * volgt per staaf uit diens doorsnede. `null` = bijlage B staat uit.
+   */
+  betonKruipInvoer: KruipInvoerProject | null;
+  setBetonKruipInvoer: (v: KruipInvoerProject | null) => void;
+  /**
+   * De versie van de rekeninstellingen (combinaties, belastinggevaltypen,
+   * eigen gewicht, analysetype, segmentlengte, alle scheefstandvelden en de
+   * gevolgklasse) — zie `lib/rekenInstellingen.ts`. Beide invalidatie-effecten
+   * (hier en in App.tsx) lezen DEZE waarde, zodat een nieuw veld niet in één
+   * van de twee vergeten kan worden.
+   */
+  rekenInstellingenVersie: string;
+  /**
+   * De nationale bijlage van het project, zoals hij aan deze store is
+   * meegegeven. Staat hier zodat de toetsing en het rapport hem uit dezelfde
+   * plek halen als de rekeninstellingen; `null` = niet ingesteld.
+   */
+  nationaleBijlage: string | null;
+  /**
+   * Scheefstand (initiële imperfectie, EN 1993-1-1 §5.3.2-aanpak): elke
+   * verticale last krijgt een horizontale metgezel H = φ·V. φ = 1/noemer
+   * (default 1/200); richting +1 = +x, −1 = −x. De motor past alleen toe —
+   * zie ScheefstandInput in solver/types.ts.
+   */
+  scheefstandEnabled: boolean;
+  setScheefstandEnabled: (v: boolean) => void;
+  /** Noemer x in φ = 1/x (default 200). */
+  scheefstandNoemer: number;
+  setScheefstandNoemer: (v: number) => void;
+  /** Richting van de equivalente horizontale krachten: +1 = +x, −1 = −x. */
+  scheefstandRichting: 1 | -1;
+  setScheefstandRichting: (v: 1 | -1) => void;
+  /**
+   * Waar φ vandaan komt: de vaste noemer hierboven, of de normformule van
+   * EN 1993-1-1 (5.5), EN 1992-1-1 (5.1) of EN 1995-1-1 (5.1) — zie
+   * `lib/scheefstandNorm.ts`.
+   *
+   * BEGINSTAND `"vast"`, en dat is geen smaakkwestie. α_h en α_m zijn allebei
+   * ≤ 1, dus de norm maakt de scheefstand ALTIJD kleiner dan de basiswaarde.
+   * Zou een bestaand projectbestand hier stilzwijgend op een norm uitkomen,
+   * dan rekende het na een update ineens met tot ruim de helft minder
+   * scheefstand — kleinere kolomvoetmomenten en een gunstiger toets, zonder
+   * dat iemand daarom heeft gevraagd. De normberekening is daarom een keuze
+   * die de gebruiker zelf aanzet.
+   */
+  scheefstandBron: ScheefstandBron;
+  setScheefstandBron: (v: ScheefstandBron) => void;
+  /**
+   * Handmatige hoogte h in m voor α_h; `null` = de uit het model afgeleide
+   * waarde (`leidScheefstandGeometrieAf`). Alleen van invloed als
+   * `scheefstandBron` een norm is.
+   */
+  scheefstandHoogteM: number | null;
+  setScheefstandHoogteM: (v: number | null) => void;
+  /**
+   * Handmatig aantal dragende verticale elementen m voor α_m; `null` = de
+   * afgeleide waarde. Verlagen mag altijd: kleinere m geeft grotere α_m en
+   * dus grotere φ — de veilige kant.
+   */
+  scheefstandAantalElementen: number | null;
+  setScheefstandAantalElementen: (v: number | null) => void;
+  /**
+   * Alleen 3D (issue #212): handmatige m_X en m_Y per richting (EN 1993-1-1
+   * 5.3.2(3)); `null` = `scheefstandAantalElementen`, en anders de afgeleide m
+   * van die richting.
+   */
+  scheefstandAantalX: number | null;
+  setScheefstandAantalX: (v: number | null) => void;
+  scheefstandAantalY: number | null;
+  setScheefstandAantalY: (v: number | null) => void;
+  /**
+   * Alleen 3D (issue #212): de torsievarianten van EN 1993-1-1 5.3.2(10)
+   * (figuur 5.5) erbij. Standaard uit: ze verdubbelen de P-Δ-sommen van de toets.
+   */
+  scheefstandTorsie: boolean;
+  setScheefstandTorsie: (v: boolean) => void;
+  /**
+   * Alleen 3D (issue #199, fase 3): de eigen scheefstand per losse kolom (een
+   * kolomlijn met een vrije kop) in de UGT-toets. Standaard uit.
+   */
+  scheefstandEigenKolom: boolean;
+  setScheefstandEigenKolom: (v: boolean) => void;
+  /**
+   * 2D (issue #199, fase 4): hout in de UGT-toets volgens NEN-EN 1995-1-1:
+   * E_d = E_mean/γ_M, de boogimperfectie e = 0,0025·l en de systeemlengte bij
+   * een staand vrij eind. Standaard uit.
+   */
+  houtToetsEN1995: boolean;
+  setHoutToetsEN1995: (v: boolean) => void;
+  /** Canvas view mode: false = model-only (no loads drawn), true = LC active loads visible. */
+  showLoads: boolean;
+  setShowLoads: (v: boolean) => void;
+  /** When set, the matching field in LoadProperties auto-focuses + selects. */
+  pendingLoadFocus: { loadId: number; field: keyof Load } | null;
+  setPendingLoadFocus: (v: { loadId: number; field: keyof Load } | null) => void;
+
+  // History
+  canUndo: boolean;
+  canRedo: boolean;
+  undo: () => void;
+  redo: () => void;
+
+  // ── Load case + combination management ────────────────────────────────
+  /** Wijzig naam, type of categorie; de standaardcombinaties volgen. */
+  updateLoadCase: (id: number, patch: Partial<Omit<LoadCase, "id">>) => void;
+  /** Verwijder het geval, zijn lasten en zijn factor uit ELKE combinatie. */
+  removeLoadCase: (id: number) => void;
+  addCombination: (combo: Omit<LoadCombination, "id">) => void;
+  /** Elke wijziging maakt van een standaardcombinatie een eigen combinatie. */
+  updateCombination: (id: number, patch: Partial<Omit<LoadCombination, "id">>) => void;
+  removeCombination: (id: number) => void;
+  /** Andere gevolgklasse: de standaardcombinaties krijgen de factoren van NB.4/NB.5. */
+  setGevolgklasse: (gevolgklasse: Gevolgklasse) => void;
+  /** Vervang alle combinaties (behalve die van de windgenerator) door de standaardset. */
+  vervangDoorStandaardCombinaties: () => void;
+  /** Sluit de melding van `combinatieAfwijking` zonder iets te veranderen. */
+  sluitCombinatieAfwijking: () => void;
+  /**
+   * "Behoud eigen factoren" (issue #196): de huidige factoren van alle eigen
+   * combinaties gelden als bewust gekozen (`bevestigEigenFactoren`). De
+   * berekening verandert niet; de FOUT over die factoren vervalt zolang ze
+   * niet veranderen, en de melding bij het openen gaat dicht.
+   */
+  bevestigEigenFactoren: () => void;
+  /** De bevestiging van alle eigen factoren intrekken (`trekBevestigingIn`). */
+  trekBevestigingEigenFactorenIn: () => void;
+  /**
+   * Maak de vervanging bij het openen ongedaan: de combinaties uit het bestand
+   * terug, precies zoals ze waren. Werkt ook als er na het openen al andere
+   * bewerkingen zijn gedaan.
+   */
+  maakCombinatieVervangingOngedaan: () => void;
+
+  /** Replace all model state from a deserialized project file. */
+  loadProjectState: (p: {
+    nodes: Node[]; beams: Beam[]; supports: Support[]; plates: Plate[]; loads: Load[];
+    loadCases: LoadCase[]; activeLoadCaseId: number;
+    selfWeightEnabled?: boolean;
+    /**
+     * OUD veld. Bestanden van vóór het analysetype dragen alleen deze
+     * booleaan; hij blijft leidend zolang `analysetype` ontbreekt.
+     */
+    nonlinearEnabled?: boolean;
+    /** v2: analysetype; ontbreekt → afgeleid uit `nonlinearEnabled`. */
+    analysetype?: string;
+    axialMaterialLoadPath?: number[];
+    /** v2: gewenste segmentlengte in mm; ontbreekt → 400 (besluit B3). */
+    betonSegmentLengteMm?: number;
+    /** φ(∞,t₀) van het project (art. 3.1.4); ontbreekt → niet opgegeven. */
+    betonKruipcoefficient?: number | null;
+    /** Invoer voor φ(∞,t₀) volgens bijlage B; ontbreekt → niet berekenen. */
+    betonKruipInvoer?: KruipInvoerProject | null;
+    /** v2: combinatie-definities; ontbreekt (v1) → defaultCombinations(). */
+    combinations?: LoadCombination[];
+    /** v2: stramien; ontbreekt (v1) → DEFAULT_STRUCTURAL_GRID. */
+    structuralGrid?: StructuralGrid;
+    /** v2: scheefstand-instellingen; ontbreken → uit, 1/200, +x. */
+    scheefstandEnabled?: boolean;
+    scheefstandNoemer?: number;
+    scheefstandRichting?: 1 | -1;
+    /**
+     * v2: normberekening van φ. Ontbreekt `scheefstandBron` — élk bestand van
+     * vóór deze velden — dan `"vast"`, en dan rekent het bestand tot op de
+     * laatste decimaal zoals het altijd deed.
+     */
+    scheefstandBron?: string;
+    scheefstandHoogteM?: number | null;
+    scheefstandAantalElementen?: number | null;
+    scheefstandAantalX?: number | null;
+    scheefstandAantalY?: number | null;
+    scheefstandTorsie?: boolean;
+    scheefstandEigenKolom?: boolean;
+    houtToetsEN1995?: boolean;
+    /**
+     * Gevolgklasse uit de projectgegevens van het bestand. Ontbreekt → de
+     * klasse uit het kenmerk van de standaardcombinaties in het bestand, en
+     * anders de huidige klasse van de store (`gevolgklasseBijOpenen`). Nodig
+     * VÓÓR het vervangen van verouderde combinaties, anders zou dat naar de
+     * klasse van het vorige project gaan.
+     */
+    gevolgklasse?: Gevolgklasse;
+    /**
+     * De nationale bijlage uit de projectgegevens van het bestand, zoals gelezen
+     * (normnaad). Een gevulde bijlage bepaalt γ en ψ van de standaardcombinaties
+     * die bij het openen ontstaan; ontbreekt hij, dan het kenmerk, anders de
+     * huidige bijlage van de store.
+     */
+    nationaleBijlage?: unknown;
+    /**
+     * Id-tellers uit het bestand. Ontbreekt (bestand van vóór september 2026)
+     * → afgeleid uit de hoogste id's. Of een combinatie verouderd is, hangt er
+     * NIET van af: dat herkent `isOudeStandaardcombinatie` aan naam en factoren.
+     */
+    idTellers?: { belastinggeval?: number; combinatie?: number };
+    /** De tekst van een eerdere vervanging bij het openen, uit het bestand. */
+    combinatiesVervangenBijOpenen?: string;
+  }) => {
+    afwijking: CombinatieAfwijking | null;
+    vervanging: CombinatieVervanging | null;
+    /** De klasse waarmee geopend is, en waar hij vandaan kwam (zie `gevolgklasseBijOpenen`). */
+    gevolgklasse: Gevolgklasse;
+    gevolgklasseBron: KlasseBron;
+  };
+}
+
+export function useFemStore(opties?: {
+  /**
+   * De gevolgklasse uit de projectinstellingen. Staat niet in deze store (hij
+   * reist mee in de projectgegevens), maar hoort wél bij de rekeninstellingen.
+   */
+  gevolgklasse?: string | null;
+  /**
+   * De nationale bijlage uit de projectinstellingen (normnaad). Net als de
+   * gevolgklasse staat hij niet in deze store maar hoort hij wél bij de
+   * rekeninstellingen: hij bepaalt de nationaal bepaalde parameters van elke
+   * toetsing, dus een wijziging maakt de resultaten ongeldig.
+   */
+  nationaleBijlage?: string | null;
+}): FemStore {
+  // Active snapshot (current model)
+  const [nodes, setNodes]       = useState<Node[]>(DEFAULT_NODES);
+  const [beams, setBeams]       = useState<Beam[]>(DEFAULT_BEAMS);
+  const [supports, setSupports] = useState<Support[]>(DEFAULT_SUPPORTS);
+  const [plates, setPlates]     = useState<Plate[]>(DEFAULT_PLATES);
+  const [loads, setLoads]       = useState<Load[]>(DEFAULT_LOADS);
+
+  const [loadCases, setLoadCases] = useState<LoadCase[]>(DEFAULT_LOAD_CASES);
+  const [activeLoadCaseId, setActiveLoadCaseId] = useState<number>(STANDAARD_ACTIEF_GEVAL_ID);
+  const activeLoadCaseIdRef = useRef(activeLoadCaseId);
+  activeLoadCaseIdRef.current = activeLoadCaseId;
+
+  // Combinations + cached solver outputs (step 2d/2e)
+  const [combinations, setCombinations] = useState<LoadCombination[]>(
+    () => defaultCombinations(DEFAULT_LOAD_CASES, STANDAARD_GEVOLGKLASSE));
+  const [gevolgklasse, setGevolgklasseState] = useState<Gevolgklasse>(STANDAARD_GEVOLGKLASSE);
+  const [combinatieBijlage, setCombinatieBijlageState] = useState<NationaleBijlageCode>(STANDAARD_BIJLAGE);
+  const [idTellers, setIdTellers] = useState(() => ({
+    belastinggeval: volgendVrijId(DEFAULT_LOAD_CASES, 1),
+    combinatie: volgendVrijId(defaultCombinations(DEFAULT_LOAD_CASES, STANDAARD_GEVOLGKLASSE), 1),
+  }));
+  const [combinatieAfwijking, setCombinatieAfwijking] = useState<CombinatieAfwijking | null>(null);
+  const [combinatieVervanging, setCombinatieVervangingState] = useState<CombinatieVervanging | null>(null);
+  // Een ref naast de state: de knop "Ongedaan maken" in de melding bij het
+  // openen wordt gemaakt in hetzelfde event als het openen, vóór de volgende
+  // render. Met alleen de state zag die knop de vervanging nog niet.
+  const vervangingRef = useRef<CombinatieVervanging | null>(null);
+  const zetVervanging = useCallback((v: CombinatieVervanging | null) => {
+    vervangingRef.current = v;
+    setCombinatieVervangingState(v);
+  }, []);
+  const [vervangingUitBestand, setVervangingUitBestand] = useState<string | null>(null);
+
+  // Gevallen, combinaties, klasse en tellers veranderen SAMEN (zie
+  // lib/combinatieBeheer). De mutatoren rekenen daarom op één verse staat in
+  // plaats van op vier losse setState-updaters: `model_bouwen` voegt meerdere
+  // gevallen toe binnen één event, en elk moet het id en de combinaties van
+  // het vorige zien. De ref wordt in de mutator meteen bijgewerkt en bij elke
+  // render gelijkgezet aan de state.
+  const combiRef = useRef<CombinatieStaat>({
+    loadCases, combinations, gevolgklasse, bijlage: combinatieBijlage,
+    volgendGevalId: idTellers.belastinggeval, volgendCombinatieId: idTellers.combinatie,
+  });
+  combiRef.current = {
+    loadCases, combinations, gevolgklasse, bijlage: combinatieBijlage,
+    volgendGevalId: idTellers.belastinggeval, volgendCombinatieId: idTellers.combinatie,
+  };
+  const pasCombiStaatToe = useCallback((volgend: CombinatieStaat) => {
+    const huidig = combiRef.current;
+    if (volgend === huidig) return;
+    combiRef.current = volgend;
+    if (volgend.loadCases !== huidig.loadCases) setLoadCases(volgend.loadCases);
+    if (volgend.combinations !== huidig.combinations) setCombinations(volgend.combinations);
+    if (volgend.gevolgklasse !== huidig.gevolgklasse) setGevolgklasseState(volgend.gevolgklasse);
+    if (volgend.bijlage !== huidig.bijlage) setCombinatieBijlageState(volgend.bijlage);
+    if (
+      volgend.volgendGevalId !== huidig.volgendGevalId ||
+      volgend.volgendCombinatieId !== huidig.volgendCombinatieId
+    ) {
+      setIdTellers({ belastinggeval: volgend.volgendGevalId, combinatie: volgend.volgendCombinatieId });
+    }
+  }, []);
+  const setGevolgklasse = useCallback((klasse: Gevolgklasse) => {
+    pasCombiStaatToe(zetGevolgklasse(combiRef.current, klasse));
+  }, [pasCombiStaatToe]);
+  // Andere nationale bijlage: de standaardcombinaties krijgen γ en ψ van die
+  // rij (normnaad), langs dezelfde route als een andere gevolgklasse.
+  const setCombinatieBijlage = useCallback((bijlage: NationaleBijlageCode) => {
+    pasCombiStaatToe(zetBijlage(combiRef.current, bijlage));
+  }, [pasCombiStaatToe]);
+  const [activeCombinationId, setActiveCombinationId] = useState<number | null>(null);
+  const [envelopeView, setEnvelopeView] = useState<boolean>(false);
+  const [multiLcResult, setMultiLcResult] = useState<Map<number, SolverResult> | null>(null);
+  const [combinationResults, setCombinationResults] = useState<Map<number, SolverResult> | null>(null);
+  const [envelope, setEnvelope] = useState<Envelope | null>(null);
+  const [stabiliteit, setStabiliteit] = useState<AlphaCrUitkomst[] | null>(null);
+  const [veldpatronen, setVeldpatronen] = useState<VeldpatroonOutputs | null>(null);
+
+  // Welke combinaties dit model werkelijk nodig heeft. AFGELEID, nooit
+  // opgeslagen: `combinations` blijft de volledige lijst die in het
+  // projectbestand terechtkomt en in de editor bewerkt wordt. Zo komt een
+  // combinatie die bij een zuivere staalconstructie wegvalt vanzelf terug
+  // zodra er een houten of betonnen staaf bij komt — de beslissing wordt
+  // opnieuw genomen, niet teruggedraaid. `defaultCombinations()` kan deze
+  // afweging zelf niet maken: die draait vóórdat er een model is.
+  // Structural grid (stramien) — separate from undo history.
+  const [structuralGrid, setStructuralGridState] = useState<StructuralGrid>(DEFAULT_STRUCTURAL_GRID);
+
+  // Solver options — separate from undo history (UI toggles, not model state).
+  // Standaard AAN sinds issue #42: een nieuw project rekent mét eigen gewicht,
+  // in het eigen geval. Een geopend bestand zet hier zijn eigen waarde neer
+  // (`loadProjectState`); ontbreekt het veld daar, dan is het uit, zoals altijd.
+  const [selfWeightEnabled, setSelfWeightEnabled] = useState<boolean>(DEFAULT_SELF_WEIGHT_ENABLED);
+  const selfWeightRef = useRef(selfWeightEnabled);
+  selfWeightRef.current = selfWeightEnabled;
+  const [analysetype, setAnalysetype]             = useState<Analysetype>("eersteOrde");
+  const [axialMaterialLoadPath, setAxialMaterialLoadPath] = useState<number[]>([1]);
+  const [betonSegmentLengteMm, setBetonSegmentLengteMm] =
+    useState<number>(STANDAARD_SEGMENTLENGTE_MM);
+  // Geen beginwaarde: de norm kent voor φ(∞,t₀) geen aanbevolen getal, en een
+  // stille 0 zou "geen kruip" beweren waar "niet opgegeven" bedoeld is.
+  const [betonKruipcoefficient, setBetonKruipcoefficient] = useState<number | null>(null);
+  // Bijlage B staat standaard UIT: berekenen vraagt invoer die de gebruiker
+  // bewust kiest (RH, t₀, cementklasse).
+  const [betonKruipInvoer, setBetonKruipInvoer] = useState<KruipInvoerProject | null>(null);
+  // Scheefstand (initiële imperfectie) — zelfde patroon als selfWeightEnabled.
+  const [scheefstandEnabled, setScheefstandEnabled] = useState<boolean>(false);
+  const [scheefstandNoemer, setScheefstandNoemer]   = useState<number>(200);
+  const [scheefstandRichting, setScheefstandRichting] = useState<1 | -1>(1);
+
+  // Met een scheefstand bestaat elke doorgerekende combinatie in TWEE
+  // varianten, één per richting (EN 1993-1-1 5.3.2(2), basisaudit nr 28).
+  // De ontvouwde lijst is de lijst waarmee gerekend en getoetst wordt; de
+  // opgeslagen `combinations` blijft de ononvouwen lijst van de editor.
+  //
+  // Geldt de vereenvoudiging van NEN-EN 1995-1-1 2.2.3(5) niet — hout in een
+  // statisch onbepaalde constructie met verschillend kruipgedrag — dan krijgt
+  // elke UGT-combinatie er eindtoestandvarianten met E_mean,fin bij (zie
+  // lib/houtEindstijfheid.ts). Geldt hij wél, dan is de lijst ongewijzigd.
+  //
+  // STABIELE IDENTITEIT. De bepaling hangt van de knopen af (de telling van
+  // de onbepaaldheid), en een knoop verslepen zou anders bij elke stap een
+  // nieuwe uitkomst en dus een nieuwe `actieveCombinaties` geven — ook als er
+  // niets verandert. Een gelijke uitkomst houdt daarom het vorige object.
+  const eindstijfheidRef = useRef<{ sleutel: string; uitkomst: EindstijfheidUitkomst } | null>(null);
+  const eindstijfheid = useMemo(() => {
+    // De φ(∞,t₀) van het project gaat mee: de BGT-eindtoestand (EN 1995-1-1
+    // 2.2.3(4)) geeft een betonstaaf daarmee E_c,eff = E_cm/(1 + φ).
+    const uitkomst = bepaalEindstijfheidHout({
+      nodes, beams, supports, plates, analysetype, betonKruipcoefficient,
+    });
+    const sleutel = JSON.stringify([
+      uitkomst.status, [...uitkomst.kDefPerStaaf.entries()], [...uitkomst.betonPhiPerStaaf.entries()],
+      uitkomst.meldingen,
+    ]);
+    const vorige = eindstijfheidRef.current;
+    if (vorige && vorige.sleutel === sleutel) return vorige.uitkomst;
+    eindstijfheidRef.current = { sleutel, uitkomst };
+    return uitkomst;
+  }, [nodes, beams, supports, plates, analysetype, betonKruipcoefficient]);
+  const { actief: actieveCombinaties, overgeslagen: overgeslagenCombinaties } =
+    useMemo(() => {
+      const selectie = selecteerCombinaties(combinations, beams, plates, {
+        loadCases, gevolgklasse, bijlage: combinatieBijlage, nodes,
+      });
+      return {
+        actief: metEindtoestandVarianten(
+          metScheefstandRichtingen(selectie.actief, scheefstandEnabled, scheefstandRichting),
+          loadCases, eindstijfheid, combinatieBijlage,
+        ),
+        overgeslagen: selectie.overgeslagen,
+      };
+    }, [combinations, beams, plates, nodes, loadCases, gevolgklasse, combinatieBijlage, scheefstandEnabled, scheefstandRichting, eindstijfheid]);
+  /**
+   * De VOLLEDIGE lijst in dezelfde ontvouwing als `actieveCombinaties` — voor
+   * het rapport, dat ook opsomt wat niet is doorgerekend en de resultaten op
+   * combinatie-id opzoekt.
+   */
+  const combinatiesVoorRapport = useMemo(
+    () => {
+      const lijst = metEindtoestandVarianten(
+        metScheefstandRichtingen(combinations, scheefstandEnabled, scheefstandRichting),
+        loadCases, eindstijfheid, combinatieBijlage,
+      );
+      // Met de veldpatroonvarianten van de laatste rekengang (issue #219): het
+      // rapport zoekt de maatgevende combinatie op id op.
+      return veldpatronen ? voegVeldpatronenIn(lijst, veldpatronen.combinaties) : lijst;
+    },
+    [combinations, scheefstandEnabled, scheefstandRichting, loadCases, eindstijfheid, combinatieBijlage, veldpatronen],
+  );
+  // Normberekening van φ — beginstand "vast" (= het oude gedrag), zie de
+  // toelichting bij `scheefstandBron` hierboven. h en m op null = afleiden.
+  const [scheefstandBron, setScheefstandBron] = useState<ScheefstandBron>("vast");
+  const [scheefstandHoogteM, setScheefstandHoogteM] = useState<number | null>(null);
+  const [scheefstandAantalElementen, setScheefstandAantalElementen] =
+    useState<number | null>(null);
+  // 3D (issue #212): m per richting en de torsievarianten; null/uit = het gedrag van vóór #212.
+  const [scheefstandAantalX, setScheefstandAantalX] = useState<number | null>(null);
+  const [scheefstandAantalY, setScheefstandAantalY] = useState<number | null>(null);
+  const [scheefstandTorsie, setScheefstandTorsie] = useState<boolean>(false);
+  const [scheefstandEigenKolom, setScheefstandEigenKolom] = useState<boolean>(false);
+  const [houtToetsEN1995, setHoutToetsEN1995] = useState<boolean>(false);
+  // Eén versie van alles buiten het model dat de uitkomst bepaalt. Elk veld
+  // van `RekenInstellingen` is verplicht, dus een nieuwe instelling kan hier
+  // niet ontbreken zonder dat het niet compileert.
+  // De gevolgklasse uit de projectgegevens gaat de combinaties in. Tot
+  // september 2026 stond die keuze alleen in de dialoog en het rapport; de
+  // combinaties rekenden altijd met CC2. Een onbekende of ontbrekende waarde
+  // laat de store ongemoeid. In de versie hieronder staat de klasse waarmee de
+  // standaardcombinaties WERKELIJK rekenen (`gevolgklasse`, de state), niet de
+  // doorgegeven tekst: die twee lopen één render uiteen, en een bestand kan een
+  // klasse meebrengen vóórdat de projectgegevens zijn bijgewerkt.
+  const projectKlasse = opties?.gevolgklasse ?? null;
+  useEffect(() => {
+    if (projectKlasse === "CC1" || projectKlasse === "CC2" || projectKlasse === "CC3") {
+      setGevolgklasse(projectKlasse);
+    }
+  }, [projectKlasse, setGevolgklasse]);
+  // De nationale bijlage komt uit de projectgegevens en wordt hier alleen
+  // doorgegeven: hij is geen staat van de store, maar wel een rekeninstelling.
+  const projectBijlage = opties?.nationaleBijlage ?? null;
+  // Noemt het project een gevulde bijlage, dan volgen de standaardcombinaties
+  // haar. Een onbekende code laat de combinaties staan: er zijn geen γ en ψ
+  // voor, en de kernen weigeren de bijlage met reden.
+  useEffect(() => {
+    if (projectBijlage !== null && (BIJLAGEN_GEVULD as readonly string[]).includes(projectBijlage)) {
+      setCombinatieBijlage(projectBijlage as NationaleBijlageCode);
+    }
+  }, [projectBijlage, setCombinatieBijlage]);
+  const rekenInstellingenVersie = useMemo(
+    () => bepaalRekenInstellingenVersie({
+      loadCases, combinations, selfWeightEnabled, analysetype, axialMaterialLoadPath, betonSegmentLengteMm,
+      betonKruipcoefficient, betonKruipInvoer,
+      scheefstandEnabled, scheefstandNoemer, scheefstandRichting, scheefstandBron,
+      scheefstandHoogteM, scheefstandAantalElementen, scheefstandAantalX, scheefstandAantalY,
+      scheefstandTorsie, scheefstandEigenKolom, houtToetsEN1995, gevolgklasse,
+      nationaleBijlage: projectBijlage,
+    }),
+    [
+      loadCases, combinations, selfWeightEnabled, analysetype, axialMaterialLoadPath, betonSegmentLengteMm,
+      betonKruipcoefficient, betonKruipInvoer,
+      scheefstandEnabled, scheefstandNoemer, scheefstandRichting, scheefstandBron,
+      scheefstandHoogteM, scheefstandAantalElementen, scheefstandAantalX, scheefstandAantalY,
+      scheefstandTorsie, scheefstandEigenKolom, houtToetsEN1995, gevolgklasse, projectBijlage,
+    ],
+  );
+  // Canvas view mode: false = "Model" tab (no loads drawn), true = LC active.
+  const [showLoads, setShowLoads] = useState<boolean>(true);
+  // Cross-panel focus hint: when the user clicks a value on the canvas (e.g.
+  // a q-load label), this requests that the matching Properties-input gets
+  // focused + selected. Consumed once then cleared.
+  const [pendingLoadFocus, setPendingLoadFocus] = useState<{ loadId: number; field: keyof Load } | null>(null);
+
+  const setSolverOutputs = useCallback((m: {
+    perCase: Map<number, SolverResult>;
+    combinationResults: Map<number, SolverResult>;
+    envelope: Envelope;
+    stabiliteit?: AlphaCrUitkomst[];
+    veldpatronen?: VeldpatroonOutputs | null;
+  } | null) => {
+    if (m === null) {
+      setMultiLcResult(null);
+      setCombinationResults(null);
+      setEnvelope(null);
+      setStabiliteit(null);
+      setVeldpatronen(null);
+      return;
+    }
+    setMultiLcResult(m.perCase);
+    setCombinationResults(m.combinationResults);
+    setEnvelope(m.envelope);
+    setStabiliteit(m.stabiliteit ?? null);
+    setVeldpatronen(m.veldpatronen ?? null);
+  }, []);
+  // Issue #219: de lijst waarmee werkelijk gerekend is, met de
+  // veldpatroonvarianten achter hun basiscombinatie.
+  const rekenCombinaties = useMemo(
+    () => (veldpatronen ? voegVeldpatronenIn(actieveCombinaties, veldpatronen.combinaties) : actieveCombinaties),
+    [actieveCombinaties, veldpatronen],
+  );
+  const rekenBelastinggevallen = useMemo(
+    () => (veldpatronen ? [...loadCases, ...veldpatronen.gevallen] : loadCases),
+    [loadCases, veldpatronen],
+  );
+
+  // Wat er aan de gevallen niet meetelt — tegen de ACTIEF doorgerekende
+  // combinaties, want alleen die bepalen de toetsing. De volledige lijst en de
+  // klasse erbij: een ontbrekende standaardcombinatie is ook een fout.
+  const belastingMeldingen = useMemo(
+    () => meldingenBelastinggevallen({
+      loadCases, combinations: actieveCombinaties, alleCombinaties: combinations, gevolgklasse,
+      bijlage: combinatieBijlage, loads, selfWeightEnabled,
+      // Hout vraagt een UGT-combinatie met alleen blijvende belasting (k_mod).
+      metHout: beams.some((b) => matchSupportedTimberGrade(b.material) !== null),
+    }).concat(
+      // De eindstijfheid van hout (EN 1995-1-1 2.2.3(5), 2.3.2.2): wat er in
+      // een gemengd onbepaald model is doorgerekend en wat niet.
+      eindstijfheid.meldingen,
+      // Veranderlijke vloerbelasting over meer velden bij een NIET-lineaire
+      // berekening: geen veldpatronen, dus luid melden (issue #219).
+      veldpatroonMeldingen({
+        beams, supports, loadCases, loads, lineair: analysetype === "eersteOrde" && !beams.some((b) => b.tensionOnly),
+      }).map((m): GevalMelding => ({
+        niveau: m.niveau, caseId: m.caseId, tekst: m.tekst,
+        kop: {
+          sleutel: "common:loadCases.fieldPatternNonlinear",
+          waarden: { velden: m.velden },
+          tekst: `Niet veldsgewijs geplaatst over ${m.velden} velden bij niet-lineair rekenen`,
+        },
+      })),
+    ),
+    [loadCases, actieveCombinaties, combinations, gevolgklasse, combinatieBijlage, loads, selfWeightEnabled, beams, eindstijfheid, supports, analysetype],
+  );
+
+  const [selection, setSelection] = useState<Selection>(null);
+
+  // History — stack of Snapshots, plus pointer.
+  const [history, setHistory] = useState<HistorieSnapshot[]>([makeInitialSnapshot()]);
+  const [historyIdx, setHistoryIdx] = useState(0);
+
+  // We use a ref for the latest model so the snapshot push always grabs
+  // the freshest values without stale-closure trouble.
+  const latestRef = useRef({ nodes, beams, supports, plates, loads });
+  useEffect(() => {
+    latestRef.current = { nodes, beams, supports, plates, loads };
+  }, [nodes, beams, supports, plates, loads]);
+  // Bewerkingen die het tekenvlak in één klik na elkaar aanroept, zetten
+  // `latestRef` daarnaast meteen bij: zie `werkBij`.
+
+  // Zelfde truc voor het stramien: `verplaatsStramienAs` en `setStructuralGrid`
+  // hebben de verse waarde nodig binnen één event, vóór de re-render.
+  const gridRef = useRef(structuralGrid);
+  useEffect(() => { gridRef.current = structuralGrid; }, [structuralGrid]);
+  // Idem voor de historie-pointer, zodat setStructuralGrid de JUISTE snapshot
+  // bijwerkt zonder als dependency op historyIdx te hangen.
+  const historyIdxRef = useRef(0);
+  useEffect(() => { historyIdxRef.current = historyIdx; }, [historyIdx]);
+
+  // (Het doorgeefluik voor meshcaches en polygoonrandlasten dat hier stond is
+  // weg: `bouwMultiInput` geeft beide nu zelf door, zodat de app en de
+  // MCP-sidecar met dezelfde invoer rekenen. Zie lib/modelNaarSolverInput.)
+
+  /** Push a new history snapshot AFTER a mutation completes. */
+  const pushHistory = useCallback((next: HistorieSnapshot) => {
+    // Elke snapshot draagt het stramien mee; roept een mutator alleen model-
+    // velden aan, dan vullen we het actuele stramien aan. Zo hoort bij iedere
+    // undo-stap altijd het bijbehorende stramien.
+    const snap: HistorieSnapshot = next.structuralGrid
+      ? next
+      : { ...next, structuralGrid: gridRef.current };
+    // Elke mutator pusht de NIEUWE modelstaat. Zet `latestRef` daarom hier
+    // meteen bij, niet pas na de render: een tweede mutator in hetzelfde
+    // synchrone event (de lus over `addLoad` in de bedieningsopdracht
+    // `model_bouwen`, of `addBeam` gevolgd door `updateBeam` en een volgende
+    // `addBeam`) las anders dezelfde verouderde snapshot, kreeg hetzelfde id en
+    // overschreef de vorige toevoeging — alleen de laatste last bleef over,
+    // met id 1 (#215). Hetzelfde als `werkBij`, maar voor alle mutators.
+    werkBij(latestRef, {
+      nodes: next.nodes, beams: next.beams, supports: next.supports,
+      plates: next.plates, loads: next.loads,
+    });
+    // Uitgaan van de ref, niet van de state uit de closure: slaat één klik twee
+    // stappen op (een staaf naar een nieuw eindpunt: knoop, dan staaf), dan moet
+    // de tweede op de eerste volgen. Met de oude state kapten beide op dezelfde
+    // plek af en schoof de index voorbij het einde; Ctrl+Z liep dan vast (#102).
+    const basis = historyIdxRef.current;
+    setHistory((prev) => {
+      const truncated = prev.slice(0, basis + 1);
+      const updated = [...truncated, snap];
+      // Cap memory usage
+      const trimmed = updated.length > HISTORY_LIMIT
+        ? updated.slice(updated.length - HISTORY_LIMIT)
+        : updated;
+      return trimmed;
+    });
+    const volgende = Math.min(basis + 1, HISTORY_LIMIT - 1);
+    setHistoryIdx(volgende);
+    // Direct bijwerken: een setStructuralGrid of een tweede push later in
+    // hetzelfde event moet de ZOJUIST gepushte snapshot als basis nemen.
+    historyIdxRef.current = volgende;
+  }, []);
+
+  // Helper: produce next snapshot from a partial change
+  const applySnapshot = useCallback((next: HistorieSnapshot) => {
+    setNodes(next.nodes);
+    setBeams(next.beams);
+    setSupports(next.supports);
+    setPlates(next.plates);
+    setLoads(next.loads);
+    // Stramien hoort bij de snapshot sinds een as-verplaatsing knopen meeneemt.
+    if (next.structuralGrid) {
+      gridRef.current = next.structuralGrid;
+      setStructuralGridState(next.structuralGrid);
+    }
+  }, []);
+
+  // ── Mutations ────────────────────────────────────────────────────────────
+  const addNode = useCallback((x: number, z: number) => {
+    const cur = latestRef.current;
+    const newId = cur.nodes.length === 0 ? 1 : Math.max(...cur.nodes.map(n => n.id)) + 1;
+    const nextNodes = [...cur.nodes, { id: newId, x, z }];
+    setNodes(nextNodes);
+    werkBij(latestRef, { nodes: nextNodes });
+    pushHistory({ ...cur, nodes: nextNodes });
+    return newId;
+  }, [pushHistory]);
+
+  const updateNode = useCallback((id: number, x: number, z: number) => {
+    const cur = latestRef.current;
+    const nextNodes = cur.nodes.map(n => n.id === id ? { ...n, x, z } : n);
+    setNodes(nextNodes);
+    pushHistory({ ...cur, nodes: nextNodes });
+  }, [pushHistory]);
+
+  const addBeam = useCallback((fromId: number, toId: number) => {
+    if (fromId === toId) return null;
+    const cur = latestRef.current;
+    // No duplicate
+    if (cur.beams.some(b =>
+      (b.from === fromId && b.to === toId) || (b.from === toId && b.to === fromId))) {
+      return null;
+    }
+    const newId = cur.beams.length === 0 ? 1 : Math.max(...cur.beams.map(b => b.id)) + 1;
+    // Materiaal en profiel EXPLICIET meegeven, ook al zijn het de defaults.
+    // Een staaf zonder deze velden bestond wel, maar elke lezer verzon er
+    // dan zelf "HEA160 / S235" bij: de eigenschappen, de tabel, de solver en
+    // het rapport. In het rapport kwam dat terug als een volwaardig
+    // hoofdstuk "HEA160" met de complete eigenschappentabel — een profiel
+    // dat de gebruiker nooit had gekozen en dat hij ook niet kon aanwijzen
+    // om te wijzigen. Wat de app rekent hoort in het model te staan.
+    const nextBeams = [
+      ...cur.beams,
+      { id: newId, from: fromId, to: toId, material: "S235", profile: "HEA160" },
+    ];
+    setBeams(nextBeams);
+    werkBij(latestRef, { beams: nextBeams });
+    pushHistory({ ...cur, beams: nextBeams });
+    return newId;
+  }, [pushHistory]);
+
+  /** Patch arbitrary fields on a beam (material, profile, releases, …). */
+  const updateBeam = useCallback((id: number, updates: Partial<Beam>) => {
+    const cur = latestRef.current;
+    if (!cur.beams.some(b => b.id === id)) return;
+    const nextBeams = cur.beams.map(b => b.id === id ? { ...b, ...updates } : b);
+    setBeams(nextBeams);
+    pushHistory({ ...cur, beams: nextBeams });
+  }, [pushHistory]);
+
+  /** Zie FemStore.updateBeams — één snapshot voor de hele groep. */
+  const updateBeams = useCallback((ids: number[], updates: Partial<Beam>) => {
+    const cur = latestRef.current;
+    const doel = new Set(ids);
+    if (!cur.beams.some(b => doel.has(b.id))) return;
+    const nextBeams = cur.beams.map(b => doel.has(b.id) ? { ...b, ...updates } : b);
+    setBeams(nextBeams);
+    pushHistory({ ...cur, beams: nextBeams });
+  }, [pushHistory]);
+
+  const addPlate = useCallback((nodeIds: number[], meshCache?: PlaatMeshCache) => {
+    const cur = latestRef.current;
+    const newId = cur.plates.length === 0 ? 1 : Math.max(...cur.plates.map(p => p.id)) + 1;
+    // Rekenvelden meteen expliciet op de defaults (dikte 20 mm, staal,
+    // meshSize 500 mm) — zo toont de UI nooit een impliciete waarde. Een
+    // polygonplaat krijgt zijn CDT-meshcache direct mee (P4.2).
+    const nieuw: Plate = meshCache
+      ? { id: newId, nodeIds, ...PLATE_DEFAULTS, meshCache }
+      : { id: newId, nodeIds, ...PLATE_DEFAULTS };
+    const nextPlates = [...cur.plates, nieuw];
+    setPlates(nextPlates);
+    pushHistory({ ...cur, plates: nextPlates });
+    return newId;
+  }, [pushHistory]);
+
+  /** Meshcache bijwerken zonder history-snapshot — zie FemStore-doc. */
+  const setPlateMeshCache = useCallback((id: number, cache: PlaatMeshCache | undefined) => {
+    setPlates(prev => prev.map(p => p.id === id ? { ...p, meshCache: cache } : p));
+  }, []);
+
+  // Terugkanaal voor mesh-regeneratie (P4.2): het canvas commit een
+  // geregenereerde CDT-cache via femTypes.commitPlaatMeshCache — de store
+  // registreert de mutator hier zodat er geen extra App-prop nodig is.
+  useEffect(() => {
+    registreerPlaatMeshCacheCommitter(setPlateMeshCache);
+    return () => registreerPlaatMeshCacheCommitter(null);
+  }, [setPlateMeshCache]);
+
+  /** Patch willekeurige velden op een plaat (dikte, E, ν, ρ, meshSize, …). */
+  const updatePlate = useCallback((id: number, updates: Partial<Plate>) => {
+    const cur = latestRef.current;
+    if (!cur.plates.some(p => p.id === id)) return;
+    const nextPlates = cur.plates.map(p => p.id === id ? { ...p, ...updates } : p);
+    setPlates(nextPlates);
+    pushHistory({ ...cur, plates: nextPlates });
+  }, [pushHistory]);
+
+  const addSupport = useCallback((nodeId: number, type: SupportType, k?: number) => {
+    const cur = latestRef.current;
+    const without = cur.supports.filter(s => s.nodeId !== nodeId);
+    const nextSupports = [...without, { nodeId, type, k }];
+    setSupports(nextSupports);
+    werkBij(latestRef, { supports: nextSupports });
+    pushHistory({ ...cur, supports: nextSupports });
+  }, [pushHistory]);
+
+  const removeSupport = useCallback((nodeId: number) => {
+    const cur = latestRef.current;
+    const nextSupports = cur.supports.filter(s => s.nodeId !== nodeId);
+    setSupports(nextSupports);
+    pushHistory({ ...cur, supports: nextSupports });
+  }, [pushHistory]);
+
+  const addLoad = useCallback((l: Omit<Load, "id">) => {
+    // Het geval "Eigen gewicht" wordt automatisch gevuld; een handmatige last
+    // erin zou onzichtbaar bij het eigen gewicht optellen. Weigeren, met reden.
+    if (!gevalNeemtHandmatigeLasten(combiRef.current.loadCases, l.caseId)) {
+      meldGeenHandmatigeLast(combiRef.current.loadCases.find(c => c.id === l.caseId)?.name ?? String(l.caseId));
+      return;
+    }
+    const cur = latestRef.current;
+    const newId = cur.loads.length === 0 ? 1 : Math.max(...cur.loads.map(x => x.id)) + 1;
+    const nextLoads = [...cur.loads, { ...l, id: newId }];
+    setLoads(nextLoads);
+    pushHistory({ ...cur, loads: nextLoads });
+  }, [pushHistory]);
+
+  /** Patch arbitrary fields on a load (q, fx/fz/my, deltaT, …). */
+  const updateLoad = useCallback((id: number, updates: Partial<Load>) => {
+    const cur = latestRef.current;
+    if (!cur.loads.some(l => l.id === id)) return;
+    // Een last VERPLAATSEN naar het geval "Eigen gewicht" is hetzelfde als er
+    // een in aanmaken: geweigerd, met reden (zie addLoad).
+    if (updates.caseId !== undefined && !gevalNeemtHandmatigeLasten(combiRef.current.loadCases, updates.caseId)) {
+      meldGeenHandmatigeLast(combiRef.current.loadCases.find(c => c.id === updates.caseId)?.name ?? String(updates.caseId));
+      return;
+    }
+    const nextLoads = cur.loads.map(l => l.id === id ? { ...l, ...updates } : l);
+    setLoads(nextLoads);
+    pushHistory({ ...cur, loads: nextLoads });
+  }, [pushHistory]);
+
+  // ── Verwijderen op id (tabel-editor) ─────────────────────────────────────
+  // Zelfde cascade-regels als de overeenkomstige deleteSelected-takken; elke
+  // mutator pusht één history-snapshot. Wijst de huidige selectie naar het
+  // verwijderde element, dan wordt die leeggemaakt.
+
+  /** Verwijder een knoop + aanliggende staven, oplegging, platen en lasten. */
+  const removeNode = useCallback((id: number) => {
+    const cur = latestRef.current;
+    if (!cur.nodes.some(n => n.id === id)) return;
+    const nextNodes = cur.nodes.filter(n => n.id !== id);
+    const nextBeams = cur.beams.filter(b => b.from !== id && b.to !== id);
+    const nextSupports = cur.supports.filter(s => s.nodeId !== id);
+    const goneBeamIds = new Set(cur.beams.filter(b => b.from === id || b.to === id).map(b => b.id));
+    // Platen die deze knoop raken verdwijnen — hun randlasten (edgeLoad,
+    // P3.3) cascaderen mee, net als staafgebonden lasten.
+    const gonePlateIds = new Set(cur.plates.filter(p => p.nodeIds.includes(id)).map(p => p.id));
+    const nextLoads = cur.loads.filter(l =>
+      l.nodeId !== id
+      && !(l.beamId !== undefined && goneBeamIds.has(l.beamId))
+      && !(l.plateId !== undefined && gonePlateIds.has(l.plateId)));
+    const nextPlates = cur.plates.filter(p => !p.nodeIds.includes(id));
+    setNodes(nextNodes);
+    setBeams(nextBeams);
+    setSupports(nextSupports);
+    setPlates(nextPlates);
+    setLoads(nextLoads);
+    pushHistory({
+      nodes: nextNodes, beams: nextBeams, supports: nextSupports,
+      plates: nextPlates, loads: nextLoads,
+    });
+    setSelection(prev => prev && prev.type === "node" && prev.id === id ? null : prev);
+  }, [pushHistory]);
+
+  /** Verwijder een staaf + de lasten die eraan hangen. */
+  const removeBeam = useCallback((id: number) => {
+    const cur = latestRef.current;
+    if (!cur.beams.some(b => b.id === id)) return;
+    const nextBeams = cur.beams.filter(b => b.id !== id);
+    const nextLoads = cur.loads.filter(l => l.beamId !== id);
+    setBeams(nextBeams);
+    setLoads(nextLoads);
+    pushHistory({ ...cur, beams: nextBeams, loads: nextLoads });
+    setSelection(prev => prev && prev.type === "beam" && prev.id === id ? null : prev);
+  }, [pushHistory]);
+
+  /** Verwijder één last. */
+  const removeLoad = useCallback((id: number) => {
+    const cur = latestRef.current;
+    if (!cur.loads.some(l => l.id === id)) return;
+    const nextLoads = cur.loads.filter(l => l.id !== id);
+    setLoads(nextLoads);
+    pushHistory({ ...cur, loads: nextLoads });
+    setSelection(prev => prev && prev.type === "load" && prev.id === id ? null : prev);
+  }, [pushHistory]);
+
+  /** Verwijder één plaat (knopen blijven staan; randlasten cascaderen mee). */
+  const removePlate = useCallback((id: number) => {
+    const cur = latestRef.current;
+    if (!cur.plates.some(p => p.id === id)) return;
+    const nextPlates = cur.plates.filter(p => p.id !== id);
+    const nextLoads = cur.loads.filter(l => l.plateId !== id);
+    setPlates(nextPlates);
+    setLoads(nextLoads);
+    pushHistory({ ...cur, plates: nextPlates, loads: nextLoads });
+    setSelection(prev => prev && prev.type === "plate" && prev.id === id ? null : prev);
+  }, [pushHistory]);
+
+  const deleteSelected = useCallback(() => {
+    if (!selection) return;
+    const cur = latestRef.current;
+    if (selection.type === "beam") {
+      const nextBeams = cur.beams.filter(b => b.id !== selection.id);
+      // Also drop loads attached to this beam
+      const nextLoads = cur.loads.filter(l => l.beamId !== selection.id);
+      // And plates that reference its endpoints? — leave for now (plates use nodeIds).
+      setBeams(nextBeams);
+      setLoads(nextLoads);
+      pushHistory({ ...cur, beams: nextBeams, loads: nextLoads });
+    } else if (selection.type === "node") {
+      const id = selection.id;
+      const nextNodes = cur.nodes.filter(n => n.id !== id);
+      const nextBeams = cur.beams.filter(b => b.from !== id && b.to !== id);
+      const nextSupports = cur.supports.filter(s => s.nodeId !== id);
+      // Drop plates that touch this node + loads on the removed beams / node
+      const goneBeamIds = new Set(cur.beams.filter(b => b.from === id || b.to === id).map(b => b.id));
+      // Randlasten (edgeLoad) van platen die deze knoop raken gaan mee weg.
+      const gonePlateIds = new Set(cur.plates.filter(p => p.nodeIds.includes(id)).map(p => p.id));
+      const nextLoads = cur.loads.filter(l =>
+        l.nodeId !== id
+        && !(l.beamId !== undefined && goneBeamIds.has(l.beamId))
+        && !(l.plateId !== undefined && gonePlateIds.has(l.plateId))
+      );
+      const nextPlates = cur.plates.filter(p => !p.nodeIds.includes(id));
+      setNodes(nextNodes);
+      setBeams(nextBeams);
+      setSupports(nextSupports);
+      setPlates(nextPlates);
+      setLoads(nextLoads);
+      pushHistory({
+        nodes: nextNodes, beams: nextBeams, supports: nextSupports,
+        plates: nextPlates, loads: nextLoads,
+      });
+    } else if (selection.type === "plate") {
+      const nextPlates = cur.plates.filter(p => p.id !== selection.id);
+      // Randlasten (edgeLoad) op deze plaat cascaderen mee.
+      const nextLoads = cur.loads.filter(l => l.plateId !== selection.id);
+      setPlates(nextPlates);
+      setLoads(nextLoads);
+      pushHistory({ ...cur, plates: nextPlates, loads: nextLoads });
+    } else if (selection.type === "load") {
+      const nextLoads = cur.loads.filter(l => l.id !== selection.id);
+      setLoads(nextLoads);
+      pushHistory({ ...cur, loads: nextLoads });
+    } else if (selection.type === "multi") {
+      // Multi-select: drop all selected nodes/beams/plates and everything that
+      // referenced them. Mirrors the single-node/beam branches above.
+      const nodeIds = new Set(selection.nodeIds);
+      const beamIds = new Set(selection.beamIds);
+      const plateIds = new Set(selection.plateIds);
+      const nextNodes = cur.nodes.filter(n => !nodeIds.has(n.id));
+      const nextBeams = cur.beams.filter(b =>
+        !beamIds.has(b.id) && !nodeIds.has(b.from) && !nodeIds.has(b.to));
+      const goneBeamIds = new Set(cur.beams.filter(b =>
+        beamIds.has(b.id) || nodeIds.has(b.from) || nodeIds.has(b.to)).map(b => b.id));
+      const nextSupports = cur.supports.filter(s => !nodeIds.has(s.nodeId));
+      // Verdwijnende platen (geselecteerd of via een verwijderde hoekknoop)
+      // nemen hun randlasten (edgeLoad) mee.
+      const gonePlateIds = new Set(cur.plates.filter(p =>
+        plateIds.has(p.id) || p.nodeIds.some(nid => nodeIds.has(nid))).map(p => p.id));
+      // Rechtstreeks geselecteerde lasten ("selecteer alle lijnlasten") gaan
+      // óók weg; het veld ontbreekt bij elke andere multi-selectie en laat
+      // het bestaande gedrag dan ongemoeid.
+      const gekozenLastIds = new Set(selection.loadIds ?? []);
+      const nextLoads = cur.loads.filter(l =>
+        !gekozenLastIds.has(l.id) &&
+        (l.nodeId === undefined || !nodeIds.has(l.nodeId)) &&
+        (l.beamId === undefined || !goneBeamIds.has(l.beamId)) &&
+        (l.plateId === undefined || !gonePlateIds.has(l.plateId)));
+      const nextPlates = cur.plates.filter(p =>
+        !plateIds.has(p.id) && p.nodeIds.every(nid => !nodeIds.has(nid)));
+      setNodes(nextNodes);
+      setBeams(nextBeams);
+      setSupports(nextSupports);
+      setPlates(nextPlates);
+      setLoads(nextLoads);
+      pushHistory({
+        nodes: nextNodes, beams: nextBeams, supports: nextSupports,
+        plates: nextPlates, loads: nextLoads,
+      });
+    }
+    setSelection(null);
+  }, [selection, pushHistory]);
+
+  /** Verplaats de volledige selectie (multi-bewust) over (dx, dz). */
+  const translateSelection = useCallback((sel: Selection, dx: number, dz: number): boolean => {
+    const cur = latestRef.current;
+    const r = computeSelectionTranslate(cur, sel, dx, dz);
+    if (!r) return false;
+    setNodes(r.nodes);
+    setPlates(r.plates);
+    pushHistory({ ...cur, nodes: r.nodes, plates: r.plates });
+    return true;
+  }, [pushHistory]);
+
+  /**
+   * Volwaardige kopie van de selectie op offset (dx, dz): alle staafvelden,
+   * opleggingen en lasten gaan mee (zie computeSelectionCopy). `source` is
+   * optioneel een bewaarde Ctrl+C-snapshot. Eén history-push per plakactie.
+   */
+  const copySelection = useCallback((sel: Selection, dx: number, dz: number, source?: Snapshot): boolean => {
+    const cur = latestRef.current;
+    const r = computeSelectionCopy(source ?? cur, sel, dx, dz, cur);
+    if (!r) return false;
+    setNodes(r.nodes);
+    setBeams(r.beams);
+    setSupports(r.supports);
+    setPlates(r.plates);
+    setLoads(r.loads);
+    pushHistory({
+      nodes: r.nodes, beams: r.beams, supports: r.supports,
+      plates: r.plates, loads: r.loads,
+    });
+    return true;
+  }, [pushHistory]);
+
+  /** Roteer de volledige selectie (multi-bewust) om (cx, cz) met `angleRad`. */
+  const rotateSelection = useCallback((sel: Selection, cx: number, cz: number, angleRad: number): boolean => {
+    const cur = latestRef.current;
+    const r = computeSelectionRotate(cur, sel, cx, cz, angleRad);
+    if (!r) return false;
+    setNodes(r.nodes);
+    setPlates(r.plates);
+    pushHistory({ ...cur, nodes: r.nodes, plates: r.plates });
+    return true;
+  }, [pushHistory]);
+
+  /**
+   * Plak klembordlasten in een belastinggeval (zie `computeLastenPlakken`).
+   * Eén setLoads + één history-push, dus één Ctrl+Z draait de hele actie
+   * terug. Verandert niets aan de geometrie.
+   */
+  const plakLasten = useCallback((
+    klembord: KlembordLast[], doelCaseId: number,
+  ) => {
+    const cur = latestRef.current;
+    const gevalNaam = loadCases.find(c => c.id === doelCaseId)?.name
+      ?? `Geval ${doelCaseId}`;
+    // Plakken in het geval "Eigen gewicht": geweigerd, zie addLoad.
+    if (!gevalNeemtHandmatigeLasten(loadCases, doelCaseId)) {
+      meldGeenHandmatigeLast(gevalNaam);
+      return { geplakt: 0, overgeslagen: klembord.length, verweesd: 0, verplaatst: 0, gevalNaam };
+    }
+    const r = computeLastenPlakken(cur, klembord, doelCaseId);
+    if (r.geplakt > 0) {
+      setLoads(r.loads);
+      pushHistory({ ...cur, loads: r.loads });
+    }
+    return {
+      geplakt: r.geplakt, overgeslagen: r.overgeslagen, verweesd: r.verweesd,
+      verplaatst: r.verplaatst, gevalNaam,
+    };
+  }, [pushHistory, loadCases]);
+
+  /** Spiegel de volledige selectie (multi-bewust) om de lijn (x1,z1)-(x2,z2). */
+  const mirrorSelection = useCallback((sel: Selection, x1: number, z1: number, x2: number, z2: number): boolean => {
+    const cur = latestRef.current;
+    const r = computeSelectionMirror(cur, sel, x1, z1, x2, z2);
+    if (!r) return false;
+    setNodes(r.nodes);
+    setPlates(r.plates);
+    pushHistory({ ...cur, nodes: r.nodes, plates: r.plates });
+    return true;
+  }, [pushHistory]);
+
+  /**
+   * Split a beam at a snapped point (x, z): inserts a new node and replaces
+   * the beam with two. Materiaal/profiel/releases/lijnlasten gaan netjes mee —
+   * zie computeBeamSplit voor de precieze regels.
+   */
+  const splitBeamAt = useCallback((beamId: number, x: number, z: number, tolMm?: number) => {
+    const cur = latestRef.current;
+    const split = computeBeamSplit(cur, beamId, x, z, tolMm);
+    if (!split) return;
+    setNodes(split.nodes);
+    setBeams(split.beams);
+    setLoads(split.loads);
+    pushHistory({ ...cur, nodes: split.nodes, beams: split.beams, loads: split.loads });
+    meldSplitsing(split.meldingen);
+  }, [pushHistory]);
+
+  /**
+   * Knoop plaatsen ÉN aansluiten — zie FemStore.addNodeMetSplitsing. Eén
+   * snapshot: de knoop en de splitsingen die hij veroorzaakt horen bij elkaar
+   * en gaan met één Ctrl+Z samen terug.
+   */
+  const addNodeMetSplitsing = useCallback((x: number, z: number, tolMm: number = CONTROLE_TOL_MM) => {
+    const cur = latestRef.current;
+    const r = computeKnoopMetSplitsing(cur, x, z, tolMm);
+    if (!r.gewijzigd) return r.nodeId;
+    setNodes(r.nodes);
+    setBeams(r.beams);
+    setLoads(r.loads);
+    werkBij(latestRef, { nodes: r.nodes, beams: r.beams, loads: r.loads });
+    pushHistory({ ...cur, nodes: r.nodes, beams: r.beams, loads: r.loads });
+    meldVerbonden(
+      i18next.t("common:canvas.modelCheck.splitTitle", { count: r.splitsingen.length }),
+      r.splitsingen.map(splitsingRegel),
+    );
+    meldSplitsing(r.meldingen);
+    return r.nodeId;
+  }, [pushHistory]);
+
+  /** Herstel: splits een staaf op een knoop die er alleen maar op lag. */
+  const verbindKnoopMetStaaf = useCallback((nodeId: number, beamId: number) => {
+    const cur = latestRef.current;
+    const deel = computeBeamSplitOpKnoop(cur, beamId, nodeId);
+    if (!deel) return false;
+    setBeams(deel.beams);
+    setLoads(deel.loads);
+    pushHistory({ ...cur, beams: deel.beams, loads: deel.loads });
+    meldVerbonden(
+      i18next.t("common:canvas.modelCheck.splitTitle", { count: 1 }),
+      [splitsingRegel({ staafId: beamId, knoopId: nodeId, delen: deel.delen, afwijkingMm: deel.afwijkingMm })],
+    );
+    meldSplitsing(deel.meldingen);
+    return true;
+  }, [pushHistory]);
+
+  /** Herstel: voeg twee samenvallende knopen samen. */
+  const voegKnopenSamen = useCallback((bewaarId: number, verwijderId: number) => {
+    const cur = latestRef.current;
+    const r = computeKnopenSamenvoegen(cur, bewaarId, verwijderId);
+    if (!r) return false;
+    setNodes(r.nodes);
+    setBeams(r.beams);
+    setSupports(r.supports);
+    setPlates(r.plates);
+    setLoads(r.loads);
+    pushHistory(r);
+    // Een selectie kan naar de verdwenen knoop wijzen.
+    setSelection(null);
+    return true;
+  }, [pushHistory]);
+
+  /** Herstel alles in één stap — zie FemStore.herstelModel. */
+  const herstelModel = useCallback((tolMm: number = CONTROLE_TOL_MM) => {
+    const cur = latestRef.current;
+    const r = computeModelHerstel(cur, tolMm);
+    if (!r) return [];
+    setNodes(r.nodes);
+    setBeams(r.beams);
+    setSupports(r.supports);
+    setPlates(r.plates);
+    setLoads(r.loads);
+    pushHistory({
+      nodes: r.nodes, beams: r.beams, supports: r.supports,
+      plates: r.plates, loads: r.loads,
+    });
+    setSelection(null);
+    meldVerbonden(i18next.t("common:canvas.modelCheck.repaired"), r.regels);
+    return r.stappen;
+  }, [pushHistory]);
+
+  // Tot september 2026: id = hoogste + 1 en géén combinatiefactor. Een nieuw
+  // geval telde daardoor in geen enkele combinatie mee, en na het verwijderen
+  // van het hoogste id erfde het de factoren van het verwijderde geval.
+  const addLoadCase = useCallback((name: string, type?: LoadCase["type"]) => {
+    pasCombiStaatToe(voegBelastinggevalToe(combiRef.current, name, type).staat);
+  }, [pasCombiStaatToe]);
+
+  /**
+   * Verdween het gekenmerkte geval "Eigen gewicht" (verwijderd, of van type
+   * gewijzigd)? Dan gaat het eigen gewicht UIT, met melding — issue #42,
+   * punt 6. De regel staat in lib/eigenGewicht (`eigenGewichtNaGevalWijziging`).
+   */
+  const eigenGewichtUitNa = useCallback((voor: CombinatieStaat, na: CombinatieStaat) => {
+    const gevolg = eigenGewichtNaGevalWijziging({
+      voor: voor.loadCases, na: na.loadCases, selfWeightEnabled: selfWeightRef.current,
+    });
+    if (!gevolg) return;
+    selfWeightRef.current = false;
+    setSelfWeightEnabled(false);
+    meldEigenGewichtUit(gevolg.reden, gevolg.geval.name ?? String(gevolg.geval.id));
+  }, []);
+
+  /**
+   * Het aanbod van issue #42: geef dit project een eigen geval "Eigen gewicht"
+   * en verplaats het eigen gewicht daarheen. ÉÉN undo-stap: gevallen en
+   * combinaties zitten niet in de modelsnapshots, dus draagt de stap zelf de
+   * staat van ervoor en erna (`eigenGewichtStap`). Geeft het id van het nieuwe
+   * geval, of null als er niets te verplaatsen viel.
+   */
+  const verplaatsEigenGewicht = useCallback((): number | null => {
+    const voor = combiRef.current;
+    const r = verplaatsEigenGewichtNaarEigenGeval(voor);
+    if (r.id === null) return null;
+    pasCombiStaatToe(r.staat);
+    pushHistory({
+      ...latestRef.current,
+      eigenGewichtStap: { voor, na: r.staat, actiefVoor: activeLoadCaseIdRef.current },
+    });
+    setActiveLoadCaseId(r.id);
+    return r.id;
+  }, [pasCombiStaatToe, pushHistory]);
+
+  const zorgVoorBelastinggevallen = useCallback(
+    (gevallen: readonly Pick<LoadCase, "name" | "type" | "eigenGewicht">[]): number[] => {
+      const r = zorgVoorGevallenInStaat(combiRef.current, gevallen);
+      pasCombiStaatToe(r.staat);
+      return r.ids;
+    }, [pasCombiStaatToe]);
+
+  /**
+   * Zie de documentatie bij FemStore.vervangGegenereerdeBelasting. Één
+   * snapshot, één loads-identiteit — bewust GEEN lus over addLoad, want dat
+   * zou per last een history-stap én een herberekening opleveren.
+   */
+  const vervangGegenereerdeBelasting = useCallback((p: {
+    gevallen: LoadCase[];
+    lasten: Omit<Load, "id">[];
+    combinaties: Omit<LoadCombination, "id">[];
+    gevalHoortBijGeneratie: (c: LoadCase) => boolean;
+    lastHoortBijGeneratie: (l: Load) => boolean;
+    combinatieHoortBijGeneratie: (c: LoadCombination) => boolean;
+  }) => {
+    const cur = latestRef.current;
+    // Lasten: handmatige behouden (volgorde intact), gegenereerde vervangen.
+    const behoudenLasten = cur.loads.filter(l => !p.lastHoortBijGeneratie(l));
+    let nextLoadId = behoudenLasten.reduce((m, l) => Math.max(m, l.id), 0) + 1;
+    const nieuweLasten: Load[] = p.lasten.map(l => ({ ...l, id: nextLoadId++ }));
+    const nextLoads = [...behoudenLasten, ...nieuweLasten];
+    setLoads(nextLoads);
+    pushHistory({ ...cur, loads: nextLoads });
+
+    const staat = combiRef.current;
+    const behoudenGevallen = staat.loadCases.filter(c => !p.gevalHoortBijGeneratie(c));
+    const volgendeGevallen = [...behoudenGevallen, ...p.gevallen];
+    const gevallen = volgendeGevallen.length > 0 ? volgendeGevallen : staat.loadCases; // nooit alles wegnemen
+    // Wees de actieve tab naar een geval dat nog bestaat.
+    setActiveLoadCaseId(curr =>
+      gevallen.some(c => c.id === curr) ? curr : (gevallen[0]?.id ?? curr));
+
+    // Id's van de teller, niet "hoogste + 1": een weggehaalde gegenereerde
+    // combinatie mag haar id niet aan een nieuwe doorgeven. De volgorde maakt
+    // voor de toetsing niet meer uit — de toetsbouwers envelopperen over alle
+    // combinaties van een soort in plaats van de eerste treffer te nemen.
+    let volgendId = volgendVrijId(staat.combinations, staat.volgendCombinatieId);
+    const combinaties = [
+      ...staat.combinations.filter(c => !p.combinatieHoortBijGeneratie(c)),
+      ...p.combinaties.map(c => ({ ...c, id: volgendId++ })),
+    ];
+    // De gegenereerde gevallen staan buiten de standaardset; de synchronisatie
+    // wist hier alleen factoren van gevallen die niet meer bestaan.
+    pasCombiStaatToe(synchroniseerStandaard(
+      {
+        ...staat,
+        loadCases: gevallen,
+        combinations: combinaties,
+        volgendGevalId: volgendVrijId(gevallen, staat.volgendGevalId),
+        volgendCombinatieId: volgendId,
+      },
+      { loadCases: staat.loadCases, gevolgklasse: staat.gevolgklasse, bijlage: staat.bijlage },
+    ));
+    setActiveCombinationId(null);
+  }, [pushHistory, pasCombiStaatToe]);
+
+  /** Bulk-translate the given nodeIds by (dx, dz). One snapshot push. */
+  const translateNodes = useCallback((nodeIds: number[], dx: number, dz: number) => {
+    if (nodeIds.length === 0 || (dx === 0 && dz === 0)) return;
+    const cur = latestRef.current;
+    const idSet = new Set(nodeIds);
+    const nextNodes = cur.nodes.map(n =>
+      idSet.has(n.id) ? { ...n, x: n.x + dx, z: n.z + dz } : n);
+    // Slepen van een hele plaat: de openingen schuiven mee (zie
+    // transformeerPlaatOpeningen).
+    const nextPlates = transformeerPlaatOpeningen(cur.plates, idSet, p => ({ x: p.x + dx, z: p.z + dz }));
+    setNodes(nextNodes);
+    setPlates(nextPlates);
+    pushHistory({ ...cur, nodes: nextNodes, plates: nextPlates });
+  }, [pushHistory]);
+
+  const setStructuralGrid = useCallback((g: StructuralGrid | ((prev: StructuralGrid) => StructuralGrid)) => {
+    const next = typeof g === "function"
+      ? (g as (p: StructuralGrid) => StructuralGrid)(gridRef.current)
+      : g;
+    gridRef.current = next;
+    setStructuralGridState(next);
+    // Losse stramien-bewerkingen (as toevoegen, hernoemen, verwijderen) zijn
+    // geen eigen undo-stap — net als voorheen. We schrijven ze wél in de
+    // HUIDIGE snapshot, anders zou een undo van een latere modelwijziging ze
+    // stilletjes terugdraaien.
+    setHistory(prev => prev.map((s, i) =>
+      i === historyIdxRef.current ? { ...s, structuralGrid: next } : s));
+  }, []);
+
+  /**
+   * Verplaats één stramienas naar `nieuwePositie` (mm) en neem de knopen die
+   * OP die as liggen mee, zodat staven, opleggingen en lasten meeschuiven en
+   * het model aan het stramien vast blijft zitten.
+   *
+   * As-verplaatsing en knoopverplaatsing vormen SAMEN één undo-stap: de
+   * snapshot bevat zowel de nieuwe knopen als het nieuwe stramien.
+   * Zie `berekenStramienVerplaatsing` voor het gekozen gedrag (lokale maat:
+   * alleen de bewerkte as schuift, verdere assen blijven staan).
+   *
+   * Retourneert het aantal meegeschoven knopen, of null als de as niet bestaat
+   * of de verplaatsing nul is.
+   */
+  const verplaatsStramienAs = useCallback((
+    as: "x" | "z", axisId: string, nieuwePositie: number,
+  ): number | null => {
+    const cur = latestRef.current;
+    const grid = gridRef.current;
+    const doelAs = (as === "x" ? grid.xAxes : grid.zAxes).find(a => a.id === axisId);
+    if (!doelAs) return null;
+    const v = berekenStramienVerplaatsing(cur.nodes, as, doelAs.position, nieuwePositie);
+    if (v.delta === 0) return null;
+
+    const idSet = new Set(v.nodeIds);
+    const nextNodes = v.nodeIds.length === 0
+      ? cur.nodes
+      : cur.nodes.map(n => idSet.has(n.id) ? { ...n, x: n.x + v.dx, z: n.z + v.dz } : n);
+    const verplaatsAs = (lijst: StructuralGrid["xAxes"]) =>
+      lijst.map(a => a.id === axisId ? { ...a, position: nieuwePositie } : a);
+    const nextGrid: StructuralGrid = {
+      ...grid,
+      xAxes: as === "x" ? verplaatsAs(grid.xAxes) : grid.xAxes,
+      zAxes: as === "z" ? verplaatsAs(grid.zAxes) : grid.zAxes,
+    };
+
+    if (v.nodeIds.length > 0) setNodes(nextNodes);
+    gridRef.current = nextGrid;
+    setStructuralGridState(nextGrid);
+    pushHistory({ ...cur, nodes: nextNodes, structuralGrid: nextGrid });
+    return v.nodeIds.length;
+  }, [pushHistory]);
+
+  // ── Undo / Redo ──────────────────────────────────────────────────────────
+  const canUndo = historyIdx > 0;
+  const canRedo = historyIdx < history.length - 1;
+  // Gevallen en combinaties zitten niet in de snapshots. De uitzondering is de
+  // vervanging van verouderde combinaties bij het openen: een eigen stap
+  // (`combinatieStap`) die zelf draagt wat er terug moet.
+  const undo = useCallback(() => {
+    if (!canUndo) return;
+    const stap = history[historyIdx].combinatieStap;
+    const egStap = history[historyIdx].eigenGewichtStap;
+    const newIdx = historyIdx - 1;
+    applySnapshot(history[newIdx]);
+    if (egStap) {
+      // Het geval "Eigen gewicht" weer weg: gevallen, combinaties en tellers
+      // van vóór het aanbod, en de tab terug waar hij stond.
+      pasCombiStaatToe(egStap.voor);
+      setActiveLoadCaseId(egStap.actiefVoor);
+      setActiveCombinationId(null);
+    }
+    if (stap) {
+      pasCombiStaatToe(herstelCombinaties(combiRef.current, stap.voor));
+      zetVervanging(null);
+      setActiveCombinationId(null);
+      meldVervangingOngedaan(stap.voor.length, "Ctrl+Y vervangt ze opnieuw.");
+    }
+    setHistoryIdx(newIdx);
+    historyIdxRef.current = newIdx;
+    setSelection(null);
+  }, [canUndo, historyIdx, history, applySnapshot, pasCombiStaatToe, zetVervanging]);
+
+  const redo = useCallback(() => {
+    if (!canRedo) return;
+    const newIdx = historyIdx + 1;
+    const stap = history[newIdx].combinatieStap;
+    const egStap = history[newIdx].eigenGewichtStap;
+    applySnapshot(history[newIdx]);
+    if (egStap) {
+      pasCombiStaatToe(egStap.na);
+      setActiveCombinationId(null);
+    }
+    if (stap) {
+      // Opnieuw afleiden in plaats van de lijst van toen terug te zetten:
+      // tussen ongedaan maken en opnieuw kan een belastinggeval zijn veranderd.
+      const r = vervangVerouderdeCombinaties(combiRef.current);
+      pasCombiStaatToe(r.staat);
+      zetVervanging(r.vervanging);
+      setActiveCombinationId(null);
+    }
+    setHistoryIdx(newIdx);
+    historyIdxRef.current = newIdx;
+    setSelection(null);
+  }, [canRedo, historyIdx, history, applySnapshot, pasCombiStaatToe, zetVervanging]);
+
+  // Invalidate cached solver outputs whenever the model changes, so the UI
+  // never shows a stale envelope/combination after the user edits the model.
+  useEffect(() => {
+    setMultiLcResult(null);
+    setCombinationResults(null);
+    setEnvelope(null);
+    setVeldpatronen(null);
+    // α_cr hoort net zo goed bij het oude model: bleef hij staan, dan kreeg het
+    // rapport de analysetoelichting van het vorige model, en de toets via het
+    // API-pad (zonder verse rekengang) de α_cr van vóór de wijziging. Dezelfde
+    // vier velden die `setSolverOutputs(null)` wist.
+    setStabiliteit(null);
+    // We deliberately depend on the model-bearing state, not on the setters.
+    // `plates` doet mee sinds platen meerekenen (P2): zonder die dependency
+    // zou een dikte- of meshSize-wijziging verouderde resultaten laten staan.
+    // `rekenInstellingenVersie` om dezelfde reden voor alles BUITEN het model:
+    // een factor, het eigen gewicht, de scheefstand of het analysetype
+    // veranderen de uitkomst net zo goed — zie lib/rekenInstellingen.ts.
+  }, [nodes, beams, supports, plates, loads, rekenInstellingenVersie]);
+
+  return {
+    nodes, beams, supports, plates, loads,
+    loadCases, activeLoadCaseId,
+    combinations, actieveCombinaties, overgeslagenCombinaties, combinatiesVoorRapport,
+    gevolgklasse, setGevolgklasse, combinatieBijlage, belastingMeldingen, eindstijfheid, combinatieAfwijking, idTellers,
+    combinatieVervanging,
+    combinatieVervangingTekst: combinatieVervanging?.samenvatting ?? vervangingUitBestand,
+    activeCombinationId, envelopeView,
+    multiLcResult, combinationResults, envelope, stabiliteit,
+    veldpatronen, rekenCombinaties, rekenBelastinggevallen,
+    selection,
+    setSelection,
+    setActiveLoadCaseId,
+    setActiveCombinationId,
+    setEnvelopeView,
+    setSolverOutputs,
+    addNode, updateNode, addBeam, updateBeam, updateBeams, addPlate, updatePlate,
+    setPlateMeshCache,
+    addSupport, removeSupport, addLoad, updateLoad,
+    removeNode, removeBeam, removeLoad, removePlate,
+    deleteSelected, splitBeamAt, addLoadCase, verplaatsEigenGewicht, zorgVoorBelastinggevallen, vervangGegenereerdeBelasting,
+    addNodeMetSplitsing, verbindKnoopMetStaaf, voegKnopenSamen, herstelModel,
+    translateSelection, copySelection, rotateSelection, mirrorSelection,
+    plakLasten,
+    translateNodes,
+    structuralGrid, setStructuralGrid, verplaatsStramienAs,
+    selfWeightEnabled, setSelfWeightEnabled,
+    analysetype, setAnalysetype, axialMaterialLoadPath, setAxialMaterialLoadPath,
+    betonSegmentLengteMm, setBetonSegmentLengteMm,
+    betonKruipcoefficient, setBetonKruipcoefficient,
+    betonKruipInvoer, setBetonKruipInvoer,
+    rekenInstellingenVersie,
+    nationaleBijlage: projectBijlage,
+    scheefstandEnabled, setScheefstandEnabled,
+    scheefstandNoemer, setScheefstandNoemer,
+    scheefstandRichting, setScheefstandRichting,
+    scheefstandBron, setScheefstandBron,
+    scheefstandHoogteM, setScheefstandHoogteM,
+    scheefstandAantalElementen, setScheefstandAantalElementen,
+    scheefstandAantalX, setScheefstandAantalX,
+    scheefstandAantalY, setScheefstandAantalY,
+    scheefstandTorsie, setScheefstandTorsie,
+    scheefstandEigenKolom, setScheefstandEigenKolom,
+    houtToetsEN1995, setHoutToetsEN1995,
+    showLoads, setShowLoads,
+    pendingLoadFocus, setPendingLoadFocus,
+    canUndo, canRedo, undo, redo,
+    // ── Load case + combination mutators ─────────────────────────────────
+    // De vijf mutatoren hieronder rekenen via lib/combinatieBeheer: de
+    // standaardcombinaties volgen elke wijziging aan de gevallen, en een
+    // verwijderd geval verdwijnt uit ELKE factortabel (bevinding 14 van de
+    // basisaudit: voorheen erfde het volgende geval de wees-factoren).
+    zetGevallenUitDocument: (p) => {
+      const huidig = combiRef.current;
+      pasCombiStaatToe({
+        ...huidig,
+        loadCases: p.loadCases,
+        combinations: p.combinations,
+        volgendGevalId: p.idTellers?.belastinggeval ?? huidig.volgendGevalId,
+        volgendCombinatieId: p.idTellers?.combinatie ?? huidig.volgendCombinatieId,
+      });
+      setLoads(p.loads);
+      setActiveLoadCaseId(p.activeLoadCaseId);
+      setSelfWeightEnabled(p.selfWeightEnabled);
+    },
+    updateLoadCase: (id, patch) => {
+      const voor = combiRef.current;
+      const na = wijzigBelastinggeval(voor, id, patch);
+      pasCombiStaatToe(na);
+      eigenGewichtUitNa(voor, na);
+    },
+    removeLoadCase: (id) => {
+      const voor = combiRef.current;
+      const na = verwijderBelastinggeval(voor, id);
+      if (na === voor) return; // onbekend id, of het laatste geval — nooit alles wissen
+      pasCombiStaatToe(na);
+      eigenGewichtUitNa(voor, na);
+      // Detach loads die naar deze case verwijzen.
+      setLoads(prev => prev.filter(l => l.caseId !== id));
+      // Switch actieve case als die verdwijnt.
+      setActiveLoadCaseId(curr => curr === id ? (na.loadCases[0]?.id ?? 1) : curr);
+    },
+    addCombination: (combo) => {
+      pasCombiStaatToe(voegCombinatieToe(combiRef.current, combo));
+    },
+    updateCombination: (id, patch) => {
+      pasCombiStaatToe(wijzigCombinatie(combiRef.current, id, patch));
+    },
+    removeCombination: (id) => {
+      pasCombiStaatToe(verwijderCombinatie(combiRef.current, id));
+      setActiveCombinationId(curr => curr === id ? null : curr);
+    },
+    vervangDoorStandaardCombinaties: () => {
+      pasCombiStaatToe(vervangDoorStandaard(combiRef.current));
+      setCombinatieAfwijking(null);
+      setActiveCombinationId(null);
+    },
+    sluitCombinatieAfwijking: () => setCombinatieAfwijking(null),
+    bevestigEigenFactoren: () => {
+      pasCombiStaatToe(bevestigEigenFactoren(combiRef.current).staat);
+      setCombinatieAfwijking(null);
+    },
+    trekBevestigingEigenFactorenIn: () => {
+      pasCombiStaatToe(trekBevestigingIn(combiRef.current).staat);
+    },
+    maakCombinatieVervangingOngedaan: () => {
+      const v = vervangingRef.current;
+      if (!v) return;
+      pasCombiStaatToe(herstelCombinaties(combiRef.current, v.voor));
+      zetVervanging(null);
+      setActiveCombinationId(null);
+      meldVervangingOngedaan(
+        v.voor.length,
+        '"Vervang door standaardcombinaties" bij die FOUT zet de standaardset terug.',
+      );
+      // De historiestap draagt dezelfde vervanging; bleef hij staan, dan zou
+      // Ctrl+Z of Ctrl+Y hem later nog eens terugdraaien of opnieuw uitvoeren.
+      setHistory((prev) => prev.map((s) => (s.combinatieStap ? { ...s, combinatieStap: undefined } : s)));
+    },
+
+    /** Replace the entire model from a deserialized project file. */
+    loadProjectState: (p: {
+      nodes: Node[]; beams: Beam[]; supports: Support[]; plates: Plate[]; loads: Load[];
+      loadCases: LoadCase[]; activeLoadCaseId: number;
+      selfWeightEnabled?: boolean;
+    /**
+     * OUD veld. Bestanden van vóór het analysetype dragen alleen deze
+     * booleaan; hij blijft leidend zolang `analysetype` ontbreekt.
+     */
+    nonlinearEnabled?: boolean;
+    /** v2: analysetype; ontbreekt → afgeleid uit `nonlinearEnabled`. */
+    analysetype?: string;
+    axialMaterialLoadPath?: number[];
+    /** v2: gewenste segmentlengte in mm; ontbreekt → 400 (besluit B3). */
+    betonSegmentLengteMm?: number;
+    /** φ(∞,t₀) van het project (art. 3.1.4); ontbreekt → niet opgegeven. */
+    betonKruipcoefficient?: number | null;
+    /** Invoer voor φ(∞,t₀) volgens bijlage B; ontbreekt → niet berekenen. */
+    betonKruipInvoer?: KruipInvoerProject | null;
+      combinations?: LoadCombination[];
+      structuralGrid?: StructuralGrid;
+      scheefstandEnabled?: boolean;
+      scheefstandNoemer?: number;
+      scheefstandRichting?: 1 | -1;
+      scheefstandBron?: string;
+      scheefstandHoogteM?: number | null;
+      scheefstandAantalElementen?: number | null;
+      scheefstandAantalX?: number | null;
+      scheefstandAantalY?: number | null;
+      scheefstandTorsie?: boolean;
+      scheefstandEigenKolom?: boolean;
+      houtToetsEN1995?: boolean;
+      gevolgklasse?: Gevolgklasse;
+      /** De nationale bijlage uit de projectgegevens van het bestand, zoals gelezen. */
+      nationaleBijlage?: unknown;
+      idTellers?: { belastinggeval?: number; combinatie?: number };
+      combinatiesVervangenBijOpenen?: string;
+    }) => {
+      // Oude bestanden zonder plaat-rekenvelden → defaults aanvullen
+      // (dikte 20 mm, staal, meshSize 500 mm), zie withPlateDefaults.
+      const plates = p.plates.map(withPlateDefaults);
+      setNodes(p.nodes);
+      setBeams(p.beams);
+      setSupports(p.supports);
+      setPlates(plates);
+      setLoads(p.loads);
+      // Gevallen, combinaties, klasse en tellers in één keer, via
+      // `openCombinatieStaat` (lib/combinatieBeheer) — dezelfde functie als de
+      // sidecar bij `project_path`. Een bestand zonder combinaties (v1, of
+      // Nieuw) krijgt de standaardset van ZIJN gevallen. Een bestand MET
+      // combinaties: factoren voor gevallen die niet bestaan gaan eruit (de
+      // teller komt boven elk id uit de factortabellen, basisaudit nr 14), en
+      // wat de app zelf ooit maakte maar nu anders zou maken — de standaardset
+      // van 0.3.11 en ouder, een andere gevolgklasse, de windgenerator — wordt
+      // VERVANGEN, als eigen historiestap zodat Ctrl+Z het terugdraait. Eigen
+      // combinaties blijven staan en worden gecontroleerd.
+      // De klasse: uit het bestand, anders uit het kenmerk van de
+      // standaardcombinaties in het bestand, anders die van het project dat
+      // open stond — dezelfde regel als de sidecar (`gevolgklasseBijOpenen`).
+      const { klasse, bron: gevolgklasseBron } = gevolgklasseBijOpenen({
+        bestand: p.gevolgklasse,
+        combinations: p.combinations,
+        terugval: combiRef.current.gevolgklasse,
+      });
+      // De bijlage (normnaad): een gevulde bijlage uit het bestand, anders die
+      // uit het kenmerk van de standaardcombinaties, anders die van het project
+      // dat open stond — dezelfde volgorde als de klasse. Een ONBEKENDE code uit
+      // het bestand geeft geen rij om combinaties mee op te stellen; dan blijft
+      // de huidige staan en weigeren de kernen die code zelf met reden.
+      const bestandsBijlage = (BIJLAGEN_GEVULD as readonly unknown[]).includes(p.nationaleBijlage)
+        ? (p.nationaleBijlage as NationaleBijlageCode)
+        : null;
+      const bijlage = bestandsBijlage ?? bijlageUitKenmerk(p.combinations) ?? combiRef.current.bijlage;
+      const { staat: geopend, afwijking, vervanging } = openCombinatieStaat({
+        loadCases: p.loadCases,
+        combinations: p.combinations,
+        gevolgklasse: klasse,
+        bijlage,
+        idTellers: p.idTellers,
+        // Voor de melding over wees-factoren: stond er een last in zo'n geval?
+        loads: p.loads,
+      });
+      pasCombiStaatToe(geopend);
+      setCombinatieAfwijking(afwijking);
+      zetVervanging(vervanging);
+      setVervangingUitBestand(
+        typeof p.combinatiesVervangenBijOpenen === "string" && p.combinatiesVervangenBijOpenen.trim() !== ""
+          ? p.combinatiesVervangenBijOpenen
+          : null,
+      );
+      setActiveLoadCaseId(p.activeLoadCaseId);
+      setSelfWeightEnabled(!!p.selfWeightEnabled);
+      // Terugleesbaarheid: een bestand zonder `analysetype` valt terug op de
+      // oude booleaan — true wordt de geometrische tweede orde, false de
+      // eerste orde. Zie `analysetypeUitBestand` in femTypes.
+      setAnalysetype(analysetypeUitBestand(p.analysetype, p.nonlinearEnabled));
+      setAxialMaterialLoadPath(p.axialMaterialLoadPath ?? [1]);
+      setBetonSegmentLengteMm(
+        typeof p.betonSegmentLengteMm === "number" && p.betonSegmentLengteMm > 0
+          ? p.betonSegmentLengteMm
+          : STANDAARD_SEGMENTLENGTE_MM,
+      );
+      // Ontbreekt het veld (elk bestand van vóór september 2026), dan is de
+      // kruipcoëfficiënt NIET opgegeven — niet 0. Een 0 aannemen zou een oud
+      // project stil zonder kruip laten rekenen, en dat is de onveilige kant.
+      setBetonKruipcoefficient(
+        typeof p.betonKruipcoefficient === "number" && p.betonKruipcoefficient >= 0
+          ? p.betonKruipcoefficient
+          : null,
+      );
+      // Bijlage-B-invoer: ontbreekt of is hij onleesbaar, dan staat bijlage B
+      // uit. Er wordt dan niets berekend, en een ouder bestand rekent als
+      // voorheen.
+      setBetonKruipInvoer(leesKruipInvoer(p.betonKruipInvoer));
+      // Scheefstand — ontbrekende velden (v1/oudere v2-bestanden) → uit,
+      // noemer 200 (φ = 1/200), richting +x.
+      setScheefstandEnabled(!!p.scheefstandEnabled);
+      setScheefstandNoemer(
+        typeof p.scheefstandNoemer === "number" && p.scheefstandNoemer > 0
+          ? p.scheefstandNoemer : 200,
+      );
+      setScheefstandRichting(p.scheefstandRichting === -1 ? -1 : 1);
+      // De normberekening van φ. Een onbekende of ontbrekende bron valt terug
+      // op "vast" — het oude gedrag. Dat is de harde eis: een bestaand
+      // projectbestand mag na een update niet stilzwijgend met een kleinere
+      // scheefstand gaan rekenen.
+      setScheefstandBron(
+        (SCHEEFSTAND_BRONNEN as readonly string[]).includes(p.scheefstandBron ?? "")
+          ? (p.scheefstandBron as ScheefstandBron)
+          : "vast",
+      );
+      setScheefstandHoogteM(
+        typeof p.scheefstandHoogteM === "number" && p.scheefstandHoogteM > 0
+          ? p.scheefstandHoogteM : null,
+      );
+      setScheefstandAantalElementen(
+        typeof p.scheefstandAantalElementen === "number" && p.scheefstandAantalElementen >= 1
+          ? Math.floor(p.scheefstandAantalElementen) : null,
+      );
+      // 3D (issue #212): ontbreekt = afleiden en geen torsievarianten, het gedrag van vóór #212.
+      const mPerAs = (v: unknown) => (typeof v === "number" && v >= 1 ? Math.floor(v) : null);
+      setScheefstandAantalX(mPerAs(p.scheefstandAantalX));
+      setScheefstandAantalY(mPerAs(p.scheefstandAantalY));
+      setScheefstandTorsie(p.scheefstandTorsie === true);
+      setScheefstandEigenKolom(p.scheefstandEigenKolom === true);
+      setHoutToetsEN1995(p.houtToetsEN1995 === true);
+      // v2-velden; v1-bestanden (of Nieuw) vallen terug op de defaults.
+      // (De combinaties zijn hierboven al gezet, samen met de gevallen.)
+      const nieuwGrid = p.structuralGrid ?? DEFAULT_STRUCTURAL_GRID;
+      gridRef.current = nieuwGrid;
+      setStructuralGridState(nieuwGrid);
+      // Combinatie-ids uit het bestand hoeven niet overeen te komen met de
+      // vorige selectie — selectie resetten voorkomt een dangling id.
+      setActiveCombinationId(null);
+      setSelection(null);
+      // Reset history so undo can't time-travel back to the previous model.
+      // Is er bij het openen vervangen, dan is dat de eerste en enige stap:
+      // Ctrl+Z zet de combinaties uit het bestand terug.
+      const basis: HistorieSnapshot = {
+        nodes: p.nodes, beams: p.beams, supports: p.supports, plates,
+        loads: p.loads, structuralGrid: nieuwGrid,
+      };
+      const startIdx = vervanging ? 1 : 0;
+      setHistory(vervanging ? [basis, { ...basis, combinatieStap: vervanging }] : [basis]);
+      setHistoryIdx(startIdx);
+      historyIdxRef.current = startIdx;
+      return { afwijking, vervanging, gevolgklasse: klasse, gevolgklasseBron };
+    },
+  };
+}

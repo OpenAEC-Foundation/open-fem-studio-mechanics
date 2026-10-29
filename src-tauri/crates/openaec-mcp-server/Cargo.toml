@@ -1,0 +1,63 @@
+[package]
+name = "openaec-mcp-server"
+version = "2026.44.0"
+edition = "2021"
+description = "MCP (Model Context Protocol) server exposing the OpenAEC steel-check engine"
+license = "AGPL-3.0-or-later"
+
+# Bouwpoort op de ingebakken solverbundel: de build faalt als
+# `assets/fem-kernel.mjs` niet bij `assets/fem-kernel.sha256` hoort.
+build = "build.rs"
+
+# De server is een binary; het libdeel bestaat zodat `tests/` bij de
+# sidecar-aansturing kan. Zie src/lib.rs.
+[lib]
+name = "openaec_mcp_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openaec-mcp-server"
+path = "src/main.rs"
+
+
+[build-dependencies]
+sha2 = "0.10"
+
+[dependencies]
+serde = { workspace = true }
+# `float_roundtrip` is hier GEEN optionele netheid. Zonder deze feature parseert
+# serde_json een double uit JSON langs een snelle route die er 1 ULP naast kan
+# zitten. De FEM-tools zijn precies een JSON-doorgeefluik: de sidecar schrijft
+# een getal als tekst, deze server leest het en schrijft het opnieuw. Verschuift
+# bij dat lezen de laatste bit, dan krijgt de MCP-client NIET het getal dat de
+# solver uitrekende. Gemeten op het gouden portaal (tests/golden, taak T13):
+# drie waarden schoven een ULP op, waaronder een doorbuiging. Plan §5.2 laag B
+# eist bit-identiteit tussen bundel en MCP-tool juist omdat beide in dezelfde
+# runtime draaien; met de snelle parser is die eis onhaalbaar, hoe goed de
+# rekenkern ook is.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# `process` en `time` staan hier en niet meer bij de dev-afhankelijkheden: de
+# sidecar-aansturing start Node-processen en bewaakt de klok in de
+# PRODUCTIECODE, niet alleen in tests.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "process", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+# ureq: kleine synchrone HTTP-client voor de gui_*-tools (bedieningskanaal van de app).
+ureq = { version = "2", features = ["json"] }
+# Hashpoort op de solverbundel (build.rs en sidecar.rs).
+sha2 = "0.10"
+# Engine crates
+steel-profiles = { path = "../steel-profiles" }
+section-properties = { path = "../section-properties" }
+# Ruimtelijke raamwerken: exact dezelfde neutrale adapter en vastgezette
+# externe 3D-kern als het Tauri-command `solve_open_fem_3d`.
+open-fem-3d = { path = "../open-fem-3d" }
+# Dedaliano-kern onder de oude cratenaam, als het Tauri-command `solve_frame3d`.
+frame3d-solver = { path = "../frame3d-solver" }
+openaec-native-fem = { path = "../native-fem", default-features = false }
+
+[dev-dependencies]
+# De toetsbrug als bibliotheek: de drie-wegen-verificatie roept zijn werkelijke
+# `behandel` aan in plaats van hem na te programmeren.
+toetsbrug = { path = "../toetsbrug", default-features = false }

@@ -1,0 +1,14 @@
+[package]
+name = "openaec-native-fem"
+version = "2026.44.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Independent Rust finite-element kernels for Open FEM Studio"
+
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+frame3d-solver = { path = "../frame3d-solver" }

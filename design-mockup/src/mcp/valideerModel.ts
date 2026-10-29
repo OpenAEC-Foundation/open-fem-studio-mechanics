@@ -1,0 +1,2027 @@
+/**
+ * valideerModel.ts — strenge modelvalidatie voor de MCP-sidecar.
+ *
+ * WAAROM STRENG, EN WAAROM DIT BESTAND BESTAAT
+ * De rekenketen is vergevingsgezind op precies de verkeerde plek. Een lijnlast
+ * met `qq` in plaats van `q` valt in `bouwMultiInput` door alle takken heen en
+ * verdwijnt zonder een woord; een onbekende of ontbrekende profielnaam gaf
+ * vroeger in `resolveSection` een vervangende doorsnede (nu weigert de solver
+ * zo'n staaf met DOORSNEDE_ONBEKEND, #247); een puntlast op een knoop die aan
+ * geen enkele staaf hangt wordt bij het opbouwen van de krachtvector
+ * overgeslagen. In alle drie de gevallen SLAAGT de berekening en komt er een
+ * plausibel ogend antwoord uit dat bij een ander model hoort. Voor een
+ * constructeur is dat gevaarlijker dan een foutmelding: nul leest als nul.
+ *
+ * Daarom weigert deze validatie ONBEKENDE VELDEN in plaats van ze te negeren.
+ * Een tikfout in een sleutel is de enige waarneembare aanwijzing dat de
+ * aanroeper iets anders bedoelde dan er staat; hem opeten maakt het verschil
+ * tussen "u bedoelde `q`" en een stille nul onzichtbaar.
+ *
+ * TWEE INGANGEN, met verschillend gebruik:
+ *
+ *   controleerVelden(rauw) → string[]
+ *       De HARDE POORT. Alleen vorm, veldnamen en types. Draait ook vóór elke
+ *       `solve` en `check`: een model dat hier faalt mag nooit doorgerekend
+ *       worden, want dan is niet te zeggen wélk model er is doorgerekend.
+ *
+ *   valideerModel(rauw) → { ok, errors, warnings }
+ *       De VOLLEDIGE droogloop (`op: "validate"`, plan §3.2): de veldcontrole
+ *       plus de constructieve controles — losse knopen, mechanisme, staven met
+ *       lengte 0, dubbele knopen, onbekende profiel/materiaalcombinaties,
+ *       lasten die stil wegvallen, belastinggevallen zonder werkzame last en
+ *       polygoonplaten zonder geldige meshcache.
+ *
+ * WAT DEZE VALIDATIE NIET CLAIMT
+ * `ok: true` betekent "geen van de bekende valkuilen aangetroffen", niet "dit
+ * model is oplosbaar". De mechanismecontrole toetst eerst NOODZAKELIJKE
+ * voorwaarden (er moet in x én z gesteund zijn, rotatie moet verhinderd zijn,
+ * elk losstaand constructiedeel moet ergens steunen). Dat een stelsel niet
+ * singulier is, bewijst alleen de ontbinding zelf. Die wordt daarom niet
+ * benaderend nageschreven, maar sinds issue #248 voor modellen zonder platen
+ * aan de rekenkern zelf gevraagd (`zoekMechanisme`: dezelfde mesh, matrix,
+ * randvoorwaarden en oplosser als de berekening, zonder last). Een tweede,
+ * eigen stelselcontrole zou een tweede antwoord op dezelfde vraag zijn, en dat
+ * is precies wat dit ontwerp vermijdt.
+ *
+ * GEEN TWEEDE WAARHEID
+ * De controle "valt deze last stilzwijgend weg?" wordt niet nageschreven maar
+ * GEMETEN: de last gaat door `bouwMultiInput` — dezelfde functie die de app
+ * gebruikt — en levert die daar geen invoerregel op, dan telt hij niet mee.
+ * Zo kan deze validatie per definitie niet uit de pas lopen met de mapping.
+ * Om dezelfde reden komt de doorsnedecontrole uit `resolveSection` en de
+ * plaatvormcontrole uit `valideerPlaatPolygoon` / `plaatRekentAlsRaster` en de
+ * openingencontrole uit `valideerPlaatOpeningen`.
+ */
+import {
+  GEBRUIKSCATEGORIEEN,
+  plaatMeshSignatuurVan,
+  plaatRekentAlsRaster,
+  valideerPlaatOpeningen,
+  PLAAT_MESH_TYPEN,
+  bepaalPlaatlastRand,
+  valideerPlaatPolygoon,
+  type PlaatPunt,
+} from "../components/fem/femTypes";
+import { puntInPolygoon, afstandTotLijnstuk } from "../core/fem/PlaatMesher";
+import {
+  lastWaardeFout, zoekDubbeleKnopen, zoekStaafeindenBijPlaatrand, type LastWaardeVelden,
+} from "../lib/modelControle";
+import { bouwMultiInput, type FemModelInvoer } from "../lib/modelNaarSolverInput";
+import { zoekMechanisme } from "../components/fem/solver/engine";
+import { combineerOpleggingen } from "../components/fem/solver/opleggingen";
+import { bepaalVerloop, resolveSection } from "../lib/sectionResolver";
+import { keurPlaatMateriaal, plaatMateriaalSoort } from "../lib/plaatMateriaal";
+import { plaatPlooiGeometrieFout } from "../lib/plaatPlooi";
+import type { Plate, Node } from "../components/fem/femTypes";
+// De geldige bronnen van de scheefstand — één lijst met de app en de sidecar.
+import { SCHEEFSTAND_BRONNEN } from "../lib/scheefstandNorm";
+// De wapeningsstaalsoorten komen uit de betonbouwer en worden hier niet
+// nageschreven: één lijst, anders keurt deze poort straks een staalsoort af
+// die de kern wél kent.
+import { SUPPORTED_REINFORCEMENT_GRADES } from "../lib/betonMateriaal";
+import type { LoadCase } from "../components/fem/femTypes";
+import type { LoadCombination } from "../components/fem/solver/combinations";
+import type { Gevolgklasse } from "../components/fem/solver/normcombinaties";
+import type { NationaleBijlageCode } from "../lib/normAanduidingen";
+// Eén regel voor "telt dit geval mee": dezelfde functie voedt de projectboom,
+// het rapport en de solve-waarschuwingen van de sidecar.
+import {
+  bevestigdeEigenFactoren, meldingenBelastinggevallen, tekstBevestigdeEigenFactoren,
+} from "../lib/combinatieBeheer";
+import { matchSupportedTimberGrade } from "../lib/houtMateriaal";
+// "C30" is hout én de korte naam van C30/37 — dezelfde melding als de
+// modelcontrole in de app (basisaudit nr 16).
+import { dubbelzinnigMateriaal, dubbelzinnigMateriaalTekst } from "../lib/materiaalDubbelzinnig";
+
+/** Uitkomst van de volledige droogloop; alle teksten zijn Nederlands. */
+export interface ValidatieUitkomst {
+  ok: boolean;
+  /** Blokkerend: doorrekenen levert een fout of een antwoord bij een ánder model. */
+  errors: string[];
+  /** Niet blokkerend, wel het melden waard. */
+  warnings: string[];
+}
+
+// ── Toegestane velden per objectsoort ──────────────────────────────────────
+// Deze lijsten zijn de spiegel van `femTypes.ts` en `FemModelInvoer`. Wordt
+// daar een veld toegevoegd, dan hoort het hier ook; tot die tijd weigert de
+// validatie het — luidruchtig, en dat is de bedoeling.
+
+const MODEL_VELDEN = [
+  "nodes", "beams", "supports", "plates", "loadCases", "loads",
+  "selfWeightEnabled", "scheefstandEnabled", "scheefstandNoemer",
+  "scheefstandRichting",
+  // De normkeuze van de scheefstand (basisaudit nr 19): de sidecar rekent φ
+  // hiermee zoals de app; het MCP-schema kent dezelfde drie velden.
+  "scheefstandBron", "scheefstandHoogteM", "scheefstandAantalElementen",
+  // Issue #199, fase 3: de eigen scheefstand per losse kolom in de UGT-toets.
+  "scheefstandEigenKolom",
+  // Issue #199, fase 4: hout in de UGT-toets volgens NEN-EN 1995-1-1.
+  "houtToetsEN1995",
+] as const;
+
+const NODE_VELDEN = ["id", "x", "z"] as const;
+
+const BEAM_VELDEN = [
+  "id", "from", "to", "material", "profile", "releases", "checkConfig",
+  "loadRole",
+  // Eindprofiel van een verlopende staaf (ontwerp 15 september 2026, §4.1);
+  // `profile` is dan het beginprofiel. Zelfde spiegel in `schema_beams`
+  // (openaec-mcp-server/src/fem_tools.rs), bewaakt door een Rust-test.
+  "profileEnd",
+  // Verende aansluiting (`BeamEindVeren`) en staaf op bedding (`BeamBedding`).
+  // Allebei schrijft de app ze in het projectbestand en rekent de kern ermee;
+  // ze stonden hier niet, dus een geldig model met een verende aansluiting of
+  // een staaf op bedding — de referentie R26 — werd langs de MCP-weg en de
+  // toetsbrug geweigerd met "onbekend veld". Dat is de omgekeerde fout van
+  // waar deze lijst voor is: niet een tikfout tegenhouden, maar een geldig
+  // model weigeren, waarna de drie wegen verschillende antwoorden geven.
+  "veren", "bedding",
+  // Trek-alleen staaf (issue #234): valt uit zolang hij op druk staat. Zelfde
+  // spiegel in `schema_beams` (fem_tools.rs).
+  "tensionOnly",
+] as const;
+
+const RELEASE_VELDEN = [
+  "startTx", "startTz", "startRy", "endTx", "endTz", "endRy",
+] as const;
+
+/** De zes veerstijfheden van `BeamEindVeren` — zelfde namen als `releases`. */
+const VEER_VELDEN = [
+  "startTx", "startTz", "startRy", "endTx", "endTz", "endRy",
+] as const;
+
+/** Beddingsconstante k (kN/m³) en contactbreedte b (mm) — `BeamBedding`. */
+const BEDDING_VELDEN = ["k", "b"] as const;
+
+/** De velden van één langswapeningszone (`LongitudinalZone`). */
+const ZONE_LANGS_VELDEN = [
+  "side", "row", "x_start_mm", "x_end_mm", "bar_shape", "casting_position",
+] as const;
+
+/** De velden van één beugelzone (`StirrupZone`). */
+const ZONE_BEUGEL_VELDEN = [
+  "x_start_mm", "x_end_mm", "spacing_mm", "legs", "diameter_mm",
+] as const;
+
+// De betonvelden stonden hier NIET, terwijl `BeamCheckConfig` ze al kende.
+// Gevolg: elk model met een wapeningskorf — de gewone toestand van een
+// betonstaaf, en sinds september 2026 ook het startmodel — werd door deze
+// poort afgekeurd met `onbekend veld betonKorf`, terwijl de app hem gewoon
+// opslaat en doorrekent. Dat is de omgekeerde fout van waar de lijst voor is:
+// niet een tikfout tegenhouden, maar een geldig model weigeren.
+const CHECKCONFIG_VELDEN = [
+  "bucklingLengthY_m", "bucklingLengthZ_m", "lateralRestraints",
+  "lateralRestraintsBottom", "deflectionClass", "deflectionLimitNumerator",
+  "deflectionAddLimitNumerator", "preCamber_mm", "serviceClass", "loadDuration",
+  "betonKorf", "betonMilieuklasse", "betonConstructieklasse", "betonStaalsoort",
+  "betonStroken", "betonStaaltak", "betonKolom", "spanningSigmaZ",
+  // De wapeningszones per stuk (`ReinforcementZones`, §9.2.1.3 en §9.2.2). De
+  // korfeditor schrijft ze en `betonCheckBuilder` leest ze; ze stonden hier
+  // niet, dus elke betonstaaf met zones werd langs de MCP-weg geweigerd.
+  "betonZones",
+  // De kipsteunafstand van hout (EN 1995-1-1 art. 6.3.3). De UI schrijft hem
+  // weg en `timberCheckBuilder` leest hem, maar hij stond hier niet: elk
+  // houtmodel met een kipsteunafstand werd langs de MCP-weg geweigerd.
+  "ltbSupportSpacing_m",
+  // De drie houtkeuzen van september 2026: scheurfactor k_cr (6.1.7),
+  // kiptoets aan/uit (6.3.3(5)) en het aangrijpingspunt van de belasting
+  // (tabel 6.1). Tot dan zaten ze vast in de houtbouwer.
+  "kCr", "performLtbCheck", "ltbLoadPosition",
+  // Issue #253: welke rand van een verlopende houten ligger schuin loopt (6.4.2).
+  "schuineRand",
+  // Kruislaaghout: de vervormingsfactor k_def van §7.2 met zijn bron. Tabel 3.2
+  // kent geen rij voor kruislaaghout, dus is er niets om op terug te vallen;
+  // zonder deze twee blijft de doorbuigingstoets van een CLT-staaf uit, met
+  // reden in het resultaat.
+  "cltKdef", "cltKdefBron",
+  // Issue #232: de gedeclareerde rolschuifsterkte van kruislaaghout met bron.
+  "cltFvRolK", "cltFvRolKBron",
+  // Aluminium (NEN-EN 1999-1-1, issue #5): lasstatus en de verklaring dat
+  // kip niet kan optreden. `aluminiumCheckBuilder` leest ze.
+  "aluLasstatus", "aluZijdelingsGesteund",
+  // Koudgevormde profielen (NEN-EN 1993-1-3, issue #4): de verklaring dat
+  // kip niet kan optreden. `koudgevormdCheckBuilder` leest hem.
+  "kvZijdelingsGesteund",
+] as const;
+
+/** De drie aangrijpingspunten van tabel 6.1, in de spelling van `checkConfig`. */
+const LTB_LASTPOSITIES = ["centreOfGravity", "compressionEdge", "tensionEdge"] as const;
+/** De schuine rand van een verlopende houten ligger (6.4.2), als de Rust-enum `SchuineRand`. */
+const SCHUINE_RANDEN = ["Boven", "Onder", "Beide"] as const;
+
+/**
+ * De velden van het §5.8-blok (`ConcreteColumnInput`), inclusief de drie om de
+ * TWEEDE as voor §5.8.9: `bracing_z`, `buckling_length_z` en `m0_edz_knm`.
+ */
+const KOLOM_VELDEN = [
+  "bracing", "buckling_length", "phi_inf_t0", "stirrup_zone", "lap_situation",
+  "bracing_z", "buckling_length_z", "m0_edz_knm",
+] as const;
+
+/** De twee waarden van `Schoring` — het ontwerpbesluit van §5.8.1. */
+const SCHORINGEN = ["Geschoord", "Ongeschoord"] as const;
+
+/** De vijf vakjes van figuur 5.7 met een VASTE l₀. */
+const KNIKGEVALLEN_GELDIG = [
+  "ScharnierendScharnierend", "Console", "IngeklemdScharnierend",
+  "TweezijdigIngeklemdGeschoord", "TweezijdigIngeklemdOngeschoord",
+] as const;
+
+const BEUGELZONES = ["Regulier", "BijBalkOfPlaat", "BijOverlappingslas"] as const;
+
+const OVERLAPPINGSSITUATIES = [
+  "GeenLassen", "LassenBuitenDezeDoorsnede", "TerPlaatseVanLas",
+] as const;
+
+/**
+ * De dragende velden van één wapeningskorf (`ReinforcementCage`). ALLE VIER
+ * verplicht: een korf zonder `bottom` is geen halve korf maar een ander
+ * wapeningsplan, en de betonbouwer zou er zonder mopperen een balk zonder
+ * onderwapening van maken.
+ */
+const KORF_VELDEN_VERPLICHT = ["cover_mm", "stirrup_diameter_mm", "top", "bottom"] as const;
+
+/**
+ * De beugelvelden voor §6.2.3 en §9.2.2. OPTIONEEL: ontbreken betekent "niet
+ * opgegeven", en dan meldt de dwarskrachttoets dat hij niet kan. De norm
+ * schrijft voor geen van de vier een waarde voor — §9.2.2(6) en (8) geven
+ * alleen bovengrenzen — dus een standaardwaarde zou een ontwerpbeslissing zijn
+ * die de app voor de constructeur neemt.
+ *
+ * Ze moeten hier wél staan: `keurVelden` weigert alles wat er niet in staat,
+ * dus zonder deze regel zou een model mét beugelgegevens de poort niet halen.
+ */
+const KORF_VELDEN_BEUGEL = [
+  "stirrup_spacing_mm",
+  "stirrup_legs",
+  "stirrup_leg_spacing_mm",
+  "stirrup_fywk_mpa",
+] as const;
+
+const KORF_VELDEN = [...KORF_VELDEN_VERPLICHT, ...KORF_VELDEN_BEUGEL] as const;
+
+/** Velden van één wapeningsrij (`RebarRow`) — allebei verplicht. */
+const REBARROW_VELDEN = ["count", "diameter_mm"] as const;
+
+/** Milieuklassen van tabel 4.1, in de volgorde van `ExposureClass`. */
+const MILIEUKLASSEN = [
+  "X0", "XC1", "XC2", "XC3", "XC4", "XD1", "XD2", "XD3",
+  "XS1", "XS2", "XS3", "XF1", "XF2", "XF3", "XF4", "XA1", "XA2", "XA3",
+] as const;
+
+/** Constructieklassen van 4.4.1.2(5). */
+const CONSTRUCTIEKLASSEN = ["S1", "S2", "S3", "S4", "S5", "S6"] as const;
+
+/** Bovenste tak van het staaldiagram, 3.2.7(2). */
+const STAALTAKKEN = ["Horizontal", "Inclined"] as const;
+
+const SUPPORT_VELDEN = ["nodeId", "type", "k"] as const;
+
+const PLOOI_VELDEN = ["a_mm", "b_mm", "randvoorwaarden", "steun_bron", "onverstijfd", "uniforme_spanning"] as const;
+const PLATE_VELDEN = [
+  "id", "nodeIds", "thickness", "E", "nu", "rho", "meshSize", "meshCache",
+  "meshType", "openingen", "materiaal", "hoofdrichting",
+  "cltG12", "cltG12Bron", "cltG12Bovengrens", "klimaatklasse", "plooi", "wapening",
+] as const;
+
+/** Velden van één opening in een plaat (`PlaatOpening`). */
+const OPENING_VELDEN = ["id", "punten"] as const;
+
+const MESHCACHE_VELDEN = [
+  "signature", "points", "triangles", "edgeNodeIndices",
+  "quads", "meshSoort", "openingEdgeNodeIndices",
+] as const;
+
+/** Wat een mesher kan opleveren (`PlaatMeshSoort`). */
+const MESHSOORTEN = ["driehoeken", "vierhoeken", "gemengd"] as const;
+
+const LOAD_VELDEN = [
+  "id", "type", "caseId", "nodeId", "fx", "fz", "my", "beamId", "posFrac",
+  "q", "qStart", "qEnd", "qDir", "qCoord", "startFrac", "endFrac", "deltaT",
+  "plateId", "edge", "edgeIndex", "openingId", "gegenereerdDoor", "omschrijving",
+] as const;
+
+const LOADCASE_VELDEN = ["id", "name", "type", "categorie", "gegenereerd", "eigenGewicht", "imperfectie"] as const;
+
+const SUPPORT_TYPES = [
+  "pinned", "fixed", "xRoller", "zRoller", "zSpring", "xSpring", "rotSpring",
+] as const;
+
+const LOAD_TYPES = [
+  "pointForce", "pointMoment", "lineLoad", "thermal", "edgeLoad",
+] as const;
+
+const LOADCASE_TYPES = ["dead", "live", "snow", "wind", "other"] as const;
+
+const LOADROLLEN = [
+  "gevelLinks", "gevelRechts", "dakPlat", "dakHellend", "overstek", "vloer",
+  "binnen",
+] as const;
+
+/** Welke vrijheidsgraad elk oplegtype vastzet (veren tellen als vastgezet). */
+const VASTGEZET: Record<string, ("x" | "z" | "ry")[]> = {
+  fixed: ["x", "z", "ry"],
+  pinned: ["x", "z"],
+  xRoller: ["x"],
+  zRoller: ["z"],
+  xSpring: ["x"],
+  zSpring: ["z"],
+  rotSpring: ["ry"],
+};
+
+// ── Kleine hulpjes ─────────────────────────────────────────────────────────
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+const isGetal = (v: unknown): v is number =>
+  typeof v === "number" && Number.isFinite(v);
+
+const isGeheel = (v: unknown): v is number => isGetal(v) && Number.isInteger(v);
+const isEindig = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** Levenshtein-afstand, alleen voor de "bedoelde u …?"-hint. */
+function afstand(a: string, b: string): number {
+  const rij = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let vorige = rij[0];
+    rij[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tijdelijk = rij[j];
+      rij[j] = Math.min(
+        rij[j] + 1,
+        rij[j - 1] + 1,
+        vorige + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      vorige = tijdelijk;
+    }
+  }
+  return rij[b.length];
+}
+
+/**
+ * Dichtstbijzijnde bekende veldnaam, of null als niets in de buurt komt. De
+ * drempel schaalt mee met de lengte: bij `qq` (2 tekens) telt één afwijking,
+ * bij `deflectionLimitNumerato` mogen er meer zijn.
+ */
+function dichtstbij(veld: string, bekend: readonly string[]): string | null {
+  let beste: string | null = null;
+  let besteAfstand = Number.POSITIVE_INFINITY;
+  for (const kandidaat of bekend) {
+    const d = afstand(veld.toLowerCase(), kandidaat.toLowerCase());
+    if (d < besteAfstand) {
+      besteAfstand = d;
+      beste = kandidaat;
+    }
+  }
+  const drempel = Math.max(1, Math.floor(veld.length / 3));
+  return beste !== null && besteAfstand <= drempel ? beste : null;
+}
+
+/** Elk veld dat niet in `toegestaan` staat is een fout, mét hint. */
+function keurVelden(
+  obj: Record<string, unknown>,
+  toegestaan: readonly string[],
+  pad: string,
+  fouten: string[],
+): void {
+  for (const veld of Object.keys(obj)) {
+    if (toegestaan.includes(veld)) continue;
+    const hint = dichtstbij(veld, toegestaan);
+    fouten.push(
+      `${pad}: onbekend veld \`${veld}\`. ` +
+        (hint !== null
+          ? `Bedoelde u \`${hint}\`? Een onbekend veld wordt niet meegerekend.`
+          : `Bekende velden: ${toegestaan.join(", ")}.`),
+    );
+  }
+}
+
+/** Waarde moet een van de toegestane teksten zijn (als hij er staat). */
+function keurEnum(
+  waarde: unknown,
+  toegestaan: readonly string[],
+  pad: string,
+  fouten: string[],
+): void {
+  if (waarde === undefined) return;
+  if (typeof waarde !== "string" || !toegestaan.includes(waarde)) {
+    fouten.push(
+      `${pad}: ${JSON.stringify(waarde)} is geen geldige waarde. ` +
+        `Toegestaan: ${toegestaan.join(", ")}.`,
+    );
+  }
+}
+
+/** Optioneel getalveld; leeg is goed, aanwezig-maar-geen-getal niet. */
+function keurGetal(
+  waarde: unknown,
+  pad: string,
+  fouten: string[],
+  { positief = false, nietNegatief = false } = {},
+): void {
+  if (waarde === undefined) return;
+  if (!isGetal(waarde)) {
+    fouten.push(`${pad}: moet een getal zijn, maar is ${JSON.stringify(waarde)}.`);
+    return;
+  }
+  if (positief && waarde <= 0) {
+    fouten.push(`${pad}: moet groter dan nul zijn, maar is ${waarde}.`);
+  }
+  // Nul toegestaan, negatief niet — voor grootheden waarvan 0 een betekenis
+  // heeft ("geen kruip") maar een negatieve waarde niet bestaat.
+  if (nietNegatief && waarde < 0) {
+    fouten.push(`${pad}: mag niet negatief zijn, maar is ${waarde}.`);
+  }
+}
+
+/**
+ * Verende aansluiting (`BeamEindVeren`): per vrijheidsgraad een stijfheid in
+ * kN/mm (translatie) of kNm/rad (rotatie).
+ *
+ * NUL WORDT GEWEIGERD en niet als "geen veer" gelezen: een veer met stijfheid
+ * nul is een scharnier, en dat hoort in `releases` te staan. Zou de poort hem
+ * doorlaten, dan gaf hetzelfde bestand langs de ene weg een scharnier en langs
+ * de andere een starre aansluiting. Negatief bestaat niet.
+ */
+function keurVeren(waarde: unknown, pad: string, fouten: string[]): void {
+  if (waarde === undefined) return;
+  if (!isObject(waarde)) {
+    fouten.push(`${pad}: moet een object met veerstijfheden per staafeinde zijn.`);
+    return;
+  }
+  keurVelden(waarde, VEER_VELDEN, pad, fouten);
+  for (const veld of VEER_VELDEN) {
+    const v = waarde[veld];
+    if (v === undefined || v === null) continue;
+    if (!isGetal(v) || v <= 0) {
+      fouten.push(
+        `${pad}.${veld}: moet een getal > 0 zijn (kN/mm, of kNm/rad bij een ` +
+          `rotatieveer), maar is ${JSON.stringify(v)}. Laat het veld WEG als er ` +
+          "geen veer is; een veer met stijfheid nul is een scharnier en hoort in `releases`.",
+      );
+    }
+  }
+}
+
+/**
+ * Staaf op bedding (`BeamBedding`, Winkler). De adapter rekent uit k·b de
+ * lijnstijfheid; allebei de getallen moeten dus groter dan nul zijn. Is een
+ * van beide nul, dan laat `bouwMultiInput` de bedding STIL weg — dat is
+ * precies het verschil dat deze poort hoort te melden.
+ */
+function keurBedding(waarde: unknown, pad: string, fouten: string[]): void {
+  if (waarde === undefined) return;
+  if (!isObject(waarde)) {
+    fouten.push(`${pad}: moet een object met \`k\` (kN/m³) en \`b\` (mm) zijn.`);
+    return;
+  }
+  keurVelden(waarde, BEDDING_VELDEN, pad, fouten);
+  for (const veld of BEDDING_VELDEN) {
+    if (waarde[veld] === undefined) {
+      fouten.push(
+        `${pad}.${veld} ontbreekt; een bedding heeft zowel de beddingsconstante ` +
+          "`k` (kN/m³) als de contactbreedte `b` (mm) nodig.",
+      );
+      continue;
+    }
+    keurGetal(waarde[veld], `${pad}.${veld}`, fouten, { positief: true });
+  }
+}
+
+/**
+ * Wapeningszones per stuk (`ReinforcementZones`, §9.2.1.3 en §9.2.2).
+ *
+ * Een ONTBREKENDE lijst is hier geen fout maar "leeg": dat is de gedocumenteerde
+ * betekenis in de kern (`schema_wapeningszones`, "beide leeg = de korf uit
+ * `cage` geldt over de hele staaf") en de lezing van `betonCheckBuilder`. Wat
+ * er WEL staat moet kloppen — een zone die niet vóór zijn einde begint, of een
+ * onbekende zijde, zou anders stil een ander wapeningsplan opleveren.
+ */
+function keurZones(waarde: unknown, pad: string, fouten: string[]): void {
+  if (waarde === undefined) return;
+  if (!isObject(waarde)) {
+    fouten.push(`${pad}: moet een object met \`longitudinal\` en \`stirrups\` zijn.`);
+    return;
+  }
+  keurVelden(waarde, ["longitudinal", "stirrups"] as const, pad, fouten);
+  for (const lijst of ["longitudinal", "stirrups"] as const) {
+    const zones = waarde[lijst];
+    if (zones === undefined) continue;
+    if (!Array.isArray(zones)) {
+      fouten.push(`${pad}.${lijst}: moet een array zijn.`);
+      continue;
+    }
+    zones.forEach((z, i) => {
+      const zpad = `${pad}.${lijst}[${i}]`;
+      if (!isObject(z)) return void fouten.push(`${zpad}: moet een object zijn.`);
+      keurVelden(
+        z,
+        lijst === "longitudinal" ? ZONE_LANGS_VELDEN : ZONE_BEUGEL_VELDEN,
+        zpad,
+        fouten,
+      );
+      for (const veld of ["x_start_mm", "x_end_mm"] as const) {
+        if (z[veld] === undefined) {
+          fouten.push(`${zpad}.${veld} ontbreekt; een zone heeft een begin en een einde.`);
+        } else {
+          keurGetal(z[veld], `${zpad}.${veld}`, fouten);
+        }
+      }
+      if (isGetal(z.x_start_mm) && isGetal(z.x_end_mm) && !(z.x_start_mm < z.x_end_mm)) {
+        fouten.push(
+          `${zpad}: de zone begint niet vóór zijn einde (x_start_mm ${z.x_start_mm}, ` +
+            `x_end_mm ${z.x_end_mm}). Een lege of omgekeerde zone is geen wapening.`,
+        );
+      }
+      if (lijst === "longitudinal") {
+        keurEnum(z.side, ["Bottom", "Top"] as const, `${zpad}.side`, fouten);
+        keurEnum(z.bar_shape, ["Recht", "AndersDanRecht"] as const, `${zpad}.bar_shape`, fouten);
+        keurEnum(
+          z.casting_position,
+          ["Onderzijde", "Bovenzijde", "Glijbekisting", "GoedAangetoond"] as const,
+          `${zpad}.casting_position`, fouten,
+        );
+        const rij = z.row;
+        if (rij === undefined) {
+          fouten.push(`${zpad}.row ontbreekt; een langswapeningszone heeft aantal en diameter nodig.`);
+        } else if (!isObject(rij)) {
+          fouten.push(`${zpad}.row: moet een object met \`count\` en \`diameter_mm\` zijn.`);
+        } else {
+          keurVelden(rij, ["count", "diameter_mm"] as const, `${zpad}.row`, fouten);
+          keurGetal(rij.count, `${zpad}.row.count`, fouten, { positief: true });
+          keurGetal(rij.diameter_mm, `${zpad}.row.diameter_mm`, fouten, { positief: true });
+        }
+      } else {
+        for (const veld of ["spacing_mm", "legs", "diameter_mm"] as const) {
+          if (z[veld] === undefined) {
+            fouten.push(`${zpad}.${veld} ontbreekt; een beugelzone heeft afstand, benen en diameter nodig.`);
+          } else {
+            keurGetal(z[veld], `${zpad}.${veld}`, fouten, { positief: true });
+          }
+        }
+      }
+    });
+  }
+}
+
+/**
+ * Wapeningskorf (`ReinforcementCage`). Anders dan de meeste velden hier is
+ * deze niet optioneel-per-onderdeel: staat de korf er, dan moeten alle vier de
+ * DRAGENDE onderdelen erin staan én kloppen. Een korf waarin `bottom`
+ * ontbreekt wordt door de kern gelezen als een balk zonder onderwapening — een
+ * ander bouwwerk dan de gebruiker invoerde, met een M_Rd die daarbij past.
+ *
+ * De vier beugelvelden zijn wél optioneel; zie `KORF_VELDEN_BEUGEL`. Staan ze
+ * er, dan moeten ze een échte maat zijn: nul betekent hier niet "niet
+ * opgegeven" maar een afstand van nul, en die bestaat niet.
+ */
+function keurKorf(waarde: unknown, pad: string, fouten: string[]): void {
+  if (waarde === undefined) return;
+  if (!isObject(waarde)) {
+    fouten.push(`${pad}: moet een object zijn (dekking, beugel, boven- en onderwapening).`);
+    return;
+  }
+  keurVelden(waarde, KORF_VELDEN, pad, fouten);
+  for (const veld of KORF_VELDEN_VERPLICHT) {
+    if (waarde[veld] === undefined) {
+      fouten.push(`${pad}.${veld} ontbreekt; een wapeningskorf heeft alle vier de onderdelen nodig.`);
+    }
+  }
+  // De beugelvelden: leeglaten mag, maar wat er staat moet groter dan nul
+  // zijn. Zelfde grens als `ReinforcementCage::validate` in de kern.
+  for (const veld of KORF_VELDEN_BEUGEL) {
+    const v = waarde[veld];
+    if (v === undefined || v === null) continue;
+    if (!isGetal(v) || v <= 0) {
+      fouten.push(
+        `${pad}.${veld}: moet een getal > 0 zijn, maar is ${JSON.stringify(v)}. ` +
+          `Laat het veld WEG als het niet is opgegeven — leeg en nul betekenen hier niet hetzelfde.`,
+      );
+    }
+  }
+  // Dekking en beugel mogen nul zijn (geen beugel is een geldige korf), maar
+  // niet negatief — dezelfde grens als `controleerKorf` in de frontend en
+  // `ReinforcementCage::validate` in de kern.
+  for (const veld of [`cover_mm`, `stirrup_diameter_mm`] as const) {
+    const v = waarde[veld];
+    if (v === undefined) continue;
+    if (!isGetal(v) || v < 0) {
+      fouten.push(`${pad}.${veld}: moet een getal ≥ 0 zijn, maar is ${JSON.stringify(v)}.`);
+    }
+  }
+  for (const kant of ["top", "bottom"] as const) {
+    const rij = waarde[kant];
+    if (rij === undefined) continue;
+    if (!isObject(rij)) {
+      fouten.push(`${pad}.${kant}: moet een object met \`count\` en \`diameter_mm\` zijn.`);
+      continue;
+    }
+    keurVelden(rij, REBARROW_VELDEN, `${pad}.${kant}`, fouten);
+    for (const veld of REBARROW_VELDEN) {
+      const v = rij[veld];
+      if (v === undefined) {
+        fouten.push(`${pad}.${kant}.${veld} ontbreekt.`);
+      } else if (!isGetal(v) || v < 0) {
+        fouten.push(`${pad}.${kant}.${veld}: moet een getal ≥ 0 zijn, maar is ${JSON.stringify(v)}.`);
+      }
+    }
+  }
+}
+
+/**
+ * De §5.8-gegevens van een kolom (`checkConfig.betonKolom`).
+ *
+ * TWEE VERPLICHTE VELDEN ZODRA HET BLOK BESTAAT: `bracing` en
+ * `buckling_length`. Dat is geen strengheid om de strengheid — §5.8.1 noemt
+ * geschoord uitdrukkelijk een aanname in de BEREKENING, en het scheelt een
+ * factor twee in de kniklengte. Een blok met alleen een kniklengte zou de kern
+ * doen weigeren; hier komt de melding vóórdat het model die kant op gaat.
+ *
+ * De overige velden zijn optioneel: leeg betekent "niet opgegeven", en dan
+ * meldt de toets dat hij niet kan in plaats van de ruimste tak aan te nemen.
+ * Voor de TWEEDE as (`bracing_z`, `buckling_length_z`, `m0_edz_knm`) betekent
+ * leeg: de keuze van het rekenvlak wordt overgenomen (met melding), en
+ * M₀Ed,z = 0 — de kern rekent de imperfectie en de tweede orde om z dan nog
+ * steeds uit.
+ */
+function keurKolom(waarde: unknown, pad: string, fouten: string[]): void {
+  if (waarde === undefined) return;
+  if (!isObject(waarde)) {
+    fouten.push(`${pad}: moet een object zijn (schoring, kniklengte en de §9.5-keuzen).`);
+    return;
+  }
+  keurVelden(waarde, KOLOM_VELDEN, pad, fouten);
+  if (waarde.bracing === undefined) {
+    fouten.push(
+      `${pad}.bracing ontbreekt. Geschoord of ongeschoord is het ontwerpbesluit van art. 5.8.1 ` +
+        `en heeft met opzet geen standaardwaarde; zonder die keuze is er geen kniklengte en geen ` +
+        `slankheidsgrens.`,
+    );
+  }
+  keurEnum(waarde.bracing, SCHORINGEN, `${pad}.bracing`, fouten);
+  keurGetal(waarde.phi_inf_t0, `${pad}.phi_inf_t0`, fouten, { positief: true });
+  keurEnum(waarde.stirrup_zone, BEUGELZONES, `${pad}.stirrup_zone`, fouten);
+  keurEnum(waarde.lap_situation, OVERLAPPINGSSITUATIES, `${pad}.lap_situation`, fouten);
+  // De tweede as: dezelfde soorten als in het vlak, allemaal optioneel. Het
+  // teken van M₀Ed,z doet er niet toe (de korf is symmetrisch), dus geen eis
+  // "positief".
+  keurEnum(waarde.bracing_z, SCHORINGEN, `${pad}.bracing_z`, fouten);
+  keurGetal(waarde.m0_edz_knm, `${pad}.m0_edz_knm`, fouten);
+  if (waarde.buckling_length_z !== undefined) {
+    keurKniklengte(waarde.buckling_length_z, `${pad}.buckling_length_z`, fouten);
+  }
+
+  if (waarde.buckling_length === undefined) {
+    fouten.push(`${pad}.buckling_length ontbreekt; zonder l₀ is er geen slankheid λ = l₀/i.`);
+    return;
+  }
+  keurKniklengte(waarde.buckling_length, `${pad}.buckling_length`, fouten);
+}
+
+/**
+ * Eén kniklengtekeuze (`Kniklengtekeuze`): een vakje van figuur 5.7 of l₀
+ * rechtstreeks. Dezelfde regels voor het rekenvlak en voor de z-as.
+ */
+function keurKniklengte(kl: unknown, pad: string, fouten: string[]): void {
+  if (!isObject(kl)) {
+    fouten.push(`${pad}: moet een object met \`soort\` zijn.`);
+    return;
+  }
+  if (kl.soort === "Figuur57") {
+    keurVelden(kl, ["soort", "geval"], pad, fouten);
+    keurEnum(kl.geval, KNIKGEVALLEN_GELDIG, `${pad}.geval`, fouten);
+    if (kl.geval === undefined) {
+      fouten.push(`${pad}.geval ontbreekt.`);
+    }
+  } else if (kl.soort === "Opgegeven") {
+    keurVelden(kl, ["soort", "l0_m"], pad, fouten);
+    if (kl.l0_m === undefined) {
+      fouten.push(`${pad}.l0_m ontbreekt; l₀ is hier het hele gegeven.`);
+    }
+    keurGetal(kl.l0_m, `${pad}.l0_m`, fouten, { positief: true });
+  } else {
+    fouten.push(
+      `${pad}.soort: ${JSON.stringify(kl.soort)} bestaat niet. ` +
+        `Toegestaan: Figuur57 (een vakje van figuur 5.7) of Opgegeven (l₀ rechtstreeks).`,
+    );
+  }
+}
+
+/** Verplicht geheel getal (identiteiten en verwijzingen). */
+function eisGeheel(
+  waarde: unknown,
+  pad: string,
+  fouten: string[],
+): void {
+  if (!isGeheel(waarde)) {
+    fouten.push(
+      `${pad}: verplicht en moet een geheel getal zijn, maar is ` +
+        `${JSON.stringify(waarde)}.`,
+    );
+  }
+}
+
+/** Array-veld uit het model halen; ontbreken mag, iets anders dan array niet. */
+function leesArray(
+  model: Record<string, unknown>,
+  veld: string,
+  fouten: string[],
+): unknown[] {
+  const waarde = model[veld];
+  if (waarde === undefined) return [];
+  if (!Array.isArray(waarde)) {
+    fouten.push(`model.${veld}: moet een array zijn.`);
+    return [];
+  }
+  return waarde;
+}
+
+// ── De harde poort: vorm, veldnamen en types ───────────────────────────────
+
+/**
+ * Controleert uitsluitend de VORM van het model: onbekende velden, ontbrekende
+ * verplichte velden, verkeerde types en onbekende enum-waarden. Geeft een lege
+ * lijst als het model qua vorm deugt.
+ *
+ * Bewust gescheiden van de constructieve controles: dit is de poort die ook
+ * vóór `solve` draait, en die mag nooit weigeren om iets dat alleen maar
+ * verdacht is.
+ */
+/**
+ * De keuring van één `checkConfig` — voor een staaf in het model én voor het
+ * argument `check_config` van `check_fem_model` (sidecar.ts). Eén poort voor
+ * beide: tot september 2026 werd `check_config` NIET gekeurd, en viel een
+ * tikfout daar stil terug op de standaardwaarde (bijvoorbeeld een
+ * kipsteunafstand die de staaflengte werd).
+ */
+export function keurCheckConfig(waarde: unknown, cpad: string): string[] {
+  const fouten: string[] = [];
+  if (!isObject(waarde)) {
+    fouten.push(`${cpad}: moet een object zijn.`);
+    return fouten;
+  }
+  const cc = waarde;
+  keurVelden(cc, CHECKCONFIG_VELDEN, cpad, fouten);
+  keurGetal(cc.bucklingLengthY_m, `${cpad}.bucklingLengthY_m`, fouten, { positief: true });
+  keurGetal(cc.bucklingLengthZ_m, `${cpad}.bucklingLengthZ_m`, fouten, { positief: true });
+  keurGetal(cc.deflectionLimitNumerator, `${cpad}.deflectionLimitNumerator`, fouten, { positief: true });
+  keurGetal(cc.deflectionAddLimitNumerator, `${cpad}.deflectionAddLimitNumerator`, fouten, { positief: true });
+  keurGetal(cc.preCamber_mm, `${cpad}.preCamber_mm`, fouten);
+  // Een kipsteunafstand van 0 of minder betekent in de bouwer "de staaflengte";
+  // hier opgegeven hoort hij dus positief te zijn, net als de kniklengten.
+  keurGetal(cc.ltbSupportSpacing_m, `${cpad}.ltbSupportSpacing_m`, fouten, { positief: true });
+  // k_cr is een BREEDTEFACTOR (b_ef = k_cr · b, 6.13a): boven 1 is meer breedte
+  // dan er is, nul of eronder geen breedte. Buiten (0, 1] is dus geen keuze
+  // maar een fout, en die wordt hier geweigerd — niet stil op 1,0 gezet.
+  keurGetal(cc.kCr, `${cpad}.kCr`, fouten, { positief: true });
+  if (isGetal(cc.kCr) && cc.kCr > 1) {
+    fouten.push(`${cpad}.kCr: moet ten hoogste 1 zijn (b_ef = k_cr · b), maar is ${cc.kCr}.`);
+  }
+  if (cc.performLtbCheck !== undefined && typeof cc.performLtbCheck !== "boolean") {
+    fouten.push(`${cpad}.performLtbCheck: moet true of false zijn, maar is ${JSON.stringify(cc.performLtbCheck)}.`);
+  }
+  keurEnum(cc.ltbLoadPosition, LTB_LASTPOSITIES, `${cpad}.ltbLoadPosition`, fouten);
+  keurEnum(cc.schuineRand, SCHUINE_RANDEN, `${cpad}.schuineRand`, fouten);
+  // k_def is een KRUIPFACTOR: w_fin = w_inst + k_def · w_qp. Negatief zou de
+  // eindzakking kleiner maken dan de momentane, wat geen kruip is; 0 betekent
+  // "geen kruip" en mag. Er is geen bovengrens in de norm — tabel 3.2 gaat voor
+  // andere houtachtigen tot 4,00 — dus die wordt hier ook niet verzonnen.
+  keurGetal(cc.cltKdef, `${cpad}.cltKdef`, fouten, { nietNegatief: true });
+  if (cc.cltKdefBron !== undefined && typeof cc.cltKdefBron !== "string") {
+    fouten.push(`${cpad}.cltKdefBron: moet een tekst zijn (de productverklaring of ETA), maar is ${JSON.stringify(cc.cltKdefBron)}.`);
+  }
+  if (isGetal(cc.cltKdef) && (cc.cltKdefBron === undefined || String(cc.cltKdefBron).trim() === "")) {
+    fouten.push(
+      `${cpad}.cltKdefBron: verplicht zodra cltKdef is opgegeven. Tabel 3.2 van EN 1995-1-1 ` +
+        `kent geen k_def voor kruislaaghout, dus moet het rapport kunnen zeggen waar de waarde ` +
+        `vandaan komt (productverklaring of ETA van de plaat, per klimaatklasse).`,
+    );
+  }
+  // Rolschuifsterkte (issue #232): een sterkte is > 0, en de bron is verplicht.
+  keurGetal(cc.cltFvRolK, `${cpad}.cltFvRolK`, fouten, { positief: true });
+  if (cc.cltFvRolKBron !== undefined && typeof cc.cltFvRolKBron !== "string") {
+    fouten.push(`${cpad}.cltFvRolKBron: moet een tekst zijn (de ETA of productverklaring), maar is ${JSON.stringify(cc.cltFvRolKBron)}.`);
+  }
+  if (isGetal(cc.cltFvRolK) && (cc.cltFvRolKBron === undefined || String(cc.cltFvRolKBron).trim() === "")) {
+    fouten.push(
+      `${cpad}.cltFvRolKBron: verplicht zodra cltFvRolK is opgegeven. NEN-EN 1995-1-1 en EN 338 ` +
+        `kennen geen rolschuifsterkte, dus moet het rapport kunnen zeggen waar de waarde vandaan komt.`,
+    );
+  }
+  keurEnum(cc.deflectionClass, ["floor", "floorBrittle", "roof", "cantilever", "custom"], `${cpad}.deflectionClass`, fouten);
+  keurEnum(cc.loadDuration, ["permanent", "long", "medium", "short", "instantaneous"], `${cpad}.loadDuration`, fouten);
+  if (cc.serviceClass !== undefined && ![1, 2, 3].includes(cc.serviceClass as number)) {
+    fouten.push(`${cpad}.serviceClass: moet 1, 2 of 3 zijn.`);
+  }
+  for (const veld of ["lateralRestraints", "lateralRestraintsBottom"] as const) {
+    const lijst = cc[veld];
+    if (lijst === undefined) continue;
+    if (!Array.isArray(lijst) || !lijst.every(isGetal)) {
+      fouten.push(`${cpad}.${veld}: moet een array van getallen (fracties 0..1) zijn.`);
+    }
+  }
+  // Beton (EN 1992) en de vrije spanningstoets.
+  keurEnum(cc.betonMilieuklasse, MILIEUKLASSEN, `${cpad}.betonMilieuklasse`, fouten);
+  keurEnum(cc.betonConstructieklasse, CONSTRUCTIEKLASSEN, `${cpad}.betonConstructieklasse`, fouten);
+  keurEnum(cc.betonStaalsoort, SUPPORTED_REINFORCEMENT_GRADES, `${cpad}.betonStaalsoort`, fouten);
+  keurEnum(cc.betonStaaltak, STAALTAKKEN, `${cpad}.betonStaaltak`, fouten);
+  keurGetal(cc.betonStroken, `${cpad}.betonStroken`, fouten, { positief: true });
+  keurGetal(cc.spanningSigmaZ, `${cpad}.spanningSigmaZ`, fouten);
+  keurEnum(cc.aluLasstatus, ["geen", "gelast"], `${cpad}.aluLasstatus`, fouten);
+  if (cc.aluZijdelingsGesteund !== undefined && typeof cc.aluZijdelingsGesteund !== "boolean") {
+    fouten.push(`${cpad}.aluZijdelingsGesteund: moet true of false zijn.`);
+  }
+  if (cc.kvZijdelingsGesteund !== undefined && typeof cc.kvZijdelingsGesteund !== "boolean") {
+    fouten.push(`${cpad}.kvZijdelingsGesteund: moet true of false zijn.`);
+  }
+  keurKorf(cc.betonKorf, `${cpad}.betonKorf`, fouten);
+  keurZones(cc.betonZones, `${cpad}.betonZones`, fouten);
+  keurKolom(cc.betonKolom, `${cpad}.betonKolom`, fouten);
+  return fouten;
+}
+
+export function controleerVelden(rauw: unknown): string[] {
+  const fouten: string[] = [];
+  if (!isObject(rauw)) {
+    return ["model: moet een JSON-object zijn."];
+  }
+  keurVelden(rauw, MODEL_VELDEN, "model", fouten);
+
+  // Vlaggen op modelniveau.
+  for (const vlag of ["selfWeightEnabled", "scheefstandEnabled", "scheefstandEigenKolom", "houtToetsEN1995"] as const) {
+    if (rauw[vlag] !== undefined && typeof rauw[vlag] !== "boolean") {
+      fouten.push(`model.${vlag}: moet true of false zijn.`);
+    }
+  }
+  keurGetal(rauw.scheefstandNoemer, "model.scheefstandNoemer", fouten, {
+    positief: true,
+  });
+  if (
+    rauw.scheefstandRichting !== undefined &&
+    rauw.scheefstandRichting !== 1 &&
+    rauw.scheefstandRichting !== -1
+  ) {
+    fouten.push("model.scheefstandRichting: moet 1 (+x) of −1 (−x) zijn.");
+  }
+  if (
+    rauw.scheefstandBron !== undefined &&
+    rauw.scheefstandBron !== null &&
+    !(SCHEEFSTAND_BRONNEN as readonly unknown[]).includes(rauw.scheefstandBron)
+  ) {
+    fouten.push(
+      `model.scheefstandBron: "${String(rauw.scheefstandBron)}" is onbekend; bekend zijn ` +
+        SCHEEFSTAND_BRONNEN.map((b) => `"${b}"`).join(", ") + ".",
+    );
+  }
+  const hoogte = rauw.scheefstandHoogteM;
+  if (
+    hoogte !== undefined && hoogte !== null &&
+    !(typeof hoogte === "number" && Number.isFinite(hoogte) && hoogte > 0)
+  ) {
+    fouten.push("model.scheefstandHoogteM: moet een getal groter dan 0 zijn (m), of null.");
+  }
+  const aantal = rauw.scheefstandAantalElementen;
+  if (
+    aantal !== undefined && aantal !== null &&
+    !(typeof aantal === "number" && Number.isInteger(aantal) && aantal >= 1)
+  ) {
+    fouten.push("model.scheefstandAantalElementen: moet een geheel getal van minstens 1 zijn, of null.");
+  }
+
+  // Knopen.
+  const nodes = leesArray(rauw, "nodes", fouten);
+  nodes.forEach((n, i) => {
+    const pad = `model.nodes[${i}]`;
+    if (!isObject(n)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(n, NODE_VELDEN, pad, fouten);
+    eisGeheel(n.id, `${pad}.id`, fouten);
+    if (!isGetal(n.x)) fouten.push(`${pad}.x: verplicht getal (mm).`);
+    if (!isGetal(n.z)) fouten.push(`${pad}.z: verplicht getal (mm).`);
+  });
+
+  // Staven.
+  const beams = leesArray(rauw, "beams", fouten);
+  beams.forEach((b, i) => {
+    const pad = `model.beams[${i}]`;
+    if (!isObject(b)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(b, BEAM_VELDEN, pad, fouten);
+    eisGeheel(b.id, `${pad}.id`, fouten);
+    eisGeheel(b.from, `${pad}.from`, fouten);
+    eisGeheel(b.to, `${pad}.to`, fouten);
+    for (const veld of ["material", "profile", "profileEnd"] as const) {
+      if (b[veld] !== undefined && typeof b[veld] !== "string") {
+        fouten.push(`${pad}.${veld}: moet tekst zijn.`);
+      }
+    }
+    keurEnum(b.loadRole, LOADROLLEN, `${pad}.loadRole`, fouten);
+    if (b.releases !== undefined) {
+      if (!isObject(b.releases)) {
+        fouten.push(`${pad}.releases: moet een object zijn.`);
+      } else {
+        keurVelden(b.releases, RELEASE_VELDEN, `${pad}.releases`, fouten);
+        for (const [veld, waarde] of Object.entries(b.releases)) {
+          if (waarde !== undefined && typeof waarde !== "boolean") {
+            fouten.push(`${pad}.releases.${veld}: moet true of false zijn.`);
+          }
+        }
+      }
+    }
+    keurVeren(b.veren, `${pad}.veren`, fouten);
+    keurBedding(b.bedding, `${pad}.bedding`, fouten);
+    if (b.tensionOnly !== undefined && typeof b.tensionOnly !== "boolean") {
+      fouten.push(`${pad}.tensionOnly: moet true of false zijn.`);
+    }
+    if (b.checkConfig !== undefined) {
+      fouten.push(...keurCheckConfig(b.checkConfig, `${pad}.checkConfig`));
+    }
+  });
+
+  // Opleggingen.
+  const supports = leesArray(rauw, "supports", fouten);
+  supports.forEach((s, i) => {
+    const pad = `model.supports[${i}]`;
+    if (!isObject(s)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(s, SUPPORT_VELDEN, pad, fouten);
+    eisGeheel(s.nodeId, `${pad}.nodeId`, fouten);
+    if (s.type === undefined) {
+      fouten.push(`${pad}.type: verplicht. Toegestaan: ${SUPPORT_TYPES.join(", ")}.`);
+    } else {
+      keurEnum(s.type, SUPPORT_TYPES, `${pad}.type`, fouten);
+    }
+    keurGetal(s.k, `${pad}.k`, fouten);
+  });
+
+  // Platen.
+  const plates = leesArray(rauw, "plates", fouten);
+  plates.forEach((p, i) => {
+    const pad = `model.plates[${i}]`;
+    if (!isObject(p)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(p, PLATE_VELDEN, pad, fouten);
+    eisGeheel(p.id, `${pad}.id`, fouten);
+    if (!Array.isArray(p.nodeIds) || !p.nodeIds.every(isGeheel)) {
+      fouten.push(`${pad}.nodeIds: verplichte array van knoop-id's.`);
+    } else if (p.nodeIds.length < 3) {
+      fouten.push(`${pad}.nodeIds: een plaat heeft minstens drie hoekknopen nodig.`);
+    }
+    keurGetal(p.thickness, `${pad}.thickness`, fouten, { positief: true });
+    keurGetal(p.E, `${pad}.E`, fouten, { positief: true });
+    keurGetal(p.nu, `${pad}.nu`, fouten);
+    keurGetal(p.rho, `${pad}.rho`, fouten, { positief: true });
+    keurGetal(p.meshSize, `${pad}.meshSize`, fouten, { positief: true });
+    // Materiaal (stap 3): DEZELFDE grammatica als bij een staaf, en dezelfde
+    // regel — een naam die niet herkend wordt is een fout en geen stille
+    // terugval op staal. `keurPlaatMateriaal` is de enige bron van dat
+    // oordeel; de engine en het eigenschappenpaneel gebruiken hem ook.
+    // Sinds issue #14 keurt hij de HELE plaat: de G₁₂-plicht van
+    // kruislaaghout (cltG12 met bron, of bewust de bovengrens) en de grens op
+    // ν₁₂ hangen van meer af dan de naam.
+    keurGetal(p.cltG12, `${pad}.cltG12`, fouten, { positief: true });
+    if (p.cltG12Bron !== undefined && typeof p.cltG12Bron !== "string") {
+      fouten.push(`${pad}.cltG12Bron: tekst verwacht (de herkomst van cltG12).`);
+    }
+    if (p.cltG12Bovengrens !== undefined && typeof p.cltG12Bovengrens !== "boolean") {
+      fouten.push(`${pad}.cltG12Bovengrens: true of false verwacht.`);
+    }
+    if (p.materiaal !== undefined && typeof p.materiaal !== "string") {
+      fouten.push(`${pad}.materiaal: tekst verwacht (een materiaalnaam).`);
+    } else {
+      const reden = keurPlaatMateriaal({
+        materiaal: p.materiaal as string | undefined,
+        E: typeof p.E === "number" ? p.E : undefined,
+        nu: typeof p.nu === "number" ? p.nu : undefined,
+        cltG12: typeof p.cltG12 === "number" ? p.cltG12 : undefined,
+        cltG12Bron: typeof p.cltG12Bron === "string" ? p.cltG12Bron : undefined,
+        cltG12Bovengrens: typeof p.cltG12Bovengrens === "boolean" ? p.cltG12Bovengrens : undefined,
+      });
+      if (reden) fouten.push(`${pad}.materiaal: ${reden}`);
+    }
+    // Klimaatklasse (plaattoets hout, 2.3.1.3): 1, 2 of 3, en alleen bij een
+    // houten plaat — bij elk ander materiaal zou hij stil genegeerd worden.
+    if (p.klimaatklasse !== undefined) {
+      if (p.klimaatklasse !== 1 && p.klimaatklasse !== 2 && p.klimaatklasse !== 3) {
+        fouten.push(`${pad}.klimaatklasse: 1, 2 of 3 verwacht (NEN-EN 1995-1-1 2.3.1.3).`);
+      } else if (plaatMateriaalSoort(typeof p.materiaal === "string" ? p.materiaal : undefined) !== "hout") {
+        fouten.push(
+          `${pad}.klimaatklasse: hoort alleen bij een houten plaat (massief of gelijmd gelamineerd); ` +
+            "bij dit materiaal wordt hij geweigerd in plaats van stil genegeerd.",
+        );
+      }
+    }
+    if (p.plooi !== undefined) {
+      if (!isObject(p.plooi)) {
+        fouten.push(`${pad}.plooi: een object met expliciete veldmaten en randvoorwaarden is vereist.`);
+      } else {
+        const q = p.plooi;
+        keurVelden(q, PLOOI_VELDEN, `${pad}.plooi`, fouten);
+        for (const key of ["a_mm", "b_mm"]) {
+          if (!isEindig(q[key]) || (q[key] as number) <= 0) fouten.push(`${pad}.plooi.${key}: positief eindig getal in mm vereist.`);
+        }
+        if (q.randvoorwaarden !== "vierzijdig_scharnierend") fouten.push(`${pad}.plooi.randvoorwaarden: alleen vierzijdig_scharnierend UIT HET VLAK ondersteund.`);
+        if (typeof q.steun_bron !== "string" || !q.steun_bron.trim()) fouten.push(`${pad}.plooi.steun_bron: beschrijf het bewijs voor de vier continue steunen uit het vlak.`);
+        for (const key of ["onverstijfd", "uniforme_spanning"]) {
+          if (q[key] !== true) fouten.push(`${pad}.plooi.${key}: moet expliciet true zijn voor deze methode.`);
+        }
+        if (plaatMateriaalSoort(typeof p.materiaal === "string" ? p.materiaal : undefined) !== "staal") fouten.push(`${pad}.plooi: alleen ondersteund voor staal.`);
+        if (Array.isArray(p.nodeIds) && (p.openingen === undefined || Array.isArray(p.openingen))) {
+          const reden = plaatPlooiGeometrieFout(p as unknown as Plate, nodes.filter(isObject) as unknown as Node[]);
+          if (reden) fouten.push(`${pad}.plooi: ${reden}`);
+        }
+      }
+    }
+    // Aanwezige wapening (plaattoets beton, issue #25): de vorm van de
+    // kerninvoer, en alleen bij een betonplaat — elders zou zij stil
+    // genegeerd worden.
+    if (p.wapening !== undefined) {
+      if (plaatMateriaalSoort(typeof p.materiaal === "string" ? p.materiaal : undefined) !== "beton") {
+        fouten.push(
+          `${pad}.wapening: hoort alleen bij een betonplaat; bij dit materiaal wordt zij geweigerd ` +
+            "in plaats van stil genegeerd.",
+        );
+      } else {
+        // Projectdata uit de volledige editie: deze editie bewaart haar ongewijzigd
+        // en rekent er niet mee; alleen de vorm (een object) wordt gekeurd.
+        if (!isObject(p.wapening)) fouten.push(`${pad}.wapening: object verwacht.`);
+      }
+    }
+    // Hoofdrichting in graden; elke eindige hoek mag, ook negatief of > 360.
+    keurGetal(p.hoofdrichting, `${pad}.hoofdrichting`, fouten);
+    // Elementkeuze: een tikfout ("vierhoek") zou stil de standaard geven.
+    keurEnum(p.meshType, PLAAT_MESH_TYPEN, `${pad}.meshType`, fouten);
+    // Openingen: vorm van het veld; de ligging (binnen de omtrek, los van
+    // elkaar) volgt in de constructieve controle.
+    if (p.openingen !== undefined) {
+      if (!Array.isArray(p.openingen)) {
+        fouten.push(`${pad}.openingen: moet een array van openingen zijn.`);
+      } else {
+        p.openingen.forEach((o, k) => {
+          const opad = `${pad}.openingen[${k}]`;
+          if (!isObject(o)) return void fouten.push(`${opad}: moet een object zijn.`);
+          keurVelden(o, OPENING_VELDEN, opad, fouten);
+          eisGeheel(o.id, `${opad}.id`, fouten);
+          if (!Array.isArray(o.punten) || o.punten.length < 3
+              || !o.punten.every((q) => isObject(q) && isEindig(q.x) && isEindig(q.z))) {
+            fouten.push(`${opad}.punten: verplichte array van minstens drie punten {x, z} in mm.`);
+          }
+        });
+      }
+    }
+    if (p.meshCache !== undefined) {
+      if (!isObject(p.meshCache)) {
+        fouten.push(`${pad}.meshCache: moet een object zijn.`);
+      } else {
+        keurVelden(p.meshCache, MESHCACHE_VELDEN, `${pad}.meshCache`, fouten);
+        if (typeof p.meshCache.signature !== "string") {
+          fouten.push(`${pad}.meshCache.signature: verplichte tekst (geometrie-handtekening).`);
+        }
+        if (!Array.isArray(p.meshCache.points) || !Array.isArray(p.meshCache.triangles)) {
+          fouten.push(`${pad}.meshCache: \`points\` en \`triangles\` zijn verplichte arrays.`);
+        }
+        // Vierhoeken (stap 2): optioneel, maar als ze er zijn dan viertallen
+        // puntindices. Convexiteit en bereik keurt de engine (keurPlatMesh).
+        if (p.meshCache.quads !== undefined) {
+          const qs = p.meshCache.quads;
+          if (!Array.isArray(qs) || !qs.every((q) => Array.isArray(q) && q.length === 4 && q.every((i) => isGeheel(i) && i >= 0))) {
+            fouten.push(`${pad}.meshCache.quads: moet een lijst van viertallen puntindices (gehele getallen ≥ 0) zijn.`);
+          }
+        }
+        keurEnum(p.meshCache.meshSoort, MESHSOORTEN, `${pad}.meshCache.meshSoort`, fouten);
+        if (p.meshCache.openingEdgeNodeIndices !== undefined) {
+          const oe = p.meshCache.openingEdgeNodeIndices;
+          if (!Array.isArray(oe) || !oe.every((randen) => Array.isArray(randen)
+              && randen.every((r) => Array.isArray(r) && r.every((i) => isGeheel(i) && i >= 0)))) {
+            fouten.push(`${pad}.meshCache.openingEdgeNodeIndices: moet per opening een lijst van randen (elk een lijst puntindices) zijn.`);
+          }
+        }
+        // `edgeNodeIndices` is VERPLICHT, met precies één lijst per hoek. Dit
+        // veld was optioneel in schema en validatie, terwijl de engine er
+        // blind op leunde: een cache zonder randknopen kwam door de poort en
+        // liet de berekening crashen op `undefined.every` (gemeten). En een
+        // lijst te weinig laat een randlast op de ontbrekende rand zijn
+        // knopen niet vinden.
+        const randen = p.meshCache.edgeNodeIndices;
+        if (!Array.isArray(randen)) {
+          fouten.push(
+            `${pad}.meshCache.edgeNodeIndices: verplichte array met per plaatrand ` +
+              "(rand i loopt van hoek i naar hoek i+1) de indices van de meshknopen " +
+              "op die rand. Zonder die lijsten vindt geen randlast, randpuntlast of " +
+              "staafaansluiting zijn rand.",
+          );
+        } else {
+          if (Array.isArray(p.nodeIds) && randen.length !== p.nodeIds.length) {
+            fouten.push(
+              `${pad}.meshCache.edgeNodeIndices: beschrijft ${randen.length} ` +
+                `${randen.length === 1 ? "rand" : "randen"}, maar de plaat heeft ` +
+                `${p.nodeIds.length} hoeken en dus ${p.nodeIds.length} randen.`,
+            );
+          }
+          randen.forEach((rand, r) => {
+            if (!Array.isArray(rand) || rand.length < 2 || !rand.every((k) => isGeheel(k) && k >= 0)) {
+              fouten.push(
+                `${pad}.meshCache.edgeNodeIndices[${r}]: moet een lijst van minstens twee ` +
+                  "puntindices (gehele getallen ≥ 0) zijn — de twee hoeken en de knopen ertussen.",
+              );
+            }
+          });
+        }
+      }
+    }
+  });
+
+  // Belastinggevallen.
+  const loadCases = leesArray(rauw, "loadCases", fouten);
+  loadCases.forEach((lc, i) => {
+    const pad = `model.loadCases[${i}]`;
+    if (!isObject(lc)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(lc, LOADCASE_VELDEN, pad, fouten);
+    eisGeheel(lc.id, `${pad}.id`, fouten);
+    if (typeof lc.name !== "string" || lc.name.length === 0) {
+      fouten.push(`${pad}.name: verplichte naam.`);
+    }
+    // `type` mag ontbreken (oude bestanden); een verkeerde waarde niet — die
+    // zou het eigengewicht in het verkeerde geval kunnen zetten.
+    keurEnum(lc.type, LOADCASE_TYPES, `${pad}.type`, fouten);
+    // Gebruikscategorie (NB tabel NB.2–A1.1): een tikfout zou stil categorie A
+    // opleveren, met ψ₂ = 0,3 waar bijvoorbeeld opslag (E) 0,8 vraagt.
+    keurEnum(lc.categorie, GEBRUIKSCATEGORIEEN, `${pad}.categorie`, fouten);
+    // Het kenmerk van het automatische eigen gewicht (issue #42): alleen
+    // `true`, en alleen op een blijvend geval. `false` of een tekst zou stil
+    // "geen kenmerk" betekenen en het eigen gewicht naar het eerste blijvende
+    // geval sturen; een kenmerk op een veranderlijk geval zou het eigen
+    // gewicht ψ₂ = 0,3 geven. Beide worden geweigerd, met reden.
+    // Het kenmerk van een imperfectiegeval (issue #199): alleen `true`. Een
+    // `false` of tekst zou stil "geen imperfectiegeval" betekenen, en dan telt
+    // de scheefstand in de UGT-toets dubbel.
+    if (lc.imperfectie !== undefined && lc.imperfectie !== true) {
+      fouten.push(
+        `${pad}.imperfectie: alleen de waarde true is toegestaan (laat het veld weg voor een ` +
+        "gewoon belastinggeval).");
+    }
+    if (lc.eigenGewicht !== undefined) {
+      if (lc.eigenGewicht !== true) {
+        fouten.push(
+          `${pad}.eigenGewicht: alleen de waarde true is toegestaan (laat het veld weg voor een ` +
+          "gewoon belastinggeval).");
+      } else if (lc.type !== "dead") {
+        fouten.push(
+          `${pad}.eigenGewicht: het geval van het automatische eigen gewicht moet van type "dead" ` +
+          `zijn, niet ${lc.type === undefined ? "zonder type" : JSON.stringify(lc.type)}. Eigen gewicht ` +
+          "is een blijvende belasting (γ_G, ψ = 1,0).");
+      }
+    }
+  });
+  // Hoogstens één geval draagt het eigen gewicht; bij twee zou de rekengang
+  // stil het eerste kiezen.
+  const egGevallen = loadCases
+    .map((lc, i) => ({ lc, i }))
+    .filter(({ lc }) => isObject(lc) && lc.eigenGewicht === true);
+  if (egGevallen.length > 1) {
+    fouten.push(
+      `model.loadCases: ${egGevallen.length} gevallen dragen eigenGewicht: true ` +
+      `(${egGevallen.map(({ i }) => `[${i}]`).join(", ")}); hoogstens één geval mag het automatische ` +
+      "eigen gewicht dragen.");
+  }
+  const egGevalIds = new Set(
+    egGevallen.map(({ lc }) => (isObject(lc) ? lc.id : undefined)).filter((id) => typeof id === "number"),
+  );
+
+  // Lasten.
+  const loads = leesArray(rauw, "loads", fouten);
+  loads.forEach((l, i) => {
+    const pad = `model.loads[${i}]`;
+    if (!isObject(l)) return void fouten.push(`${pad}: moet een object zijn.`);
+    keurVelden(l, LOAD_VELDEN, pad, fouten);
+    eisGeheel(l.id, `${pad}.id`, fouten);
+    eisGeheel(l.caseId, `${pad}.caseId`, fouten);
+    // Het geval met `eigenGewicht: true` wordt automatisch gevuld; een last
+    // erin zou onzichtbaar bij het eigen gewicht optellen.
+    if (typeof l.caseId === "number" && egGevalIds.has(l.caseId)) {
+      fouten.push(
+        `${pad}.caseId: belastinggeval ${l.caseId} draagt eigenGewicht: true en wordt automatisch ` +
+        "gevuld (q = ρ·A·g per staaf, ρ·g·t per plaat); er mag geen last in staan. Zet de last in " +
+        "een ander blijvend geval.");
+    }
+    if (l.type === undefined) {
+      fouten.push(`${pad}.type: verplicht. Toegestaan: ${LOAD_TYPES.join(", ")}.`);
+    } else {
+      keurEnum(l.type, LOAD_TYPES, `${pad}.type`, fouten);
+    }
+    for (const veld of ["nodeId", "beamId", "plateId", "edgeIndex", "openingId"] as const) {
+      if (l[veld] !== undefined && !isGeheel(l[veld])) {
+        fouten.push(`${pad}.${veld}: moet een geheel getal zijn.`);
+      }
+    }
+    for (const veld of ["fx", "fz", "my", "q", "qStart", "qEnd", "deltaT"] as const) {
+      keurGetal(l[veld], `${pad}.${veld}`, fouten);
+    }
+    for (const veld of ["posFrac", "startFrac", "endFrac"] as const) {
+      const waarde = l[veld];
+      if (waarde === undefined) continue;
+      if (!isGetal(waarde) || waarde < 0 || waarde > 1) {
+        fouten.push(`${pad}.${veld}: moet een fractie tussen 0 en 1 zijn.`);
+      }
+    }
+    keurEnum(l.qDir, ["x", "z"], `${pad}.qDir`, fouten);
+    keurEnum(l.qCoord, ["global", "local"], `${pad}.qCoord`, fouten);
+    keurEnum(l.edge, ["bottom", "top", "left", "right"], `${pad}.edge`, fouten);
+    keurEnum(l.gegenereerdDoor, ["wind"], `${pad}.gegenereerdDoor`, fouten);
+    // Vrije omschrijving: alleen de VORM wordt gekeurd (het moet tekst zijn).
+    // De inhoud is aan de gebruiker — er wordt niets mee gerekend.
+    if (l.omschrijving !== undefined && typeof l.omschrijving !== "string") {
+      fouten.push(
+        `${pad}.omschrijving: moet tekst zijn, maar is ` +
+          `${JSON.stringify(l.omschrijving)}.`,
+      );
+    }
+  });
+
+  return fouten;
+}
+
+// ── De constructieve controles ─────────────────────────────────────────────
+
+/** Dubbele id's binnen één lijst. */
+function meldDubbeleIds(
+  items: { id?: unknown }[],
+  soort: string,
+  fouten: string[],
+): void {
+  const gezien = new Set<number>();
+  for (const item of items) {
+    const id = item.id;
+    if (typeof id !== "number") continue;
+    if (gezien.has(id)) {
+      fouten.push(
+        `Er zijn twee ${soort} met id ${id}. Id's moeten uniek zijn — anders ` +
+          "is niet te zeggen op welke van beide een verwijzing slaat.",
+      );
+    }
+    gezien.add(id);
+  }
+}
+
+/**
+ * Levert deze last een invoerregel op? Gemeten met `bouwMultiInput` zelf, op
+ * een model dat alleen deze last bevat en waarin eigengewicht en scheefstand
+ * uit staan — dan komt elke geproduceerde regel gegarandeerd van deze last.
+ * Zo blijft de mapping de enige waarheid over wat meetelt.
+ */
+function teltLastMee(last: unknown, loadCases: unknown[]): boolean {
+  const proef: FemModelInvoer = {
+    nodes: [],
+    beams: [],
+    supports: [],
+    plates: [],
+    loadCases: loadCases as FemModelInvoer["loadCases"],
+    loads: [last] as FemModelInvoer["loads"],
+    selfWeightEnabled: false,
+    scheefstandEnabled: false,
+    scheefstandNoemer: 200,
+    scheefstandRichting: 1,
+  };
+  const mi = bouwMultiInput(proef);
+  return (
+    mi.loads.length +
+      (mi.pointLoads?.length ?? 0) +
+      (mi.beamPointLoads?.length ?? 0) +
+      (mi.thermalLoads?.length ?? 0) +
+      (mi.edgeLoads?.length ?? 0) +
+      (mi.edgePointLoads?.length ?? 0) >
+    0
+  );
+}
+
+/**
+ * Rauw model → `FemModelInvoer` met dezelfde defaults die de sidecar hanteert.
+ * Nodig omdat `bouwMultiInput` op de arrays itereert: een ontbrekende
+ * `plates`-sleutel zou hem laten struikelen, terwijl dat gewoon "geen platen"
+ * betekent.
+ */
+function alsModelInvoer(m: Record<string, unknown>): FemModelInvoer {
+  const arr = <T>(waarde: unknown): T[] => (Array.isArray(waarde) ? (waarde as T[]) : []);
+  return {
+    nodes: arr(m.nodes),
+    beams: arr(m.beams),
+    supports: arr(m.supports),
+    plates: arr(m.plates),
+    loadCases: arr(m.loadCases),
+    loads: arr(m.loads),
+    selfWeightEnabled: m.selfWeightEnabled === true,
+    scheefstandEnabled: m.scheefstandEnabled === true,
+    scheefstandNoemer:
+      typeof m.scheefstandNoemer === "number" ? m.scheefstandNoemer : 200,
+    scheefstandRichting: m.scheefstandRichting === -1 ? -1 : 1,
+  };
+}
+
+/** Alle belastinggeval-id's waarvoor de mapping daadwerkelijk invoer oplevert. */
+function gevallenMetLast(model: FemModelInvoer): Set<number> {
+  const mi = bouwMultiInput(model);
+  const ids = new Set<number>();
+  const noteer = (caseId: number | undefined) => {
+    if (typeof caseId === "number") ids.add(caseId);
+  };
+  for (const l of mi.loads) noteer(l.caseId);
+  for (const l of mi.pointLoads ?? []) noteer(l.caseId);
+  for (const l of mi.beamPointLoads ?? []) noteer(l.caseId);
+  for (const l of mi.thermalLoads ?? []) noteer(l.caseId);
+  for (const l of mi.edgeLoads ?? []) noteer(l.caseId);
+  for (const l of mi.edgePointLoads ?? []) noteer(l.caseId);
+  for (const p of mi.plates ?? []) noteer(p.selfWeightCaseId);
+  return ids;
+}
+
+/**
+ * Vindt de samenhangende delen van de constructie (staven + platen als
+ * verbindingen) en geeft per deel de knoopverzameling terug.
+ */
+function samenhangendeDelen(
+  knoopIds: number[],
+  verbindingen: number[][],
+): number[][] {
+  const ouder = new Map<number, number>();
+  for (const id of knoopIds) ouder.set(id, id);
+  const zoek = (a: number): number => {
+    let wortel = a;
+    while (ouder.get(wortel) !== wortel) wortel = ouder.get(wortel)!;
+    let loop = a;
+    while (ouder.get(loop) !== wortel) {
+      const volgende = ouder.get(loop)!;
+      ouder.set(loop, wortel);
+      loop = volgende;
+    }
+    return wortel;
+  };
+  for (const groep of verbindingen) {
+    const aanwezig = groep.filter((id) => ouder.has(id));
+    for (let i = 1; i < aanwezig.length; i++) {
+      const a = zoek(aanwezig[0]);
+      const b = zoek(aanwezig[i]);
+      if (a !== b) ouder.set(b, a);
+    }
+  }
+  const perWortel = new Map<number, number[]>();
+  for (const id of knoopIds) {
+    const wortel = zoek(id);
+    const lijst = perWortel.get(wortel);
+    if (lijst) lijst.push(id);
+    else perWortel.set(wortel, [id]);
+  }
+  return [...perWortel.values()];
+}
+
+/**
+ * Volledige droogloop (plan §3.2). Draait eerst de harde veldpoort; faalt die,
+ * dan stoppen we daar — constructieve controles op een model met verkeerde
+ * types leveren alleen ruis op boven de echte oorzaak.
+ */
+/** Wat de droogloop naast het model mag weten. */
+export interface ValidatieOpties {
+  /**
+   * De combinaties die bij het rekenen gebruikt worden. Zonder deze lijst kan
+   * niet worden bepaald of een belastinggeval ergens meetelt, en blijft die
+   * controle achterwege.
+   */
+  combinaties?: LoadCombination[];
+  /**
+   * De volledige lijst (ook wat de selectie overslaat) en de gevolgklasse:
+   * daarmee meldt de droogloop ook een ontbrekende standaardcombinatie.
+   */
+  alleCombinaties?: LoadCombination[];
+  gevolgklasse?: Gevolgklasse;
+  /** De nationale bijlage waarmee de standaardset is opgesteld (normnaad). */
+  bijlage?: NationaleBijlageCode;
+  /**
+   * Alleen het MODEL keuren, niet de combinatieset. Zo draait de poort vóór
+   * `solve` en `check` (sidecar `rekenDoor`): een fout in het model weigert
+   * de berekening, terwijl de meldingen over de combinaties daar al als
+   * "FOUT: …" in `warnings` komen (dezelfde `meldingenBelastinggevallen`) en
+   * de berekening niet tegenhouden — zoals vóór deze poort.
+   */
+  alleenModel?: boolean;
+}
+
+export function valideerModel(rauw: unknown, opties: ValidatieOpties = {}): ValidatieUitkomst {
+  const veldFouten = controleerVelden(rauw);
+  if (veldFouten.length > 0) {
+    return { ok: false, errors: veldFouten, warnings: [] };
+  }
+
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const m = rauw as Record<string, unknown>;
+
+  const nodes = (m.nodes ?? []) as { id: number; x: number; z: number }[];
+  const beams = (m.beams ?? []) as {
+    id: number; from: number; to: number; material?: string; profile?: string;
+    checkConfig?: { betonKorf?: unknown };
+    profileEnd?: string;
+    releases?: { startRy?: boolean; endRy?: boolean };
+    bedding?: { k?: number; b?: number };
+  }[];
+  const supports = (m.supports ?? []) as { nodeId: number; type: string; k?: number }[];
+  const plates = (m.plates ?? []) as {
+    id: number; nodeIds: number[]; meshSize?: number; meshCache?: { signature: string };
+    meshType?: "driehoeken" | "vierhoeken";
+    openingen?: { id: number; punten: PlaatPunt[] }[];
+  }[];
+  const loadCases = (m.loadCases ?? []) as { id: number; name: string; type?: string }[];
+  const loads = (m.loads ?? []) as Record<string, unknown>[];
+
+  meldDubbeleIds(nodes, "knopen", errors);
+  meldDubbeleIds(beams, "staven", errors);
+  meldDubbeleIds(plates, "platen", errors);
+  meldDubbeleIds(loadCases, "belastinggevallen", errors);
+  meldDubbeleIds(loads, "lasten", errors);
+
+  const knoopById = new Map<number, { x: number; z: number }>();
+  for (const n of nodes) knoopById.set(n.id, { x: n.x, z: n.z });
+  const caseIds = new Set(loadCases.map((lc) => lc.id));
+  const beamIds = new Set(beams.map((b) => b.id));
+  const plateIds = new Set(plates.map((p) => p.id));
+
+  if (nodes.length === 0) errors.push("Het model bevat geen knopen.");
+  if (beams.length === 0 && plates.length === 0) {
+    errors.push("Het model bevat geen staven en geen platen — er valt niets te rekenen.");
+  }
+  if (loadCases.length === 0) {
+    errors.push("Het model bevat geen belastinggevallen.");
+  }
+
+  // Samenvallende knopen: twee knopen op dezelfde plek zijn niet met elkaar
+  // verbonden, maar zien er in het model uit alsof ze dat wel zijn. De staven
+  // die eraan hangen vormen dan stilzwijgend twee losse constructies.
+  //
+  // De regel zelf staat in `lib/modelControle.ts` — dezelfde die het canvas
+  // gebruikt om de bevinding te tonen en te herstellen. Twee kopieën van deze
+  // controle zouden op termijn twee antwoorden op dezelfde vraag geven.
+  // De tolerantie is hier bewust EXACT (1e-6 mm): de MCP-poort krijgt
+  // machinaal opgestelde modellen binnen, het canvas een muis.
+  for (const bevinding of zoekDubbeleKnopen({ nodes, beams }, 1e-6)) {
+    errors.push(bevinding.tekst);
+  }
+
+  // Staafeinde BIJNA op een plaatrand (omtrek of opening, issue #13): tussen
+  // 1 en 50 mm wordt het niet gekoppeld. Dezelfde regel en tekst als de
+  // modelcontrole van het canvas en de weigering in de engine. De tolerantie
+  // is hier NIET exact maar 1 mm: dat is de koppeltolerantie van de engine
+  // zelf, en deze poort hoort precies te melden wat de engine weigert.
+  for (const bevinding of zoekStaafeindenBijPlaatrand({ nodes, beams, supports, plates })) {
+    (bevinding.ernst === "fout" ? errors : warnings).push(bevinding.tekst);
+  }
+
+  // Staven: verwijzingen, lengte en doorsnede.
+  for (const b of beams) {
+    const van = knoopById.get(b.from);
+    const naar = knoopById.get(b.to);
+    if (!van) errors.push(`Staaf ${b.id} verwijst naar knoop ${b.from}, die niet bestaat.`);
+    if (!naar) errors.push(`Staaf ${b.id} verwijst naar knoop ${b.to}, die niet bestaat.`);
+    if (b.from === b.to) {
+      errors.push(`Staaf ${b.id} begint en eindigt op knoop ${b.from} — lengte nul.`);
+    } else if (van && naar) {
+      const lengte = Math.hypot(naar.x - van.x, naar.z - van.z);
+      if (lengte < 1e-6) {
+        errors.push(
+          `Staaf ${b.id} heeft lengte nul: knoop ${b.from} en knoop ${b.to} ` +
+            "liggen op dezelfde plek.",
+        );
+      }
+    }
+    // Ontbrekend of onbekend materiaal/profiel: de solver WEIGERT zo'n staaf
+    // met DOORSNEDE_ONBEKEND (`doorsnedeVoorSolver`); er is geen terugval op
+    // HEA 160 / S235 meer. De droogloop meldt daarom precies dat, met de reden
+    // die `resolveSection` zelf geeft (#247), zodat validate en solve hetzelfde
+    // zeggen.
+    const doorsnede = resolveSection(b.material, b.profile);
+    if (doorsnede.bron === "default") {
+      const geenMateriaal = b.material === undefined || b.material.trim() === "";
+      const geenProfiel = b.profile === undefined || b.profile.trim() === "";
+      const kop = geenMateriaal && geenProfiel
+        ? "geen materiaal en geen profiel opgegeven"
+        : geenMateriaal
+          ? "geen materiaal opgegeven"
+          : geenProfiel
+            ? "geen profiel opgegeven"
+            : `onbekende combinatie materiaal "${b.material}" + profiel "${b.profile}"`;
+      errors.push(
+        `Staaf ${b.id}: ${kop}; de staaf wordt niet doorgerekend` +
+          (doorsnede.reden ? ` (${doorsnede.reden})` : "") +
+          ". Er wordt geen standaardmateriaal of -profiel aangenomen.",
+      );
+    } else {
+      // Verlopend profiel: het eindprofiel moet bij het beginprofiel passen,
+      // en in een model met platen is een verloop (nog) niet toegestaan —
+      // dezelfde twee weigeringen als `controleerDoorsneden` in de mapping,
+      // hier als droogloopfout met staafnummer in plaats van een uitzondering
+      // halverwege het rekenen.
+      const verloop = bepaalVerloop(b.material, b.profile, b.profileEnd);
+      if (verloop.status === "fout") {
+        errors.push(`Staaf ${b.id}: ${verloop.reden}.`);
+      } else if (verloop.status === "verlopend" && plates.length > 0) {
+        errors.push(
+          `Staaf ${b.id} heeft een verlopend profiel ("${b.profile}" → "${b.profileEnd}") ` +
+            "en het model bevat platen; dat wordt nog niet ondersteund. Maak de staaf " +
+            "prismatisch (verwijder `profileEnd`) of haal de platen uit het model.",
+        );
+      }
+    }
+    // Een naam die hout én (kort) beton is: er wordt hout gerekend, en dat
+    // hoort de gebruiker te weten. Met een wapeningskorf erbij botsen de twee
+    // lezingen en is het een fout — anders zou de korf stil niets doen.
+    const dubbel = dubbelzinnigMateriaal(b.material);
+    if (dubbel) {
+      const metKorf = b.checkConfig?.betonKorf !== undefined && b.checkConfig?.betonKorf !== null;
+      (metKorf ? errors : warnings).push(dubbelzinnigMateriaalTekst(b.id, dubbel, metKorf));
+    }
+  }
+
+  // Welke knopen doen mee in het rekenmodel? Alleen knopen die aan een staaf
+  // of plaat hangen: `getActiveNodeIds` (Assembler.ts) laat de rest weg, en
+  // daarmee vallen ook lasten en opleggingen op die knopen stilzwijgend weg.
+  const actief = new Set<number>();
+  for (const b of beams) {
+    actief.add(b.from);
+    actief.add(b.to);
+  }
+  for (const p of plates) for (const id of p.nodeIds ?? []) actief.add(id);
+  // Een knoop ÓP een plaatrand of binnen de plaat kan een rekenknoop van het
+  // plaatmesh zijn (het raster hergebruikt UI-knopen op gridposities; een
+  // opleggingsrij langs de onderrand van een wand is het gewone geval). Tot
+  // september 2026 telde deze poort alleen de hoekknopen, en meldde hij bij
+  // zo'n wand "geen enkele oplegging houdt de constructie tegen" — een
+  // geldig model werd via de MCP geweigerd. Of de knoop werkelijk op een
+  // rekenknoop valt, keurt de engine precies (en weigert anders met reden);
+  // deze poort mag niet strenger zijn dan de engine.
+  // Per plaat (zelfde index als `plates`): de hoekcoördinaten, of undefined
+  // als een hoek ontbreekt (dat meldt de plaatcontrole verderop zelf).
+  const plaatOmtrekken: ({ x: number; z: number }[] | undefined)[] = plates.map((p) => {
+    const h = (p.nodeIds ?? []).map((id) => knoopById.get(id));
+    return h.every((q) => q !== undefined) && h.length >= 3 ? (h as { x: number; z: number }[]) : undefined;
+  });
+  // Een knoop IN een opening (niet op de rand ervan) hoort NIET bij de plaat:
+  // daar is geen materiaal en geen rekenknoop. Tot issue #13 telde deze poort
+  // alleen de omtrek, en zag hij een staaf die in een sparing zweeft als
+  // verbonden met de plaat — het losse deel bleef dan ongemeld.
+  const opLus = (n: { x: number; z: number }, lus: { x: number; z: number }[]): boolean =>
+    lus.some((a, i) => afstandTotLijnstuk(n, a, lus[(i + 1) % lus.length]) <= 1);
+  const inOfOpPlaatK = (n: { x: number; z: number }, k: number): boolean => {
+    const omtrek = plaatOmtrekken[k];
+    if (!omtrek) return false;
+    if (opLus(n, omtrek)) return true;
+    if (!puntInPolygoon(n.x, n.z, omtrek)) return false;
+    const openingen = (Array.isArray(plates[k].openingen) ? plates[k].openingen! : [])
+      .filter((o) => o && Array.isArray(o.punten) && o.punten.length >= 3);
+    return openingen.every((o) => opLus(n, o.punten) || !puntInPolygoon(n.x, n.z, o.punten));
+  };
+  const inOfOpPlaat = (n: { x: number; z: number }): boolean =>
+    plates.some((_, k) => inOfOpPlaatK(n, k));
+  for (const n of nodes) if (!actief.has(n.id) && inOfOpPlaat(n)) actief.add(n.id);
+
+  for (const n of nodes) {
+    if (!actief.has(n.id)) {
+      warnings.push(
+        // "Telt niet mee" klopte niet: in het raamwerkpad krijgt elke knoop
+        // drie vrijheidsgraden, en een losse knoop maakt het stelsel dan
+        // singulier (gemeten: de berekening faalt op die knoop).
+        `Knoop ${n.id} hangt aan geen enkele staaf of plaat. Zo'n losse knoop ` +
+          "draagt niets en maakt het stelsel singulier zodra hij kan bewegen of " +
+          "draaien — verwijder hem, of verbind hem met de constructie.",
+      );
+    }
+  }
+
+  // Opleggingen.
+  const heeftPlaten = plates.length > 0;
+  const gesteund = new Set<number>();
+  const vastgezetteRichtingen = { x: [] as number[], z: [] as number[], ry: 0 };
+  for (const s of supports) {
+    if (!knoopById.has(s.nodeId)) {
+      errors.push(`Oplegging op knoop ${s.nodeId}, die niet bestaat.`);
+      continue;
+    }
+    if (!actief.has(s.nodeId)) {
+      const melding =
+        `Oplegging op knoop ${s.nodeId}, die aan geen enkele staaf of plaat ` +
+        "hangt. Die knoop zit niet in het rekenmodel, dus de oplegging doet niets.";
+      if (heeftPlaten) warnings.push(melding);
+      else errors.push(melding);
+      continue;
+    }
+    // Een veer zonder positieve, eindige stijfheid (k <= 0, ontbrekend):
+    // tot issue #222 een waarschuwing "rekent als een starre oplegging", en
+    // de solve rekende daarna zonder melding met een star steunpunt. Nu een
+    // fout uit `combineerOpleggingen` hieronder — dezelfde regel als de engine.
+    gesteund.add(s.nodeId);
+    const knoop = knoopById.get(s.nodeId)!;
+    for (const richting of VASTGEZET[s.type] ?? []) {
+      if (richting === "x") vastgezetteRichtingen.x.push(knoop.z);
+      else if (richting === "z") vastgezetteRichtingen.z.push(knoop.x);
+      else vastgezetteRichtingen.ry++;
+    }
+  }
+
+  // Meerdere opleggingen op één knoop (issue #223) en veren zonder positieve
+  // stijfheid (issue #222): de engine voegt opleggingen per
+  // vrijheidsgraad samen en weigert star én verend (of twee veren) in
+  // dezelfde richting. Vroeger telde alleen de laatste oplegging, en de
+  // reactietabel las de eerste — met een fictief veermoment als gevolg. Hier
+  // dezelfde regel (`opleggingen.ts`): de tegenstrijdigheid is een fout, een
+  // samenvoeging een waarschuwing.
+  for (const b of combineerOpleggingen(
+    supports.filter((s) => knoopById.has(s.nodeId) && actief.has(s.nodeId)), "model",
+  ).bevindingen) {
+    (b.ernst === "fout" ? errors : warnings).push(b.tekst);
+  }
+
+  // BEDDING ALS STEUN (issue #246). Een staaf op bedding (Winkler, k·b > 0)
+  // wordt over zijn hele lengte verticaal gedragen; de kern telt die
+  // stijfheid op de verticale vrijheidsgraden van zijn eindknopen (globaal z,
+  // zie `assembleGlobalStiffnessWithGeometric`). Voor de noodzakelijke
+  // voorwaarden hieronder telt zo'n staaf dus als verticale steun op de plaats
+  // van beide eindknopen — en daarmee, als die op verschillende x liggen, ook
+  // tegen rotatie van het geheel. Tot oktober 2026 telde alleen een oplegging,
+  // en werd een ligger die alleen op bedding rust (met één xRoller) als
+  // mechanisme geweigerd (Hetényi: w = Pβ/(2kb) = 3,77 mm, M = P/(4β) = 33,2 kNm).
+  // HORIZONTAAL telt de bedding niet: de kleine wrijvingsstijfheid die de kern
+  // daar toevoegt (0,1 % van k·b·L) is een numeriek hulpmiddel tegen een
+  // singulier stelsel, geen constructieve steun.
+  const beddingKnopen = new Set<number>();
+  for (const b of beams) {
+    const kb = b.bedding;
+    if (!kb || !(typeof kb.k === "number" && kb.k > 0) || !(typeof kb.b === "number" && kb.b > 0)) continue;
+    for (const id of [b.from, b.to]) {
+      const knoop = knoopById.get(id);
+      if (!knoop || beddingKnopen.has(id)) continue;
+      beddingKnopen.add(id);
+      vastgezetteRichtingen.z.push(knoop.x);
+    }
+  }
+
+  // Mechanismecontrole — noodzakelijke voorwaarden voor een vlak raamwerk:
+  // verplaatsing in x en in z moet ergens verhinderd zijn, en rotatie van het
+  // geheel ook (door een inklemming/rotatieveer, of door twee steunpunten die
+  // dezelfde richting op verschillende plaatsen vasthouden).
+  if (supports.length === 0) {
+    errors.push(
+      beddingKnopen.size > 0
+        ? "Het model heeft geen opleggingen. De bedding draagt de staven verticaal en " +
+          "tegen draaien, maar niet horizontaal (de kleine wrijvingsstijfheid in de " +
+          "rekenkern is alleen een numeriek hulpmiddel). Voeg ten minste één oplegging " +
+          "toe die de horizontale richting vasthoudt, bijvoorbeeld een xRoller."
+        : "Het model heeft geen opleggingen — voeg randvoorwaarden toe. Zonder " +
+          "opleggingen is de constructie een mechanisme.",
+    );
+  } else {
+    if (vastgezetteRichtingen.x.length === 0) {
+      errors.push(
+        "Geen enkele oplegging houdt de constructie in x-richting tegen — " +
+          "het geheel kan horizontaal wegschuiven (mechanisme).",
+      );
+    }
+    if (vastgezetteRichtingen.z.length === 0) {
+      errors.push(
+        "Geen enkele oplegging houdt de constructie in z-richting tegen — " +
+          "het geheel kan verticaal zakken (mechanisme).",
+      );
+    }
+    const tweeVerschillend = (waarden: number[]) =>
+      waarden.some((w) => Math.abs(w - waarden[0]) > 1e-6);
+    const rotatieVerhinderd =
+      vastgezetteRichtingen.ry > 0 ||
+      tweeVerschillend(vastgezetteRichtingen.z) ||
+      tweeVerschillend(vastgezetteRichtingen.x);
+    if (!rotatieVerhinderd) {
+      errors.push(
+        "Niets verhindert dat de constructie als geheel roteert: er is geen " +
+          "inklemming of rotatieveer, en de opleggingen houden hem maar op één " +
+          "plaats per richting vast (mechanisme).",
+      );
+    }
+  }
+
+  // Elk samenhangend constructiedeel moet ergens steunen.
+  if (actief.size > 0) {
+    // Een plaat verbindt zijn hoeken én de knopen op zijn rand of in zijn
+    // vlak (zie `inOfOpPlaat` hierboven): een oplegging op de onderrand van
+    // een wand steunt de wand, ook al is die knoop geen hoek.
+    const verbindingen: number[][] = [
+      ...beams.map((b) => [b.from, b.to]),
+      ...plates.map((p, k) => {
+        const erbij = nodes.filter((n) => inOfOpPlaatK(n, k)).map((n) => n.id);
+        return [...(p.nodeIds ?? []), ...erbij];
+      }),
+    ];
+    for (const deel of samenhangendeDelen([...actief], verbindingen)) {
+      // Een deel op bedding is verticaal gesteund (issue #246); of het als
+      // geheel stabiel is, toetst de kinematische controle verderop.
+      if (!deel.some((id) => gesteund.has(id) || beddingKnopen.has(id))) {
+        errors.push(
+          `Het constructiedeel met knopen ${deel.slice(0, 6).join(", ")}` +
+            `${deel.length > 6 ? ", …" : ""} heeft geen enkele oplegging en ` +
+            "kan vrij bewegen (mechanisme).",
+        );
+      }
+    }
+  }
+
+  // Platen: vorm en meshcache — zelfde regels als de engine hanteert, zodat
+  // de droogloop niet iets goedkeurt dat de solve daarna weigert.
+  for (const p of plates) {
+    const hoeken = (p.nodeIds ?? []).map((id) => knoopById.get(id));
+    if (hoeken.some((h) => !h)) {
+      errors.push(`Plaat ${p.id}: één of meer hoekknopen bestaan niet.`);
+      continue;
+    }
+    const punten = hoeken.map((h) => ({ x: h!.x, z: h!.z })) as PlaatPunt[];
+    // Openingen (stap 2): dezelfde regel als engine, tekentool en
+    // modelcontrole — buiten de plaat, rakend of overlappend is een fout.
+    const openingen = (p.openingen ?? []).map((o) => o.punten);
+    const openingFout = valideerPlaatOpeningen(punten, openingen, 1);
+    if (openingFout) {
+      errors.push(`Plaat ${p.id}: ${openingFout}`);
+      continue;
+    }
+    const meldDubbeleOpeningIds = new Set<number>();
+    for (const o of p.openingen ?? []) {
+      if (meldDubbeleOpeningIds.has(o.id)) {
+        errors.push(`Plaat ${p.id}: opening-id ${o.id} komt meer dan één keer voor.`);
+        break;
+      }
+      meldDubbeleOpeningIds.add(o.id);
+    }
+    // Rasterpad: rechthoek met rechthoekige openingen meshet de engine zelf.
+    if (plaatRekentAlsRaster(punten, openingen, 1)) continue;
+    const vormFout = valideerPlaatPolygoon(punten, 1);
+    if (vormFout) {
+      errors.push(`Plaat ${p.id}: ${vormFout}`);
+      continue;
+    }
+    const handtekening = plaatMeshSignatuurVan(p, punten);
+    // Alleen de cache uit het model telt — precies wat de engine leest. Het
+    // doorgeefluik in de GUI waar deze regel vroeger ook keek, is weg.
+    const cache = p.meshCache && p.meshCache.signature === handtekening ? p.meshCache : undefined;
+    if (!cache) {
+      const waarom = openingen.length > 0 && punten.length === 4
+        ? "heeft een opening die geen asgelijnde rechthoek is en rekent daarom via de CDT"
+        : "is geen asgelijnde rechthoek en rekent daarom als polygoonplaat";
+      errors.push(
+        `Plaat ${p.id} ${waarom}, maar het CDT-rekenmesh ontbreekt of is verouderd. ` +
+          "Reken via een projectbestand waarin het mesh is opgeslagen; de " +
+          "MCP-server genereert zelf geen meshes.",
+      );
+    }
+  }
+
+  // Knopen die vrij kunnen draaien: minstens één staaf, alle staafeinden
+  // daar scharnierend (release Ry; een veer op een los einde telt niet, net
+  // als in de engine) en geen oplegging die de draaiing vasthoudt. Dezelfde
+  // regel als `vrijeKnoopdraaiingen` in de kern.
+  const vrijDraaiendeKnopen = new Set<number>();
+  {
+    const eindenPerKnoop = new Map<number, boolean[]>();
+    for (const b of beams) {
+      const rel = b.releases ?? {};
+      const voeg = (knoop: number, scharnier: boolean) => {
+        const lijst = eindenPerKnoop.get(knoop) ?? [];
+        lijst.push(scharnier);
+        eindenPerKnoop.set(knoop, lijst);
+      };
+      voeg(b.from, rel.startRy === true);
+      voeg(b.to, rel.endRy === true);
+    }
+    const draaiVast = new Set(
+      supports
+        .filter((s) => (VASTGEZET[s.type] ?? []).includes("ry") || s.type === "rotSpring")
+        .map((s) => s.nodeId),
+    );
+    for (const [knoop, einden] of eindenPerKnoop) {
+      if (einden.every((scharnier) => scharnier) && !draaiVast.has(knoop)) vrijDraaiendeKnopen.add(knoop);
+    }
+  }
+
+  // Lasten: verwijzingen en stille wegval.
+  for (const l of loads) {
+    const id = l.id;
+    if (!caseIds.has(l.caseId as number)) {
+      errors.push(
+        `Last ${id} verwijst naar belastinggeval ${l.caseId}, dat niet bestaat.`,
+      );
+    }
+    if (l.beamId !== undefined && !beamIds.has(l.beamId as number)) {
+      errors.push(`Last ${id} verwijst naar staaf ${l.beamId}, die niet bestaat.`);
+    }
+    if (l.plateId !== undefined && !plateIds.has(l.plateId as number)) {
+      errors.push(`Last ${id} verwijst naar plaat ${l.plateId}, die niet bestaat.`);
+    } else if (l.plateId !== undefined) {
+      // Het randadres langs DEZELFDE regel als de engine
+      // (`bepaalPlaatlastRand`): een benoemde rand op een polygoon, een
+      // rand-index die geen zijde is, beide of geen adres, en bij een last op
+      // een OPENINGSRAND een opening die niet bestaat, dubbel voorkomt of geen
+      // rand met die index heeft. De engine weigert die gevallen; de droogloop
+      // hoort ze dus ook te melden, en met dezelfde reden.
+      const plaat = plates.find((p) => p.id === l.plateId);
+      const hoeken = (plaat?.nodeIds ?? []).map((nid) => knoopById.get(nid));
+      if (plaat && hoeken.every((h) => h !== undefined)) {
+        // Alleen openingen met een bruikbare vorm; een beschadigde opening
+        // meldt de structuurkeuring (`OPENING_VELDEN`) zelf al.
+        const openingen = (Array.isArray(plaat.openingen) ? plaat.openingen : [])
+          .filter((o) => o && typeof o.id === "number" && Array.isArray(o.punten));
+        const rand = bepaalPlaatlastRand(
+          hoeken as PlaatPunt[],
+          openingen,
+          {
+            edge: l.edge as string | undefined,
+            edgeIndex: l.edgeIndex as number | undefined,
+            openingId: l.openingId as number | undefined,
+          },
+          1,
+        );
+        if (!rand.ok) errors.push(`Last ${id} op plaat ${l.plateId}: ${rand.reden}`);
+      }
+    }
+    if (l.nodeId !== undefined) {
+      if (!knoopById.has(l.nodeId as number)) {
+        errors.push(`Last ${id} verwijst naar knoop ${l.nodeId}, die niet bestaat.`);
+      } else if (!actief.has(l.nodeId as number)) {
+        errors.push(
+          `Last ${id} staat op knoop ${l.nodeId}, die aan geen enkele staaf of ` +
+            "plaat hangt. Die last valt bij het rekenen weg zonder melding.",
+        );
+      }
+    }
+    // PLAATLASTEN: welke velden bij elkaar horen. De mapping kiest bij een
+    // puntlast eerst de plaat, dan de knoop, dan de staaf; een last die er
+    // twee noemt, zou dus stil op één van beide plekken landen. Een randadres
+    // zonder plaat hoort bij niets. Een puntlast op een plaatrand zonder
+    // positie wordt niet als "beginhoek" gelezen maar geweigerd, net als in de
+    // engine, en een randlast met een leeg of omgekeerd belast deel ook.
+    const heeftRandadres =
+      l.edge !== undefined || l.edgeIndex !== undefined || l.openingId !== undefined;
+    if (l.plateId !== undefined && l.type !== "edgeLoad" && l.type !== "pointForce") {
+      errors.push(
+        `Last ${id} (type "${String(l.type)}") noemt een plaat (\`plateId\`), maar op een ` +
+          "plaat kan alleen een randlast (edgeLoad) of een puntlast op een plaatrand " +
+          "(pointForce) staan. Deze last wordt daar niet meegerekend.",
+      );
+    }
+    if (heeftRandadres && l.plateId === undefined) {
+      errors.push(
+        `Last ${id} noemt een plaatrand (\`edge\`/\`edgeIndex\`/\`openingId\`) maar geen plaat ` +
+          "(`plateId`); die rand hoort bij niets en wordt niet meegerekend.",
+      );
+    }
+    if (l.type === "pointForce" && l.plateId !== undefined) {
+      if (l.nodeId !== undefined || l.beamId !== undefined) {
+        errors.push(
+          `Last ${id} is een puntlast op plaat ${l.plateId} én noemt een ` +
+            `${l.nodeId !== undefined ? "knoop" : "staaf"}. Eén last hoort op één plek te ` +
+            "staan: geef óf `plateId` met een rand en `posFrac`, óf een knoop of staaf.",
+        );
+      }
+      if (l.posFrac === undefined) {
+        errors.push(
+          `Last ${id} is een puntlast op plaat ${l.plateId} zonder positie (\`posFrac\`: ` +
+            "fractie 0..1 langs de rand vanaf de beginhoek). Een ontbrekende positie wordt " +
+            "niet als 0 gelezen; de berekening weigert hem.",
+        );
+      }
+    }
+    if (l.type === "edgeLoad" && (l.startFrac !== undefined || l.endFrac !== undefined)) {
+      const a = (l.startFrac as number | undefined) ?? 0;
+      const b = (l.endFrac as number | undefined) ?? 1;
+      if (!(a < b)) {
+        errors.push(
+          `Last ${id} (randlast): het belaste deel begint niet vóór zijn einde ` +
+            `(startFrac ${a}, endFrac ${b}). Een leeg of omgekeerd deel is geen last.`,
+        );
+      }
+    }
+    // De waarde: dezelfde regel als de modelcontrole van de app
+    // (`lastWaardeFout`). Een koppel met zijn waarde in `fz` leverde wél een
+    // invoerregel op (`my: 0`) en kwam zo door `teltLastMee` heen.
+    const waardeFout = lastWaardeFout(l as unknown as LastWaardeVelden);
+    if (waardeFout) {
+      errors.push(waardeFout.tekst);
+    } else if (!teltLastMee(l, loadCases)) {
+      errors.push(
+        `Last ${id} (type "${String(l.type)}") levert geen invoer voor de ` +
+          "solver op en telt dus niet mee. Controleer of alle velden voor dit " +
+          "lasttype ingevuld zijn (een lijnlast heeft `beamId` en `q` nodig, of " +
+          "`qStart` en `qEnd` voor een trapezium, een puntlast `nodeId` of " +
+          "`beamId` — of op een plaatrand `plateId`, een rand en `posFrac` —, een " +
+          "koppel `nodeId` en `my`, een thermische last `beamId` en `deltaT`, een " +
+          "randlast `plateId`, een rand en `q`).",
+      );
+    }
+    // Een koppel op een knoop die vrij kan draaien: alle staafeinden daar
+    // scharnieren en geen oplegging houdt de draaiing tegen. De kern zet zo'n
+    // knoopdraaiing vast (zie `vrijeKnoopdraaiingen` in NonlinearSolver.ts),
+    // maar een koppel erop kan nergens heen: een echt mechanisme, dat de
+    // solve weigert. De droogloop hoort dat ook te zeggen.
+    if (
+      l.type === "pointMoment" && typeof l.my === "number" && l.my !== 0 &&
+      typeof l.nodeId === "number" && vrijDraaiendeKnopen.has(l.nodeId)
+    ) {
+      errors.push(
+        `Koppel ${id} op knoop ${l.nodeId}: op deze knoop komen alleen scharnierende ` +
+          "staafeinden samen en geen oplegging houdt de draaiing tegen. Een koppel kan daar " +
+          "nergens heen (mechanisme). Zet het koppel op een knoop waar een staaf star " +
+          "aansluit, of maak één staafeinde op deze knoop star.",
+      );
+    }
+  }
+
+  // KINEMATISCHE CONTROLE (issue #248). De voorwaarden hierboven zijn
+  // noodzakelijk, niet voldoende: een rechthoekig raam met alle staafeinden
+  // scharnierend is gesteund in x, z en tegen rotatie van het geheel, en kan
+  // toch als parallellogram scheefvallen. Of het stelsel singulier is, vraagt
+  // deze controle aan de rekenkern zelf (`zoekMechanisme` in engine.ts:
+  // dezelfde mesh, stijfheidsmatrix, randvoorwaarden en stelseloplosser als de
+  // berekening, met een nul-lastvector). Het oordeel sluit zo aan op de
+  // berekening: wat hier als mechanisme gemeld wordt, weigert de solve met
+  // dezelfde melding, en een stabiel model (bedding, veren, scharnierend
+  // vakwerk met diagonaal) wordt niet onterecht geweigerd.
+  //
+  // Alleen als het model verder klopt (anders is de mesh niet betrouwbaar op
+  // te bouwen) en zonder platen (het gemengde pad wordt niet nagebootst).
+  // Niet in de poort vóór `solve`/`check` (`alleenModel`): daar doet de
+  // rekenkern dezelfde controle zelf, met dezelfde melding.
+  if (errors.length === 0 && !opties.alleenModel && plates.length === 0 && supports.length > 0) {
+    let melding: string | null;
+    try {
+      melding = zoekMechanisme(bouwMultiInput(alsModelInvoer(m)));
+    } catch (e) {
+      melding = `Het rekenmodel is niet op te bouwen: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    if (melding) {
+      errors.push(
+        `Het model is een mechanisme en wordt niet doorgerekend. ${melding}`,
+      );
+    }
+  }
+
+  // Belastinggevallen zonder werkzame last: `solveAllCases` slaat die
+  // stilzwijgend over, waarna de client een ontbrekende sleutel krijgt die als
+  // "nul" leest. Alleen zinvol te bepalen als het model verder klopt.
+  if (errors.length === 0) {
+    const metLast = gevallenMetLast(alsModelInvoer(m));
+    for (const lc of loadCases) {
+      if (!metLast.has(lc.id)) {
+        warnings.push(
+          `Belastinggeval ${lc.id} ("${lc.name}") heeft geen werkzame last en ` +
+            "wordt bij het rekenen overgeslagen; het telt als nulbijdrage in " +
+            "de combinaties.",
+        );
+      }
+    }
+  }
+
+  if (opties.alleenModel) return { ok: errors.length === 0, errors, warnings };
+
+  if (opties.combinaties === undefined) {
+    for (const lc of loadCases) {
+      if (lc.type === undefined) {
+        warnings.push(
+          `Belastinggeval ${lc.id} ("${lc.name}") heeft geen \`type\`. Zonder ` +
+            "type telt het geval in geen enkele standaardcombinatie mee, en kan " +
+            "het eigen gewicht er niet aan worden toegewezen.",
+        );
+      }
+    }
+  }
+
+  // Eigen gewicht zonder blijvend geval (dat valt NIET meer stil in het eerste
+  // geval), en — als de combinaties bekend zijn — gevallen met een last die in
+  // geen enkele UGT-combinatie meetellen. Een fout: die last telt als nul.
+  const gevalMeldingen = meldingenBelastinggevallen({
+    loadCases: loadCases as unknown as Pick<LoadCase, "id" | "name" | "type">[],
+    combinations: opties.combinaties ?? [],
+    alleCombinaties: opties.alleCombinaties,
+    gevolgklasse: opties.gevolgklasse,
+    bijlage: opties.bijlage,
+    loads: loads as unknown as { caseId: number }[],
+    selfWeightEnabled: m.selfWeightEnabled === true,
+    // Hout vraagt een UGT-combinatie met alleen blijvende belasting (k_mod,
+    // EN 1995-1-1 3.1.3(2)); zie `meldingenBelastinggevallen`.
+    metHout: ((Array.isArray(m.beams) ? m.beams : []) as { material?: unknown }[]).some(
+      (b) => typeof b?.material === "string" && matchSupportedTimberGrade(b.material) !== null,
+    ),
+  }).filter((mld) => opties.combinaties !== undefined || mld.caseId === null);
+  for (const mld of gevalMeldingen) {
+    (mld.niveau === "fout" ? errors : warnings).push(mld.tekst);
+  }
+  // Bewust gekozen eigen factoren (issue #196): geen fout, maar wel vermeld.
+  // Zonder deze regel gaf een bevestigde set ok:true zonder dat een cliënt kon
+  // zien dat er met factoren buiten NB.4/NB.5 wordt gerekend.
+  if (opties.combinaties !== undefined) {
+    const bevestigd = tekstBevestigdeEigenFactoren(bevestigdeEigenFactoren({
+      loadCases: loadCases as unknown as Pick<LoadCase, "id" | "name" | "type">[],
+      combinations: opties.combinaties,
+      bijlage: opties.bijlage,
+    }), opties.bijlage);
+    if (bevestigd) warnings.push(bevestigd);
+  }
+
+  return { ok: errors.length === 0, errors, warnings };
+}

@@ -1,0 +1,206 @@
+/**
+ * Catalogusprofielen als bouwsteen voor de profieleditor.
+ *
+ * Bron: `steelSectionDims.generated.ts` (gegenereerd uit de Rust-
+ * profieldatabase). De vertaling naar de `soort` die de motor verwacht staat
+ * hier op één plek: de database noemt UNP én UPE "Channel", maar de motor
+ * rekent een UNP met de toelopende flens van DIN 1026-1 (`ChannelSchuin`);
+ * net zo noemt zij INP én IPE "ISection", terwijl de INP met de toelopende
+ * flens van DIN 1025-1 gaat (`ISectionSchuin`). Bij de I beslist de
+ * flenshelling uit de database, niet de naam.
+ */
+import { STEEL_SECTION_DIMS, type SteelSectionDims } from "../steelSectionDims.generated";
+import { STEEL_SECTIONS } from "../steelSections.generated";
+import { profileLookupKey } from "../staalProfiel";
+import type { Basisprofiel, MotorSoort } from "./types";
+import { vt, type VertaalbareTekst } from "../vertaalbareTekst";
+
+/**
+ * Reeksindeling op naamprefix, zoals het profielkeuzescherm hem kent.
+ *
+ * `oud` merkt de reeksen die niet meer gewalst worden. Ze blijven gewoon
+ * kiesbaar, maar de zoekfunctie van de profielkiezer zet hun treffers onderaan
+ * (`lib/profielZoeken.ts`, issue #39). Een vlag en geen test op "(oud)" in het
+ * label: het label is vertaalbaar en heet in het Duits "(alt)".
+ */
+export const REEKSEN: Array<{ id: string; label: string; oud?: boolean; match: (naam: string) => boolean }> = [
+  { id: "IPE", label: "IPE", match: (n) => n.startsWith("IPE") },
+  { id: "HEA", label: "HEA", match: (n) => n.startsWith("HEA") },
+  { id: "HEB", label: "HEB", match: (n) => n.startsWith("HEB") },
+  { id: "HEM", label: "HEM", match: (n) => n.startsWith("HEM") },
+  { id: "UNP", label: "UNP", match: (n) => n.startsWith("UNP") },
+  { id: "UPE", label: "UPE", match: (n) => n.startsWith("UPE") },
+  // Oude Differdinger parallelflensreeksen; zie
+  // scripts/genereer-oude-profielen.mjs voor de bron van de maten.
+  { id: "DIE", label: "DIE (oud)", oud: true, match: (n) => n.startsWith("DIE") },
+  { id: "DIL", label: "DIL (oud)", oud: true, match: (n) => n.startsWith("DIL") },
+  { id: "DIN", label: "DIN (oud)", oud: true, match: (n) => n.startsWith("DIN") },
+  // Normaalprofiel DIN 1025-1, toelopende flenzen; zelfde generator.
+  { id: "INP", label: "INP (oud)", oud: true, match: (n) => n.startsWith("INP") },
+  // Alle kokers en buizen in de catalogus zijn WARMVERVAARDIGD volgens
+  // EN 10210-2 (hoekstraal 1,5·t) en krijgen daarmee knikkromme a uit
+  // NEN-EN 1993-1-1 tabel 6.2. Een koudgevormde koker (EN 10219) heeft een
+  // andere meetkunde én knikkromme c; die reeks staat niet in de catalogus,
+  // en dat hoort de gebruiker in het label te zien in plaats van het te raden.
+  { id: "KOKER", label: "Koker warmvervaardigd (SHS/RHS, EN 10210)", match: (n) => n.startsWith("SHS") || n.startsWith("RHS") || n.startsWith("HFRHS") },
+  { id: "CHS", label: "Buis warmvervaardigd (CHS, EN 10210)", match: (n) => n.startsWith("CHS") },
+  // Hoeklijnen (EN 10056-1) in twee reeksen. Beide heten "L lang×kort×dikte",
+  // dus het onderscheid zit in de eerste twee getallen: gelijk = gelijkbenig.
+  // Ze door elkaar in één lijst zetten geeft een keuzelijst waarin
+  // "L 100x100x10" en "L 100x50x8" naast elkaar staan zonder dat te zien is
+  // dat de eerste twee even lange benen heeft — en de keuze tussen die twee
+  // is bij een hoeklijn ingrijpender dan bij welk ander profiel ook, want zij
+  // bepaalt waar de hoofdassen liggen. Zie scripts/genereer-hoeklijnen.mjs
+  // voor de bron van de maten.
+  { id: "L", label: "L gelijkbenig", match: (n) => hoeklijnBenen(n)?.gelijk === true },
+  { id: "LO", label: "L ongelijkbenig", match: (n) => hoeklijnBenen(n)?.gelijk === false },
+  // Massief rond staal (EN 10060), "RD <d>": windverbanden en trekstangen.
+  // Zie scripts/genereer-rondstaal.mjs voor de reeks en de grootheden.
+  { id: "RD", label: "Rond staal, massief (RD, Ø)", match: (n) => /^RD\d+$/.test(n) },
+  // Platstaal (EN 10058), "Strip <b>x<t>": windverbanden van strip. Zie
+  // scripts/genereer-strip.mjs voor de reeks en de grootheden, en
+  // lib/strip.ts voor de stand (breedte langs z).
+  { id: "STRIP", label: "Platstaal, strip (FL)", match: (n) => /^STRIP\d+X\d+$/.test(n) },
+];
+
+/**
+ * De labels van de reeksen die een Nederlands woord dragen, vertaalbaar voor
+ * de interface (issue #33). `label` blijft Nederlands; de profielkiezer en
+ * de profieleditor tonen `reeksLabel`. Een reeks die hier niet staat heet in
+ * elke taal hetzelfde (IPE, HEA, UNP …).
+ */
+const REEKS_TEKST: Record<string, VertaalbareTekst> = {
+  DIE: vt("check:profilePicker.seriesLabel.old", "DIE (oud)", { reeks: "DIE" }),
+  DIL: vt("check:profilePicker.seriesLabel.old", "DIL (oud)", { reeks: "DIL" }),
+  DIN: vt("check:profilePicker.seriesLabel.old", "DIN (oud)", { reeks: "DIN" }),
+  INP: vt("check:profilePicker.seriesLabel.old", "INP (oud)", { reeks: "INP" }),
+  KOKER: vt("check:profilePicker.seriesLabel.hollowHotFinished", "Koker warmvervaardigd (SHS/RHS, EN 10210)"),
+  CHS: vt("check:profilePicker.seriesLabel.circularHotFinished", "Buis warmvervaardigd (CHS, EN 10210)"),
+  L: vt("check:profilePicker.seriesLabel.angleEqual", "L gelijkbenig"),
+  LO: vt("check:profilePicker.seriesLabel.angleUnequal", "L ongelijkbenig"),
+  RD: vt("check:profilePicker.seriesLabel.roundBar", "Rond staal, massief (RD, Ø)"),
+  STRIP: vt("check:profilePicker.seriesLabel.flatBar", "Platstaal, strip (FL)"),
+};
+
+/** Het label van een reeks voor de interface: vertaalbaar, of de naam zelf. */
+export function reeksLabel(r: { id: string; label: string }): string | VertaalbareTekst {
+  return REEKS_TEKST[r.id] ?? r.label;
+}
+
+/**
+ * De twee beenlengten uit een hoeklijnsleutel ("L200X100X14"), of null als de
+ * naam geen hoeklijn is.
+ */
+function hoeklijnBenen(sleutel: string): { h: number; b: number; gelijk: boolean } | null {
+  const m = /^L(\d+)X(\d+)X\d+$/.exec(sleutel);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const b = Number(m[2]);
+  return { h, b, gelijk: h === b };
+}
+
+/**
+ * Naam om te tónen bij een databasesleutel: "DIN425" → "DIN 42.5".
+ *
+ * De sleutel is de genormaliseerde naam (zonder spaties en punten) en die is
+ * bij de oude reeksen misleidend: DIN 42.5 en DIN 47.5 zijn de historische
+ * maten 42½ en 47½, geen maat 425 of 475.
+ */
+export function profielLabel(sleutel: string): string {
+  return STEEL_SECTION_DIMS[sleutel]?.naam ?? sleutel;
+}
+
+/**
+ * Sorteersleutel: ALLE getallen in de LEESBARE naam, met de decimaal erin
+ * ("DIN 42.5" → [42,5]; "L 100x50x8" → [100, 50, 8]). Op de sleutel sorteren
+ * zou 42.5 als 425 lezen en de maat achteraan zetten.
+ *
+ * Dat het er méér dan één zijn, telt bij elke reeks waar de tweede en derde
+ * maat variëren: bij "L 100x50x6/8/10" en bij de kokers zou een vergelijking
+ * op tekst 10 vóór 6 zetten.
+ */
+function matenVan(sleutel: string): number[] {
+  return (profielLabel(sleutel).match(/\d+(?:[.,]\d+)?/g) ?? [])
+    .map((m) => parseFloat(m.replace(",", ".")));
+}
+
+/** Getal-voor-getal vergelijken; de kortste naam eerst bij gelijke maten. */
+function vergelijkMaten(a: string, b: string): number {
+  const ma = matenVan(a);
+  const mb = matenVan(b);
+  for (let i = 0; i < Math.max(ma.length, mb.length); i += 1) {
+    const va = ma[i] ?? -Infinity;
+    const vb = mb[i] ?? -Infinity;
+    if (va !== vb) return va - vb;
+  }
+  return a.localeCompare(b);
+}
+
+/** Profielnamen (databasesleutels) van één reeks, op maat gesorteerd. */
+export function profielenVanReeks(reeksId: string): string[] {
+  const r = REEKSEN.find((x) => x.id === reeksId);
+  if (!r) return [];
+  return Object.keys(STEEL_SECTION_DIMS)
+    .filter((naam) => r.match(naam))
+    .sort(vergelijkMaten);
+}
+
+/** Reeks waarin een profielnaam valt; null als geen reeks past. */
+export function reeksVanProfiel(naam: string): string | null {
+  const key = profileLookupKey(naam);
+  return REEKSEN.find((r) => r.match(key))?.id ?? null;
+}
+
+function motorSoort(naam: string, dims: SteelSectionDims): MotorSoort {
+  switch (dims.kind) {
+    case "ISection":
+      // DIN 1025-1 (INP) heeft 14 % flensschuinte; de moderne reeksen niet.
+      return (dims.flensHelling ?? 0) > 0 ? "ISectionSchuin" : "ISection";
+    case "Channel":
+      // DIN 1026-1 (UNP) heeft 8 % flensschuinte; UPE heeft evenwijdige flenzen.
+      return profileLookupKey(naam).startsWith("UNP") ? "ChannelSchuin" : "Channel";
+    case "Shs":
+      return "Shs";
+    case "Rhs":
+      return "Rhs";
+    case "Chs":
+      return "Chs";
+    case "Angle":
+      return "Angle";
+    case "RoundBar":
+      return "RoundBar";
+    // Platstaal is voor de motor een massieve rechthoek: h = de breedte van
+    // de strip, b = de dikte (zie `lib/strip.ts` voor de stand).
+    case "FlatBar":
+      return "Rechthoek";
+  }
+}
+
+/**
+ * Catalogusprofiel → invoer voor de motor; undefined als het niet bestaat.
+ * `naam` wordt de databasesleutel ("IPE300"), dezelfde vorm als het
+ * profielkeuzescherm op een staaf zet.
+ */
+export function basisprofielVan(naam: string): Basisprofiel | undefined {
+  const sleutel = profileLookupKey(naam);
+  const dims = STEEL_SECTION_DIMS[sleutel];
+  if (!dims) return undefined;
+  return {
+    naam: sleutel,
+    soort: motorSoort(naam, dims),
+    h: dims.h,
+    b: dims.b,
+    tw: dims.tw,
+    tf: dims.tf,
+    r: dims.r,
+    // Alleen een hoeklijn draagt een tweede straal (de teenafronding); bij de
+    // rest blijft het veld weg, zodat de motorinvoer er niet stilzwijgend een
+    // nul voor krijgt.
+    ...(dims.r2 === undefined ? {} : { r2: dims.r2 }),
+  };
+}
+
+/** Oppervlak uit de database (mm²), voor de snelle TS-schatting tijdens tekenen. */
+export function catalogusOppervlak(naam: string): number | undefined {
+  return STEEL_SECTIONS[profileLookupKey(naam)]?.A;
+}

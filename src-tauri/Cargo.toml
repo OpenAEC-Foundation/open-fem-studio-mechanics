@@ -1,0 +1,140 @@
+[package]
+name = "open-fem-studio"
+version = "2026.44.0"
+description = "Open FEM Studio Mechanics — open-source eindige-elementenprogramma (2D en 3D) voor de mechanica van constructies, zonder normtoetsing."
+authors = ["OpenAEC Foundation"]
+license = "AGPL-3.0-or-later"
+edition = "2021"
+
+[lib]
+name = "open_fem_studio_lib"
+# Desktop-only Windows build: use "lib" (rlib) only.
+# Tauri's default scaffold suggests cdylib + staticlib for mobile (iOS/Android),
+# but on Windows cdylib re-exports every transitive crate symbol (~95k) which
+# overflows the PE/COFF DLL 64K export limit. Add cdylib back when we add
+# mobile targets. See README "Windows toolchain note".
+crate-type = ["lib"]
+# De unit-testharnas van de lib laadt op Windows niet: hij linkt via de
+# dialoog-plugin tegen comctl32 v6 (TaskDialogIndirect) en cargo geeft alleen
+# bins en integratietest-doelen het manifest mee (build.rs). Unit-tests van
+# deze crate staan daarom in tests/ (zie tests/testbinary_laadt.rs).
+test = false
+doctest = false
+
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# Het resourcebestand van tauri-build ook in de TESTbinary (zie build.rs):
+# dezelfde crate en versie die tauri-build zelf gebruikt (Cargo.lock).
+embed-resource = "3"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "=2.5.3"
+tauri-plugin-os = "=2.3.2"
+# Eén app-venster (issue #90): een tweede start geeft zijn bestanden aan de
+# draaiende app en stopt. Vastgezet op 2.4.3, de laatste die met tauri 2.11
+# werkt: 2.5.x vraagt tauri 2.12, en dan moeten @tauri-apps/api en de
+# JS-plugins mee (test-tauri-plugin-versies.mjs). Geen JS-kant.
+tauri-plugin-single-instance = "=2.4.3"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: getallen die de pagina naar Rust stuurt (elk command, en het
+# bedieningskanaal) komen anders 1 ULP verschoven aan — 52,2 wordt 52,199999999999996.
+# De MCP-crate had dit al; zonder deze regel toont de GUI-weg een ander laatste cijfer
+# dan de kern rechtstreeks. Zie referentie-gui/wapening-workflow.mjs, stap ⑥b.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+steel-profiles = { path = "crates/steel-profiles" }
+section-properties = { path = "crates/section-properties" }
+# Ruimtelijke raamwerken: neutraal Open FEM-contract met een vastgezette
+# adapter voor een externe 3D-rekenkern (lineair, directe tweede orde en eigenknik).
+open-fem-3d = { path = "crates/open-fem-3d" }
+# Spoor `frame3d` (Tauri-commands frame3d_engine_info/solve_frame3d): dezelfde
+# Dedaliano/Stabileo-adapter onder de oude cratenaam.
+frame3d-solver = { path = "crates/frame3d-solver" }
+# Experimentele eigen Rust-FEM-kern (Tauri-command solve_native_fem).
+openaec-native-fem = { path = "crates/native-fem", default-features = false }
+# ── GUI-bediening (module `gui_control`, alleen actief met OPENAEC_GUI_CONTROL=1) ──
+# tiny_http: synchrone localhost-luisteraar; de app-crate heeft geen tokio.
+# rand/png/raw-window-handle staan al in de lock via Tauri — zelfde versies,
+# dus geen extra compilatie. windows: alleen de drie modules voor PrintWindow.
+tiny_http = "0.12"
+rand = "0.9"
+png = "0.17"
+raw-window-handle = "0.6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+semver = "1"
+
+[dev-dependencies]
+# tests/bestandskoppeling.rs: een nagebootste app (`tauri::test`) met de echte
+# fs-plugin, om de vrijgave van een gemeld bestand te toetsen. Dezelfde crate,
+# alleen de feature erbij en alleen voor testdoelen; de app bouwt zonder.
+tauri = { version = "2", features = ["test"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization"] }
+# Het standaardrapport als PDF (`gui_control::afdruk`): ICoreWebView2_7::PrintToPdf op
+# de webview die Tauri via `with_webview` geeft. Tauri exporteert webview2_com niet
+# opnieuw, dus om die interface te kunnen noemen is een directe afhankelijkheid
+# nodig. EXACT de versie die tauri/wry al gebruiken (Cargo.lock): een tweede kopie
+# gaf onverenigbare COM-types voor `controller()`. Werkt een Tauri-update
+# webview2-com bij, dan faalt het oplossen van afhankelijkheden hier luid — en dat
+# is de bedoeling: dan hoort deze regel mee te gaan.
+webview2-com = "=0.38.2"
+
+# Workaround for GNU linker "export ordinal too large" on Windows.
+# Tauri pulls in 366+ crates and the GNU ld.exe symbol table overflows.
+# Strip debuginfo to reduce export count. MSVC toolchain avoids this entirely.
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+incremental = false
+
+# Ook een dev-build rekent geoptimaliseerd. De rekenkernen draaien in het
+# app-proces (Tauri-commando's); met opt-level 0 rekende een dev-app ruim tien
+# keer zo traag als de release (NAFEMS LE1 in open-fem-3d: 1,95 s tegen 0,20 s).
+# Afhankelijkheden (lineaire algebra) en de reken- en toetscrates daarom op 3;
+# de app-crate zelf blijft op 0, zodat opnieuw bouwen snel blijft.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.open-fem-3d]
+opt-level = 3
+
+[profile.dev.package.openaec-native-fem]
+opt-level = 3
+
+[profile.dev.package.frame3d-solver]
+opt-level = 3
+
+[profile.dev.package.mechanics]
+opt-level = 3
+
+[profile.dev.package.section-properties]
+opt-level = 3
+
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+
+[workspace]
+resolver = "2"
+members = [".", "crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip voor élke crate: JSON-getallen van buiten (pagina, toetsbrug, MCP)
+# komen anders 1 ULP verschoven aan. Toelichting bij de app-crate hierboven.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+ts-rs = "10"
+approx = "0.5"
+insta = { version = "1", features = ["json"] }
+
+# De externe 3D-rekenkern met één eigen uitbreiding: orthotrope MITC4-schaal-
+# elementen (#79, #97). Kopie van dezelfde vastgezette revisie in
+# vendor/dedaliano-engine; de wijzigingen staan in OPEN-FEM-WIJZIGINGEN.md daar.
+[patch."https://github.com/lambdaclass/stabileo.git"]
+dedaliano-engine = { path = "../vendor/dedaliano-engine" }

@@ -56,7 +56,7 @@ check("een deellast, trapezium of gestapelde band houdt zijn eigen label",
   && verborgenLijnlastLabels([last(11, 1), last(12, 2, { stapelOffset: 30 })], staven, knopen).size === 0);
 check("het tekenvlak slaat het label van de verborgen lasten over (alleen bij de lijnlast op een staaf)",
   (canvas.match(/\{verborgenLabels\.has\(l\.id\) \? null : isTrap \? \(/g) ?? []).length === 1
-  && /const verborgenLabels = verborgenLijnlastLabels\(/.test(readFileSync(join(HIER, "src", "components", "fem", "FemCanvas.tsx"), "utf8")));
+  && /const verborgenLabels = (useMemo\(\(\) => )?verborgenLijnlastLabels\(/.test(readFileSync(join(HIER, "src", "components", "fem", "FemCanvas.tsx"), "utf8")));
 
 log("\n[4] de schaal van passend beeld");
 const { passendBeeldSchaal } = await import("./src/lib/lijnlastPijlen.ts");

@@ -603,6 +603,7 @@ const ALLEEN_BRON = new Map([
   ["staalhal-wizard-ui", "React-interactie van de wizard Stalen hal in Chromium (stappen, mm-invoer, voorbeeld, meldingen); de generator zelf draait ook in de bundel via staalhal-sidecar."],
   ["ifc-import-ui", "React-interactie van \"Rekenmodel importeren\" in Chromium (knop op het IFC-tabblad, keuzevenster, vraag bij niet-opgeslagen werk, verslag, foutmelding); de import zelf draait ook in de bundel via ifc-analyse-sidecar."],
   ["lijnlast-pijlen", "Pijlafstand van lijnlasten op het 2D-tekenvlak en de bron van FemCanvas; geen solvercode en niet in de sidecarbundel."],
+  ["tekenvlak-prestatie", "Prestatiegrens van het 2D-tekenvlak: lastlabels, modelcontrole en een volledige render van FemCanvas (react-dom/server) met 4840 staven, plus de bron van FemCanvas en LibraryDialog; geen solvercode en niet in de sidecarbundel."],
   ["open-fem3d-projectwissel", "Een tweede 3D-project met platen openen: de plaatlaag (Three.js) met een net dat niet bij het model past, en de bedrading in App.tsx; weergavelogica buiten de barrel, de sidecar tekent niets."],
   ["schermafdruk-canvas", "DOM-schermafdruk van de bediening buiten Windows: de WebGL-tekenvlakken vastleggen vóór html2canvas (bediening/schermafdrukCanvas.ts, met nep-canvassen) en de bedrading in bediening.ts en het 3D-tekenvlak; geen solvercode en niet in de sidecarbundel."],
   ["html2canvas-ui", "DOM-schermafbeelding met html2canvas en color-mix in Chromium (bedieningskanaal en feedback); geen solvercode en niet in de sidecarbundel."],

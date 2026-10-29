@@ -11,12 +11,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Vingerafdruk van de OpenAEC-releasesleutel (OpenPGP, Linux). De publieke
+  # sleutel staat in docs/openaec-releases.asc; zie docs/signing.md (#257).
+  OPENAEC_RELEASE_KEY_FPR: 13F6D414ADEE4ED4CD09AC60601D86C93C504D29
 
 jobs:
   # ── 1. Pre-flight check ───────────────────────────────────
-  # The frontend lives in design-mockup/ (build.frontendDist in
-  # src-tauri/tauri.conf.json). If it does not build, there is no point in
-  # building three platforms.
+  # De frontend van het programma staat in design-mockup/ (zie
+  # build.frontendDist in src-tauri/tauri.conf.json). Faalt die build,
+  # dan heeft het geen zin om drie platformen te bouwen.
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -25,13 +28,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      # Version YYYY.W.N identical everywhere, and equal to the tag (vYYYY.W.N).
-      - name: Version number
+      # Versie JJJJ.W.N op alle plekken gelijk, en gelijk aan de tag (vJJJJ.W.N).
+      - name: Versienummer
         run: |
           node scripts/versie.mjs --check
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             app=$(node -p "require('./design-mockup/package.json').version")
-            [ "v$app" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $app"; exit 1; }
+            [ "v$app" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME past niet bij versie $app"; exit 1; }
           fi
       - uses: actions/cache@v5
         with:
@@ -66,11 +69,12 @@ jobs:
     name: Build – ${{ matrix.label }}
     runs-on: ${{ matrix.platform }}
 
-    # Signing only happens when the organisation secrets are available (same
-    # setup as the other OpenAEC studios). Without them the release is built
-    # unsigned: a build must not fail on a missing certificate.
+    # Ondertekenen gebeurt alleen als de secrets er zijn (zelfde opzet als Open
+    # PDF Studio en Open Pointcloud Studio). Zonder secrets bouwt de release
+    # onondertekend, zoals voorheen: een build mag niet stuk gaan op een
+    # ontbrekend certificaat.
     #   Windows: Azure Trusted Signing (AZURE_*), via bundle.windows.signCommand.
-    #   macOS:   Developer ID + notarization with an App Store Connect API key (APPLE_*).
+    #   macOS:   Developer ID + notarisatie met een App Store Connect API-sleutel (APPLE_*).
     env:
       WIN_SIGN: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME != '' }}
       MAC_SIGN: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_API_KEY != '' }}
@@ -115,30 +119,31 @@ jobs:
             libgtk-3-dev \
             patchelf
 
-      # beforeBuildCommand in tauri.conf.json runs `cd design-mockup &&
-      # npm run build`, so its dependencies must be installed first.
+      # beforeBuildCommand in tauri.conf.json draait `cd design-mockup &&
+      # npm run build`; de dependencies daarvan moeten dus vooraf staan.
       - name: Install frontend dependencies
         run: npm ci
         working-directory: design-mockup
 
-      # tauri-action runs `npm run tauri build` in the project root, which needs
-      # @tauri-apps/cli from the root dependencies.
+      # tauri-action draait `npm run tauri build` in de projectroot; daarvoor
+      # moet @tauri-apps/cli uit de root-dependencies beschikbaar zijn.
       - name: Install root dependencies
         run: npm ci
 
-      # The MCP server ships as a separate binary in the installer (externalBin in
-      # src-tauri/tauri.bundel.conf.json). Tauri needs it before the build as
-      # binaries/openaec-mcp-server-<triple>; on macOS the script merges both
-      # architectures with lipo.
-      - name: Build MCP server (shipped in the installer)
+      # De MCP-server gaat als losse binary mee in de installer (externalBin in
+      # src-tauri/tauri.bundel.conf.json). Tauri eist dat hij vóór de build klaarstaat
+      # als binaries/openaec-mcp-server-<triple>; op macOS voegt het script de twee
+      # architecturen samen met lipo.
+      - name: Build MCP-server (meegeleverd in de installer)
         run: node scripts/mcp-sidecar.mjs --target ${{ matrix.rust-target }}
 
-      # ── Windows signing (Azure Trusted Signing) ──
-      # Installs signtool and the Trusted Signing dlib on the runner and signs the
-      # MCP sidecar in src-tauri/binaries. Tauri then signs every Windows binary
-      # itself once bundle.windows.signCommand is set: the sidecar, the app exe
-      # (after the bundler has written the bundle type into it), the NSIS dlls,
-      # uninstall.exe and the installers.
+      # ── Windows ondertekenen (Azure Trusted Signing) ──
+      # Installeert signtool en de Trusted Signing-dlib op de runner en
+      # ondertekent alvast de MCP-sidecar in src-tauri/binaries. Tauri
+      # ondertekent daarna zelf elke Windows-binary zodra
+      # bundle.windows.signCommand gezet is: de sidecar, de app-exe (pas nadat
+      # de bundler het bundeltype erin heeft gezet; eerder ondertekenen geeft een
+      # HashMismatch), de NSIS-dll's, uninstall.exe en de installers.
       - name: Install Azure signing tools (Windows)
         if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
         uses: azure/trusted-signing-action@v1
@@ -157,8 +162,8 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      # A CI config that extends tauri.bundel.conf.json (the MCP sidecar) with a
-      # signCommand for the signtool + dlib installed above.
+      # Een CI-config die tauri.bundel.conf.json (de MCP-sidecar) aanvult met een
+      # signCommand naar de signtool + dlib van hierboven.
       - name: Configure Tauri sign command (Windows)
         if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
         shell: pwsh
@@ -172,7 +177,7 @@ jobs:
             Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
           $dlib = Get-ChildItem $root -Recurse -Filter Azure.CodeSigning.Dlib.dll -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
-          if (-not $signtool -or -not $dlib) { Write-Error "signtool or the Trusted Signing dlib not found under $root"; exit 1 }
+          if (-not $signtool -or -not $dlib) { Write-Error "signtool of de Trusted Signing-dlib niet gevonden onder $root"; exit 1 }
           $metadata = Join-Path $env:RUNNER_TEMP 'trusted-signing-metadata.json'
           @{
             Endpoint = $env:AZURE_ENDPOINT
@@ -188,9 +193,9 @@ jobs:
           $conf | ConvertTo-Json -Depth 10 | Set-Content -Path src-tauri/tauri.signing.conf.json -Encoding utf8
           Get-Content src-tauri/tauri.signing.conf.json
 
-      # ── macOS signing and notarization ──
-      # Notarization with an App Store Connect API key (Apple ID + app-specific
-      # password gave persistent HTTP 500 errors from the notary API).
+      # ── macOS ondertekenen en notariseren ──
+      # Notarisatie via een App Store Connect API-sleutel: in Open PDF Studio gaf
+      # Apple-ID + app-specifiek wachtwoord een blijvende HTTP 500 op de notary-API.
       - name: Write App Store Connect API key (macOS)
         if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
         shell: bash
@@ -198,7 +203,7 @@ jobs:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
         run: printf '%s' "$APPLE_API_KEY_CONTENT" > "$RUNNER_TEMP/apple-api-key.p8"
 
-      # Unsigned: Linux always, Windows and macOS while their secrets are missing.
+      # Onondertekend: Linux altijd, Windows en macOS zolang hun secrets ontbreken.
       - name: Build Tauri app
         if: >-
           !(runner.os == 'Windows' && env.WIN_SIGN == 'true') &&
@@ -209,19 +214,19 @@ jobs:
         with:
           args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundel.conf.json
 
-      - name: Build Tauri app (Windows, signed)
+      - name: Build Tauri app (Windows, ondertekend)
         if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The dlib authenticates with Azure using these.
+          # De dlib meldt zich met deze gegevens aan bij Azure.
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
         with:
           args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.signing.conf.json
 
-      - name: Build Tauri app (macOS, signed and notarized)
+      - name: Build Tauri app (macOS, ondertekend en genotariseerd)
         if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
@@ -236,23 +241,32 @@ jobs:
         with:
           args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundel.conf.json
 
-      # Verify what users download: both installers carry a valid signature.
+      # Bewijs op wat gebruikers downloaden: beide installers dragen een geldige
+      # handtekening (Tauri ondertekent de app-exe, de sidecar en de
+      # NSIS-onderdelen vóór het inpakken).
       - name: Verify signatures (Windows)
         if: runner.os == 'Windows' && env.WIN_SIGN == 'true'
         shell: pwsh
         run: |
           $bundle = "src-tauri/target/${{ matrix.rust-target }}/release/bundle"
           $files = @(Get-ChildItem "$bundle/nsis/*-setup.exe") + @(Get-ChildItem "$bundle/msi/*.msi")
+          if ($files.Count -lt 2) { Write-Error 'setup.exe of .msi ontbreekt'; exit 1 }
+          # Ook de eigen bestanden in de NSIS-installer (#257): app-exe,
+          # MCP-sidecar en de Tauri-NSIS-plugin. De uninstaller ontstaat pas
+          # bij het installeren; die controleert de job verify.
+          7z x -y -o"$env:RUNNER_TEMP/nsis-inhoud" $files[0].FullName | Out-Null
+          $files += @('open-fem-studio.exe', 'openaec-mcp-server.exe', '$PLUGINSDIR\nsis_tauri_utils.dll' |
+            ForEach-Object { Get-Item -LiteralPath (Join-Path "$env:RUNNER_TEMP/nsis-inhoud" $_) })
           $fout = $false
           foreach ($f in $files) {
-            $sig = Get-AuthenticodeSignature $f.FullName
-            Write-Output ("{0}: {1} ({2})" -f $f.Name, $sig.Status, $sig.SignerCertificate.Subject)
-            if ($sig.Status -ne 'Valid') { $fout = $true }
+            $sig = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            Write-Output ("{0}: {1} ({2}; tijdstempel: {3})" -f $f.Name, $sig.Status, $sig.SignerCertificate.Subject, $sig.TimeStamperCertificate.Subject)
+            if ($sig.Status -ne 'Valid' -or -not $sig.TimeStamperCertificate) { $fout = $true }
           }
-          if ($fout -or $files.Count -lt 2) { Write-Error 'Not all Windows installers are validly signed'; exit 1 }
+          if ($fout) { Write-Error 'Niet alle Windows-bestanden zijn geldig ondertekend met tijdstempel'; exit 1 }
 
-      # The .app inside the dmg (what users actually get): signature,
-      # Gatekeeper and the stapled notarization ticket.
+      # De .app uit de dmg (wat gebruikers echt krijgen): handtekening,
+      # Gatekeeper en het geniete notarisatieticket.
       - name: Verify signature and notarization (macOS)
         if: runner.os == 'macOS' && env.MAC_SIGN == 'true'
         shell: bash
@@ -285,8 +299,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # ── 3. Publish a draft release ────────────────────────────
-  # Draft, so the release notes can be reviewed first.
+  # ── 3. Concept-release publiceren ─────────────────────────
+  # Draft, zodat de release-notities eerst nagelopen kunnen worden.
   publish:
     name: Publish Release
     needs: build
@@ -294,6 +308,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      release-id: ${{ steps.release.outputs.id }}
+      linux-signed: ${{ steps.gpg.outputs.signed }}
+    env:
+      WIN_SIGN: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME != '' }}
+      MAC_SIGN: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_API_KEY != '' }}
 
     steps:
       - name: Download all artifacts
@@ -309,12 +329,20 @@ jobs:
           find artifacts -name '*.dmg' -exec cp {} release/ \;
           find artifacts -name '*.AppImage' -exec cp {} release/ \;
           find artifacts -name '*.deb' -exec cp {} release/ \;
+          # GitHub maakt van een spatie in een assetnaam een punt. Hernoem vooraf,
+          # anders noemt SHA256SUMS andere namen dan de downloads en faalt
+          # `sha256sum -c` bij de gebruiker (zo in v2026.44.0, #257).
+          for f in release/*' '*; do [ -e "$f" ] && mv -- "$f" "release/$(basename "$f" | tr ' ' '.')"; done
           ls -la release/
 
-      # As in OpenAEC Blueprint: checksums, and the checksums and the AppImage
-      # signed with the organisation's OpenPGP key. Without the key only the
-      # checksums are published.
+      # Zoals OpenAEC Blueprint: controlesommen, en de controlesommen, de
+      # AppImage en de .deb met een losse handtekening (.asc) van de
+      # OpenPGP-sleutel van de organisatie (#257). Ontbreekt de sleutel, dan
+      # faalt de release niet (afspraak in Blueprint, release.yml); de
+      # release-notes en de samenvatting van de run zeggen dan dat Linux niet
+      # ondertekend is.
       - name: Checksums and OpenPGP signature (Linux)
+        id: gpg
         env:
           OPENAEC_GPG_PRIVATE_KEY: ${{ secrets.OPENAEC_GPG_PRIVATE_KEY }}
           OPENAEC_GPG_PASSPHRASE: ${{ secrets.OPENAEC_GPG_PASSPHRASE }}
@@ -323,18 +351,55 @@ jobs:
           set -euo pipefail
           (cd release && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
           if [[ -z "${OPENAEC_GPG_PRIVATE_KEY:-}" || -z "${OPENAEC_GPG_PASSPHRASE:-}" || -z "${OPENAEC_GPG_FINGERPRINT:-}" ]]; then
-            echo "OpenPGP key not available; not signed."; exit 0
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Linux niet ondertekend: OPENAEC_GPG_PRIVATE_KEY, OPENAEC_GPG_PASSPHRASE of de variabele OPENAEC_GPG_FINGERPRINT is niet met deze repository gedeeld (#257)"
+            echo "### Linux niet ondertekend" >> "$GITHUB_STEP_SUMMARY"
+            echo "De OpenPGP-sleutel van de organisatie is niet beschikbaar; alleen \`SHA256SUMS\` is gepubliceerd, zonder \`.asc\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           export GNUPGHOME=$(mktemp -d)
           printf '%s\n' "$OPENAEC_GPG_PRIVATE_KEY" | gpg --batch --import
-          fpr=$(tr -d ' ' <<< "$OPENAEC_GPG_FINGERPRINT")
-          gpg --batch --list-secret-keys --with-colons | grep -q "$fpr" || { echo "::error::the key is not $fpr"; exit 1; }
-          for f in release/SHA256SUMS release/*.AppImage; do
+          fpr=$(tr -d '[:space:]' <<< "$OPENAEC_GPG_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+          [[ "$fpr" == "$OPENAEC_RELEASE_KEY_FPR" ]] || { echo "::error::OPENAEC_GPG_FINGERPRINT ($fpr) is niet de gepubliceerde sleutel $OPENAEC_RELEASE_KEY_FPR (docs/signing.md)"; exit 1; }
+          gpg --batch --list-secret-keys --with-colons | grep -q "$fpr" || { echo "::error::de sleutel is niet $fpr"; exit 1; }
+          shopt -s nullglob
+          files=(release/SHA256SUMS release/*.AppImage release/*.deb)
+          (( ${#files[@]} >= 3 )) || { echo "::error::AppImage of .deb ontbreekt"; exit 1; }
+          for f in "${files[@]}"; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$OPENAEC_GPG_PASSPHRASE" --local-user "$fpr" --armor --detach-sign --output "$f.asc" "$f"
             gpg --batch --verify "$f.asc" "$f"
           done
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        env:
+          GPG_SIGNED: ${{ steps.gpg.outputs.signed }}
+        run: |
+          set -euo pipefail
+          ja() { [[ "$1" == true ]] && echo "ja" || echo "**nee**"; }
+          cat > notes.md <<EOF
+          **Downloads:**
+          - **Windows:** \`.exe\` (NSIS-installer) / \`.msi\`
+          - **macOS:** \`.dmg\` (universal)
+          - **Linux:** \`.AppImage\` / \`.deb\` (OpenPGP: \`.asc\`, controlesommen in \`SHA256SUMS\`)
+
+          ## Ondertekening
+
+          | Wat | Ondertekend |
+          | --- | --- |
+          | Windows: installers, programma, MCP-server en uninstaller (Authenticode, met tijdstempel) | $(ja "$WIN_SIGN") |
+          | macOS: app in de dmg (Developer ID, genotariseerd en geniet) | $(ja "$MAC_SIGN") |
+          | Linux: \`SHA256SUMS\`, AppImage en .deb (OpenPGP, losse \`.asc\`) | $(ja "$GPG_SIGNED") |
+
+          Controleren: zie [docs/signing.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/signing.md). Linux in het kort: publieke sleutel [\`openaec-releases.asc\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/openaec-releases.asc), vingerafdruk \`${OPENAEC_RELEASE_KEY_FPR}\`, dan \`gpg --verify SHA256SUMS.asc SHA256SUMS\` en \`sha256sum -c SHA256SUMS\`.
+          EOF
+          if [[ "$GPG_SIGNED" != true ]]; then
+            printf '\n> **Linux niet ondertekend.** Deze release heeft voor Linux alleen controlesommen, zonder OpenPGP-handtekening.\n' >> notes.md
+          fi
+          cat notes.md
 
       - name: Publish release
+        id: release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
@@ -342,9 +407,191 @@ jobs:
           prerelease: false
           draft: true
           generate_release_notes: true
-          body: |
-            **Downloads:**
-            - **Windows:** `.exe` (NSIS-installer) / `.msi`
-            - **macOS:** `.dmg` (universal)
-            - **Linux:** `.AppImage` / `.deb` (OpenPGP: `.asc`, checksums in `SHA256SUMS`)
+          body_path: notes.md
           files: release/*
+
+  # ── 4. Gepubliceerde bestanden opnieuw controleren ────────
+  # Haalt de bestanden van de zojuist geüploade (concept)release opnieuw op en
+  # controleert ze zoals een gebruiker dat zou doen (#257). Faalt deze job, dan
+  # mag de concept-release niet gepubliceerd worden.
+  verify:
+    name: Verify release – ${{ matrix.label }}
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            label: Linux
+            assets: '.'
+          - platform: windows-latest
+            label: Windows
+            assets: '\.(exe|msi)$'
+          - platform: macos-latest
+            label: macOS
+            assets: '\.dmg$'
+    runs-on: ${{ matrix.platform }}
+    # Bestanden van een concept-release zijn alleen met schrijfrecht te lezen.
+    permissions:
+      contents: write
+    env:
+      WIN_SIGN: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME != '' }}
+      MAC_SIGN: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_API_KEY != '' }}
+      LINUX_SIGNED: ${{ needs.publish.outputs.linux-signed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: docs
+
+      - name: Download published files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.publish.outputs.release-id }}
+          ASSETS: ${{ matrix.assets }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          mkdir -p dl
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate --jq '.[] | "\(.id)\t\(.name)"' > assets.tsv
+          while IFS=$'\t' read -r id name; do
+            [[ "$name" =~ $ASSETS ]] || continue
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "dl/$name"
+          done < assets.tsv
+          ls -la dl
+
+      # Controlesommen over alle bestanden, en de OpenPGP-handtekeningen met de
+      # publieke sleutel uit deze repository; de handtekening moet van de
+      # sleutel met de gepubliceerde vingerafdruk zijn.
+      - name: Verify checksums and OpenPGP signatures (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dl
+          test -f SHA256SUMS
+          for f in *; do
+            case "$f" in SHA256SUMS|*.asc) continue ;; esac
+            awk '{ sub(/^[0-9a-f]+  \*?/, ""); print }' SHA256SUMS | grep -qxF -- "$f" || { echo "::error::$f staat niet in SHA256SUMS"; exit 1; }
+          done
+          sha256sum -c SHA256SUMS
+          export GNUPGHOME=$(mktemp -d)
+          gpg --batch --import ../docs/openaec-releases.asc
+          key=$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr" { print $10; exit }')
+          [[ "$key" == "$OPENAEC_RELEASE_KEY_FPR" ]] || { echo "::error::docs/openaec-releases.asc is sleutel $key, niet $OPENAEC_RELEASE_KEY_FPR"; exit 1; }
+          if [[ "$LINUX_SIGNED" != true ]]; then
+            echo "::warning::Linux niet ondertekend; alleen de controlesommen zijn gecontroleerd"
+            echo "### Linux niet ondertekend (alleen SHA256SUMS gecontroleerd)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          shopt -s nullglob
+          for f in SHA256SUMS *.AppImage *.deb; do
+            test -f "$f.asc" || { echo "::error::$f.asc ontbreekt"; exit 1; }
+            gpg --batch --status-fd 1 --verify "$f.asc" "$f" > status.txt
+            primary=$(awk '$2=="VALIDSIG" { print $NF }' status.txt)
+            [[ "$primary" == "$OPENAEC_RELEASE_KEY_FPR" ]] || { echo "::error::$f is niet ondertekend met $OPENAEC_RELEASE_KEY_FPR"; cat status.txt; exit 1; }
+            echo "$f: goede handtekening van $primary"
+          done
+          echo "### Linux: OpenPGP-handtekeningen en SHA256SUMS geldig ($OPENAEC_RELEASE_KEY_FPR)" >> "$GITHUB_STEP_SUMMARY"
+
+      # De gedownloade installers, de eigen bestanden erin (uitgepakt met 7-Zip
+      # en een administratieve msi-installatie) en na een stille installatie de
+      # geïnstalleerde bestanden en de uninstaller: geldige handtekening, een
+      # tijdstempel en overal dezelfde uitgever als de installer.
+      - name: Verify Authenticode signatures (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:WIN_SIGN -ne 'true') {
+            Write-Output '::warning::Windows niet ondertekend (AZURE_*-secrets ontbreken)'
+            Add-Content $env:GITHUB_STEP_SUMMARY '### Windows niet ondertekend'
+            exit 0
+          }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { Write-Error 'signtool.exe niet gevonden'; exit 1 }
+          $script:fout = @()
+          $script:uitgever = $null
+          function Test-Handtekening([string]$pad) {
+            $naam = Split-Path $pad -Leaf
+            if (-not (Test-Path -LiteralPath $pad)) { $script:fout += "$naam ontbreekt"; return }
+            $sig = Get-AuthenticodeSignature -LiteralPath $pad
+            $ts = $sig.TimeStamperCertificate
+            Write-Output ("{0}: {1}; uitgever: {2}; tijdstempel: {3}" -f $naam, $sig.Status, $sig.SignerCertificate.Subject, $(if ($ts) { $ts.Subject } else { 'GEEN' }))
+            if ($sig.Status -ne 'Valid') { $script:fout += "$naam niet geldig ondertekend ($($sig.Status))"; return }
+            if (-not $ts) { $script:fout += "$naam heeft geen tijdstempel" }
+            if (-not $script:uitgever) { $script:uitgever = $sig.SignerCertificate.Thumbprint }
+            elseif ($sig.SignerCertificate.Thumbprint -ne $script:uitgever) { $script:fout += "$naam heeft een andere uitgever" }
+            & $signtool.FullName verify /pa /q $pad | Out-Null
+            if ($LASTEXITCODE -ne 0) { $script:fout += "signtool verify faalt voor $naam" }
+          }
+          $setup = Get-ChildItem dl/*-setup.exe | Select-Object -First 1
+          $msi = Get-ChildItem dl/*.msi | Select-Object -First 1
+          if (-not $setup -or -not $msi) { Write-Error 'setup.exe of .msi ontbreekt in de release'; exit 1 }
+          Test-Handtekening $setup.FullName
+          Test-Handtekening $msi.FullName
+
+          # Inhoud van de NSIS-installer
+          7z x -y -onsis $setup.FullName | Out-Null
+          foreach ($f in 'open-fem-studio.exe', 'openaec-mcp-server.exe', '$PLUGINSDIR\nsis_tauri_utils.dll') {
+            Test-Handtekening (Join-Path (Resolve-Path nsis) $f)
+          }
+
+          # Inhoud van de msi (administratieve installatie: alleen uitpakken)
+          $msiDir = Join-Path $pwd 'msi'
+          Start-Process msiexec.exe -Wait -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$msiDir`""
+          foreach ($f in 'open-fem-studio.exe', 'openaec-mcp-server.exe') {
+            $p = Get-ChildItem $msiDir -Recurse -Filter $f | Select-Object -First 1
+            if ($p) { Test-Handtekening $p.FullName } else { $script:fout += "$f niet in de msi" }
+          }
+
+          # Stille installatie: geïnstalleerde bestanden en de uninstaller
+          Start-Process $setup.FullName -Wait -ArgumentList '/S'
+          $entry = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Open FEM Studio Mechanics*' } | Select-Object -First 1
+          if (-not $entry) { $script:fout += 'geen uninstall-registratie na de stille installatie' }
+          else {
+            $uninstaller = $entry.UninstallString -replace '^"([^"]+)".*$', '$1'
+            $dir = Split-Path $uninstaller
+            foreach ($f in 'open-fem-studio.exe', 'openaec-mcp-server.exe') { Test-Handtekening (Join-Path $dir $f) }
+            Test-Handtekening $uninstaller
+            Start-Process $uninstaller -Wait -ArgumentList '/S'
+          }
+
+          if ($script:fout.Count -gt 0) { $script:fout | ForEach-Object { Write-Output "::error::$_" }; exit 1 }
+          Add-Content $env:GITHUB_STEP_SUMMARY '### Windows: installers, eigen bestanden en uninstaller geldig ondertekend met tijdstempel'
+
+      # De app uit de gedownloade dmg: Developer ID (geen ad-hoc), hardened
+      # runtime, Gatekeeper en het geniete notarisatieticket.
+      - name: Verify signature and notarization (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$MAC_SIGN" != true ]]; then
+            echo "::warning::macOS niet ondertekend (APPLE_*-secrets ontbreken)"
+            echo "### macOS niet ondertekend" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          DMG_PATH="$(find dl -name '*.dmg' -print -quit)"
+          test -n "$DMG_PATH"
+          MOUNT_DIR="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG_PATH"
+          APP_SRC="$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_SRC"
+          mkdir -p "$RUNNER_TEMP/verify-app"
+          cp -R "$APP_SRC" "$RUNNER_TEMP/verify-app/"
+          hdiutil detach "$MOUNT_DIR"
+          APP_PATH="$RUNNER_TEMP/verify-app/$(basename "$APP_SRC")"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          for bin in "$APP_PATH" "$APP_PATH"/Contents/MacOS/*; do
+            info=$(codesign -dvv "$bin" 2>&1)
+            grep -q 'Authority=Developer ID Application' <<< "$info" || { echo "::error::$bin is niet met een Developer ID ondertekend"; echo "$info"; exit 1; }
+            grep -q 'Signature=adhoc' <<< "$info" && { echo "::error::$bin is ad-hoc ondertekend"; exit 1; }
+            grep -q 'runtime' <<< "$info" || { echo "::error::$bin mist de hardened runtime"; exit 1; }
+            echo "$bin: Developer ID, hardened runtime"
+          done
+          spctl --assess --type execute --verbose=4 "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          echo "### macOS: app uit de dmg ondertekend, Gatekeeper akkoord, ticket geniet" >> "$GITHUB_STEP_SUMMARY"

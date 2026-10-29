@@ -115,6 +115,12 @@ Download the installer for your platform from the
 - **macOS:** `.dmg` (universal)
 - **Linux:** `.AppImage` or `.deb`; signatures (`.asc`) and checksums (`SHA256SUMS`) are published alongside
 
+Windows and macOS builds are signed (Authenticode, Developer ID with notarization); the Linux files
+and `SHA256SUMS` carry an OpenPGP signature (`.asc`) of the OpenAEC release key
+[`docs/openaec-releases.asc`](docs/openaec-releases.asc), fingerprint
+`13F6 D414 ADEE 4ED4 CD09  AC60 601D 86C9 3C50 4D29`. How to verify a download:
+[docs/signing.md](docs/signing.md). A release that is not signed for a platform says so in its release notes.
+
 The installers also place the MCP server next to the app. To connect an AI assistant, open
 **Settings → AI assistant (MCP)** in the app: it shows the path of the server, a button to add it to Claude
 Desktop, and the command for Claude Code. Driving the running app is only possible on the same computer and

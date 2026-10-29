@@ -60,6 +60,11 @@ export default function LibraryDialog({ open, onClose, initialTab = "sections" }
     SUPPORTED_TIMBER_GRADES.filter((g) => !q || g.toUpperCase().includes(q)),
     [q]);
 
+  // Dicht: niets opbouwen. Modal tekent dan toch niets, maar de tabel met
+  // alle profielen (toLocaleString per cel) werd anders bij elke render van
+  // App opnieuw gemaakt — bij elke zoomstap ~100 ms weggegooid werk.
+  if (!open) return null;
+
   return (
     <Modal
       open={open}

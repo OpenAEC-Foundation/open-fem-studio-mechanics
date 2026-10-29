@@ -290,6 +290,17 @@ export function puntOpStaaf(
   const a = nodes.find((n) => n.id === beam.from);
   const b = nodes.find((n) => n.id === beam.to);
   if (!a || !b) return null;
+  return puntTussenEinden(a, b, x, z, tolMm);
+}
+
+/** `puntOpStaaf` met de eindknopen al opgezocht (zelfde regel, zonder `find`). */
+function puntTussenEinden(
+  a: { x: number; z: number },
+  b: { x: number; z: number },
+  x: number,
+  z: number,
+  tolMm: number,
+): number | null {
   const vx = b.x - a.x;
   const vz = b.z - a.z;
   const len = Math.hypot(vx, vz);
@@ -540,10 +551,39 @@ export function zoekKnopenOpStaaf(
   tolMm: number = CONTROLE_TOL_MM,
 ): Bevinding[] {
   const uit: Bevinding[] = [];
+  // Draait bij elke modelwijziging (modelcontrole op het tekenvlak). Elk paar
+  // (staaf, knoop) met `puntOpStaaf` was O(staven × knopen²) door de `find`
+  // naar de eindknopen: bij 2500 knopen en 4800 staven tientallen seconden.
+  // Nu de eindknopen via een tabel en alleen de knopen binnen het omhullende
+  // kader van de staaf (+ tolerantie) als kandidaat; een knoop daarbuiten kan
+  // niet binnen `tolMm` van het lijnstuk liggen. Volgorde en uitkomst gelijk.
+  const knoopVan = new Map<number, ControleModel["nodes"][number]>();
+  for (const n of model.nodes) if (!knoopVan.has(n.id)) knoopVan.set(n.id, n); // eerste, zoals find
+  const eindig: number[] = [];
+  const vreemd: number[] = []; // niet-eindige coördinaten: altijd kandidaat, zoals voorheen
+  model.nodes.forEach((n, i) => (Number.isFinite(n.x) && Number.isFinite(n.z) ? eindig : vreemd).push(i));
+  eindig.sort((i, j) => model.nodes[i].x - model.nodes[j].x);
+  const xs = eindig.map((i) => model.nodes[i].x);
+  const eersteVanaf = (x: number) => {
+    let lo = 0, hi = xs.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (xs[m] < x) lo = m + 1; else hi = m; }
+    return lo;
+  };
   for (const b of model.beams) {
-    for (const n of model.nodes) {
+    const a = knoopVan.get(b.from), c = knoopVan.get(b.to);
+    if (!a || !c) continue;
+    const zMin = Math.min(a.z, c.z) - tolMm, zMax = Math.max(a.z, c.z) + tolMm;
+    const xMax = Math.max(a.x, c.x) + tolMm;
+    const kandidaten: number[] = [...vreemd];
+    for (let k = eersteVanaf(Math.min(a.x, c.x) - tolMm); k < xs.length && xs[k] <= xMax; k++) {
+      const z = model.nodes[eindig[k]].z;
+      if (z >= zMin && z <= zMax) kandidaten.push(eindig[k]);
+    }
+    kandidaten.sort((i, j) => i - j);
+    for (const i of kandidaten) {
+      const n = model.nodes[i];
       if (n.id === b.from || n.id === b.to) continue;
-      const t = puntOpStaaf(model.nodes, b, n.x, n.z, tolMm);
+      const t = puntTussenEinden(a, c, n.x, n.z, tolMm);
       if (t === null) continue;
       uit.push({
         soort: "knoopOpStaaf",

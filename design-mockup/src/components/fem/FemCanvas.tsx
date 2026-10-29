@@ -2830,9 +2830,12 @@ export default function FemCanvas(props: FemCanvasProps) {
   // Loads for the active load case only — empty when in Model-view mode.
   // In Resultaten-modus willen we de invoer-belasting-pijlen verbergen zodat
   // alleen de output-overlays (M/V/N/u/R) zichtbaar zijn.
-  const activeLoads = (showLoads && !resultsMode)
+  // Gememoïseerd: de stapeling en de verborgen labels hieronder hangen eraan,
+  // en die hoeven bij een muisbeweging (hover) niet opnieuw.
+  const activeLoads = useMemo(() => (showLoads && !resultsMode)
     ? loads.filter(l => l.caseId === activeLoadCaseId)
-    : [];
+    : [], [showLoads, resultsMode, loads, activeLoadCaseId]);
+  const beamsById = useMemo(() => new Map(beams.map((b) => [b.id, b])), [beams]);
 
   // Auto-scale q-load arrows so the biggest line load reaches LINE_LOAD_TARGET_PX
   // on screen — fixed 16-px arrows were unreadable for q ≈ 1 kN/m and ridiculous
@@ -2895,6 +2898,9 @@ export default function FemCanvas(props: FemCanvasProps) {
   // geeft het label van elke band zijn eigen strook.
   const STAPEL_GAT_PX = 30;
   /** Stapelgegevens per lijnlast-id (leeg wanneer er niets te stapelen valt). */
+  // Gememoïseerd op model, lasten en beeld: een hover-render rekent dit niet
+  // opnieuw (bij honderden lijnlasten scheelt dat merkbaar per muisbeweging).
+  const qStapel = useMemo(() => {
   const qStapel = new Map<number, {
     beamId: number;
     /** Loodrechte verschuiving van de lastband t.o.v. de staafas (px). */
@@ -2914,10 +2920,10 @@ export default function FemCanvas(props: FemCanvasProps) {
       if (arr) arr.push(l); else perStaaf.set(l.beamId, [l]);
     }
     for (const [beamId, lijst] of perStaaf) {
-      const b = beams.find(bb => bb.id === beamId);
+      const b = beamsById.get(beamId);
       if (!b) continue;
-      const nA = nodes.find(n => n.id === b.from);
-      const nB = nodes.find(n => n.id === b.to);
+      const nA = nodesById.get(b.from);
+      const nB = nodesById.get(b.to);
       if (!nA || !nB) continue;
       const pA = worldToScreen(nA.x, nA.z), pB = worldToScreen(nB.x, nB.z);
       const dxs = pB.x - pA.x, dys = pB.y - pA.y;
@@ -2959,9 +2965,11 @@ export default function FemCanvas(props: FemCanvasProps) {
       }
     }
   }
+  return qStapel;
+  }, [activeLoads, beamsById, nodesById, worldToScreen, lineLoadPxPerKnm]);
   // Lastlabels: in een rechte keten van staven met dezelfde volle lijnlast
   // krijgt alleen de middelste staaf het label "q=… kN/m" (lib/lijnlastLabels).
-  const verborgenLabels = verborgenLijnlastLabels(
+  const verborgenLabels = useMemo(() => verborgenLijnlastLabels(
     activeLoads.flatMap((l) => l.type === "lineLoad" && l.beamId !== undefined ? [{
       id: l.id, beamId: l.beamId, caseId: l.caseId, q: l.q,
       trapezium: l.qStart !== undefined || l.qEnd !== undefined,
@@ -2970,7 +2978,7 @@ export default function FemCanvas(props: FemCanvasProps) {
       stapelOffset: qStapel.get(l.id)?.offset ?? 0,
     }] : []),
     beams, nodes,
-  );
+  ), [activeLoads, qStapel, beams, nodes]);
 
   /**
    * Hoogte (px) van de gestapelde q-banden op fractie `t` van staaf `beamId`,
@@ -3037,13 +3045,13 @@ export default function FemCanvas(props: FemCanvasProps) {
       let vrijMeten: (ux: number, uy: number) => number;
       let opStaaf = false;
       if (l.nodeId !== undefined) {
-        const n = nodes.find(nn => nn.id === l.nodeId); if (!n) return null;
+        const n = nodesById.get(l.nodeId); if (!n) return null;
         p = worldToScreen(n.x, n.z);
         vrijMeten = (ux, uy) => qBandHoogteBijKnoop(l.nodeId!, ux, uy);
       } else {
-        const b = beams.find(bb => bb.id === l.beamId); if (!b) return null;
-        const nA = nodes.find(n => n.id === b.from);
-        const nB = nodes.find(n => n.id === b.to);
+        const b = beamsById.get(l.beamId!); if (!b) return null;
+        const nA = nodesById.get(b.from);
+        const nB = nodesById.get(b.to);
         if (!nA || !nB) return null;
         const t = Math.min(1, Math.max(0, l.posFrac ?? 0));
         const pA = worldToScreen(nA.x, nA.z), pB = worldToScreen(nB.x, nB.z);
@@ -3105,7 +3113,7 @@ export default function FemCanvas(props: FemCanvasProps) {
     }
     // POINT MOMENT on node
     if (l.type === "pointMoment" && l.nodeId !== undefined) {
-      const n = nodes.find(nn => nn.id === l.nodeId); if (!n) return null;
+      const n = nodesById.get(l.nodeId); if (!n) return null;
       const p = worldToScreen(n.x, n.z);
       const m = l.my ?? 0;
       const r = 14;
@@ -3121,9 +3129,9 @@ export default function FemCanvas(props: FemCanvasProps) {
     }
     // LINE LOAD on beam
     if (l.type === "lineLoad" && l.beamId !== undefined) {
-      const b = beams.find(bb => bb.id === l.beamId); if (!b) return null;
-      const nA = nodes.find(n => n.id === b.from);
-      const nB = nodes.find(n => n.id === b.to);
+      const b = beamsById.get(l.beamId); if (!b) return null;
+      const nA = nodesById.get(b.from);
+      const nB = nodesById.get(b.to);
       if (!nA || !nB) return null;
       const pA = worldToScreen(nA.x, nA.z), pB = worldToScreen(nB.x, nB.z);
       const dxs = pB.x - pA.x, dys = pB.y - pA.y;
@@ -3444,9 +3452,9 @@ export default function FemCanvas(props: FemCanvasProps) {
     }
     // THERMAL on beam
     if (l.type === "thermal" && l.beamId !== undefined) {
-      const b = beams.find(bb => bb.id === l.beamId); if (!b) return null;
-      const nA = nodes.find(n => n.id === b.from);
-      const nB = nodes.find(n => n.id === b.to);
+      const b = beamsById.get(l.beamId); if (!b) return null;
+      const nA = nodesById.get(b.from);
+      const nB = nodesById.get(b.to);
       if (!nA || !nB) return null;
       const mx = (nA.x + nB.x) / 2, mz = (nA.z + nB.z) / 2;
       const p = worldToScreen(mx, mz);
@@ -3650,7 +3658,7 @@ export default function FemCanvas(props: FemCanvasProps) {
     for (const s of supports) ids.add(s.nodeId);
     for (const l of loads) if (l.nodeId !== undefined) ids.add(l.nodeId);
     const uit: PlaatPunt[] = [];
-    for (const id of ids) { const n = nodes.find((nn) => nn.id === id); if (n) uit.push({ x: n.x, z: n.z }); }
+    for (const id of ids) { const n = nodesById.get(id); if (n) uit.push({ x: n.x, z: n.z }); }
     return uit;
   })();
 
@@ -3898,10 +3906,10 @@ export default function FemCanvas(props: FemCanvasProps) {
     if (!envelopeView || !envelope) return null;
     const overlays: React.ReactNode[] = [];
     envelope.elements.forEach((env, beamId) => {
-      const beam = beams.find(b => b.id === beamId);
+      const beam = beamsById.get(beamId);
       if (!beam) return;
-      const nA = nodes.find(n => n.id === beam.from);
-      const nB = nodes.find(n => n.id === beam.to);
+      const nA = nodesById.get(beam.from);
+      const nB = nodesById.get(beam.to);
       if (!nA || !nB) return;
       const p1 = worldToScreen(nA.x, nA.z);
       const p2 = worldToScreen(nB.x, nB.z);
@@ -3973,7 +3981,7 @@ export default function FemCanvas(props: FemCanvasProps) {
       const fmtBereik = (min: number, max: number) =>
         `${fmtNl(min / 1000)}…${fmtNl(max / 1000)} kN`;
       envelope.reactions.forEach((r, nodeId) => {
-        const n = nodes.find(nn => nn.id === nodeId);
+        const n = nodesById.get(nodeId);
         if (!n) return;
         const p = worldToScreen(n.x, n.z);
         const rijen: string[] = [];
@@ -4524,7 +4532,7 @@ export default function FemCanvas(props: FemCanvasProps) {
             preview tot dáár (richting muis, lengte toetsenbord) met het
             ingetypte getal als label — anders gewoon tot de muis. */}
         {tool === "addBeam" && beamStart !== null && hoverModel && (() => {
-          const startNode = nodes.find(n => n.id === beamStart);
+          const startNode = nodesById.get(beamStart);
           if (!startNode) return null;
           const doel = beamMaatEindpunt ?? hoverModel;
           const p1 = worldToScreen(startNode.x, startNode.z);
@@ -4567,14 +4575,14 @@ export default function FemCanvas(props: FemCanvasProps) {
         {tool === "addPlate" && plateCorners.length > 0 && hoverModel && (() => {
           const pts: string[] = [];
           for (const id of plateCorners) {
-            const n = nodes.find(nn => nn.id === id);
+            const n = nodesById.get(id);
             if (!n) continue;
             const p = worldToScreen(n.x, n.z);
             pts.push(`${p.x},${p.y}`);
           }
           const hp = worldToScreen(hoverModel.x, hoverModel.z);
           pts.push(`${hp.x},${hp.y}`);
-          const eerste = nodes.find(nn => nn.id === plateCorners[0]);
+          const eerste = nodesById.get(plateCorners[0]);
           const ep = eerste ? worldToScreen(eerste.x, eerste.z) : null;
           return (
             <g>
@@ -4651,9 +4659,9 @@ export default function FemCanvas(props: FemCanvasProps) {
           const l = loads.find(ll => ll.id === (selection as { type: "load"; id: number }).id);
           if (!l || l.type !== "lineLoad" || l.beamId === undefined) return null;
           if (l.caseId !== activeLoadCaseId) return null;
-          const b = beams.find(bb => bb.id === l.beamId);
-          const nA = b ? nodes.find(n => n.id === b.from) : undefined;
-          const nB = b ? nodes.find(n => n.id === b.to) : undefined;
+          const b = beamsById.get(l.beamId);
+          const nA = b ? nodesById.get(b.from) : undefined;
+          const nB = b ? nodesById.get(b.to) : undefined;
           if (!b || !nA || !nB) return null;
           const pA = worldToScreen(nA.x, nA.z), pB = worldToScreen(nB.x, nB.z);
           const dxs = pB.x - pA.x, dys = pB.y - pA.y;
@@ -4722,7 +4730,7 @@ export default function FemCanvas(props: FemCanvasProps) {
             if (orig) {
               return worldToScreen(orig.x + dragState.currentDelta.dx, orig.z + dragState.currentDelta.dz);
             }
-            const n = nodes.find(nn => nn.id === id);
+            const n = nodesById.get(id);
             return n ? worldToScreen(n.x, n.z) : null;
           };
           for (const b of beams) {
@@ -4766,7 +4774,7 @@ export default function FemCanvas(props: FemCanvasProps) {
           const grabPos = (id: number): { x: number; y: number } | null => {
             const orig = grabMode.originPositions.get(id);
             if (orig) return worldToScreen(orig.x + dx, orig.z + dz);
-            const n = nodes.find(nn => nn.id === id);
+            const n = nodesById.get(id);
             return n ? worldToScreen(n.x, n.z) : null;
           };
           for (const b of beams) {
@@ -5441,7 +5449,7 @@ export default function FemCanvas(props: FemCanvasProps) {
       {/* Beam properties dialog — opened by double-click on a beam, or via
           the right-click context-menu "Bewerk eigenschappen" action. */}
       {editingBeamId !== null && (() => {
-        const beam = beams.find(b => b.id === editingBeamId);
+        const beam = beamsById.get(editingBeamId);
         if (!beam) return null;
         const beamForces = overlayResult?.elements.get(editingBeamId) ?? null;
         return (
@@ -5488,9 +5496,9 @@ export default function FemCanvas(props: FemCanvasProps) {
       // in mm vanaf de beginhoek van die rand.
       const opStaaf = p.nodeId === undefined && p.beamId !== undefined;
       const opPlaat = p.nodeId === undefined && p.beamId === undefined && p.plateId !== undefined;
-      const beam = opStaaf ? beams.find(b => b.id === p.beamId) : undefined;
-      const nA = beam ? nodes.find(n => n.id === beam.from) : undefined;
-      const nB = beam ? nodes.find(n => n.id === beam.to) : undefined;
+      const beam = opStaaf ? beamsById.get(p.beamId!) : undefined;
+      const nA = beam ? nodesById.get(beam.from) : undefined;
+      const nB = beam ? nodesById.get(beam.to) : undefined;
       const plaat = opPlaat ? plates.find(pp => pp.id === p.plateId) : undefined;
       const randGeo = plaat ? plaatRandGeometrie(plaat, nodes, p) : null;
       const lenMm = opPlaat
@@ -5534,9 +5542,9 @@ export default function FemCanvas(props: FemCanvasProps) {
     }
     if (p.kind === "lineLoad") {
       // Staaflengte (mm) voor de begin/eind-invoer van een deellast.
-      const beam = beams.find(b => b.id === p.beamId);
-      const nA = beam ? nodes.find(n => n.id === beam.from) : undefined;
-      const nB = beam ? nodes.find(n => n.id === beam.to) : undefined;
+      const beam = beamsById.get(p.beamId!);
+      const nA = beam ? nodesById.get(beam.from) : undefined;
+      const nB = beam ? nodesById.get(beam.to) : undefined;
       const lenMm = nA && nB ? Math.hypot(nB.x - nA.x, nB.z - nA.z) : 0;
       // q en richting komen uit het waardegeheugen; begin/einde niet — die
       // horen bij DEZE staaf en beginnen dus altijd op de volle lengte.

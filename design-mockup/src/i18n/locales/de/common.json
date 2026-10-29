@@ -1,7 +1,8 @@
 {
   "resultView": {
     "busy": "Berechnung läuft…",
-    "emptyCase": "{{name}}: keine wirksame Last; kein Lastfallergebnis."
+    "emptyCase": "{{name}}: keine wirksame Last; kein Lastfallergebnis.",
+    "checkForcesReused": "Die Ergebnisse sind bereits diese Berechnung; der Nachweis hat nichts zusätzlich gerechnet."
   },
   "checkPanelControls": {
     "open": "Nachweise",
@@ -599,6 +600,7 @@
     },
     "check": {
       "title": "Nachweis",
+      "noCheckableTitle": "Keine nachweisbaren Stäbe",
       "noCheckableBody": "Das Modell enthält keine Stahlprofile (HEA/HEB/IPE/…) und keine Holzfestigkeitsklassen (C24, GL28h, …).",
       "seeInsightsErrors": "Siehe Einblick → Fehler.",
       "refused": "Nachweis verweigert",
@@ -774,10 +776,14 @@
       "sideTopFlange": "Obergurt",
       "sideBottomFlange": "Untergurt",
       "sideBothFlange": "Ober- und Untergurt",
+      "sideLeftFlange": "linker Gurt (im Nachweis der Obergurt)",
+      "sideRightFlange": "rechter Gurt (im Nachweis der Untergurt)",
       "sideBothStandingFlange": "linker und rechter Gurt",
       "sideTopEdge": "oberer Rand",
       "sideBottomEdge": "unterer Rand",
       "sideBothEdge": "oberer und unterer Rand",
+      "sideLeftEdge": "linker Rand (im Nachweis der obere Rand)",
+      "sideRightEdge": "rechter Rand (im Nachweis der untere Rand)",
       "sideBothStandingEdge": "linker und rechter Rand",
       "sideCompressed": "gedrückter Rand",
       "chainTop": "Kippfelder bei gedrücktem Obergurt (mm)",
@@ -1044,6 +1050,7 @@
     "segmentTitle": "Gewünschte Segmentlänge in mm. Jeder Betonstab wird in gleich lange Segmente geteilt, die jeweils ihre eigene Sekanten-EI erhalten (5.8.6(6)). Kürzer = genauer und langsamer; die Anwendung vergröbert nicht von selbst.",
     "segment": "Segment",
     "creepTitle": "Endwert der Kriechzahl φ(∞,t₀) nach Abs. 3.1.4, für jeden Betonstab ohne eigenen Wert bei den §5.8-Angaben. Der Kern verarbeitet sie nach 5.8.6(4) — alle Bemessungswerte mal (1 + φ_ef) — was für die Anfangssteigung E_c,eff = E_cm/(1 + φ) nach (7.20) entspricht. LEER = nicht angegeben: dann wird OHNE Kriechen gerechnet, die Durchbiegung fällt zu klein aus, und das liegt auf der unsicheren Seite. Mit dem Kästchen daneben wird φ(∞,t₀) nach Anhang B berechnet; ein hier angegebener Wert hat Vorrang.",
+    "creepFeedsBoth": "Dieser Wert speist zwei Berechnungen: die GZG-Steifigkeit bei der physikalisch nichtlinearen Analyse (5.8.6(4)) und den Stützennachweis bei jedem Analysetyp (A in λ_lim nach 5.8.3.1(1), φ_ef nach (5.19)). Ein Stab mit eigenem φ(∞,t₀) in den §5.8-Angaben hat Vorrang.",
     "emptyPlaceholder": "leer",
     "noConcreteBars": "keine Betonstäbe mit Korb",
     "modelLarge": "Modell groß — siehe Segmentlänge",
@@ -1070,6 +1077,7 @@
     "swayOwnColumn": "φ freie Stütze",
     "swayOwnColumnTitle": "Eigene Schiefstellung je freistehender Stütze (Issue #199, Phase 3): eine Stütze mit freiem Kopf hängt an nichts und mittelt ihre Schiefstellung mit nichts. Im GZT-Nachweis erhalten ihre Lasten φ = max(φ_Modell, φ_eigen), mit φ_eigen nach der Norm ihres Werkstoffs, h = ihre eigene Höhe und m = 1. Damit ist ihr seitliches Knicken in den Nachweisschnittgrößen enthalten, und für eine freistehende Stahlstütze gilt die Systemlänge L statt 2·L (EN 1993-1-1 5.2.2(7)b). Die Ergebnisse ändern sich nicht.",
     "timberEn1995": "Holz EN 1995",
+    "timberEn1995Title": "Holz im GZT-Nachweis nach EN 1995-1-1 (Issue #199, Phase 4): die Berechnung nach Theorie II. Ordnung rechnet Holzstäbe mit E_d = E_mean/γ_M (2.2.2(1)P), jeder gedrückte Holzstab erhält die Vorkrümmung e = 0,0025·l (5.4.4(2)), und ein stehender Holzstab mit freiem Ende erhält die Systemlänge L statt 2·L. Die Ergebnisse ändern sich nicht.",
     "swayDirectionTitle": "Richtung der Ersatz-Horizontalkräfte: BEIDE. Der GZT-Nachweis rechnet jede Kombination mit der Schiefstellung in +x und in −x (EN 1993-1-1 5.3.2(2): in der ungünstigsten Richtung) und nimmt je Stab die ungünstigere der beiden; mit angehaktem Kästchen Schiefstellung werden auch die Ergebnisse so gerechnet, und der Kombinationsname nennt die Richtung. Die hier gespeicherte Vorzugsrichtung ({{richting}}) bestimmt nur, welche Variante die ursprüngliche Kombinationsnummer behält.",
     "dialogTitle": "Lastfälle & Kombinationen",
     "casesTab": "Lastfälle ({{aantal}})",
@@ -1196,7 +1204,9 @@
       },
       "heightManual": "h wurde von Hand eingegeben: {{h}} m.",
       "membersManual": "m wurde von Hand eingegeben: {{m}}.",
+      "directionBoth": "Richtung: beide. Der GZT-Nachweis rechnet jede Kombination mit der Schiefstellung in +x und in −x, als zwei Varianten mit der Richtung im Namen, und nimmt je Stab die ungünstigere der beiden (EN 1993-1-1 5.3.2(2): die Imperfektion in der ungünstigsten Richtung; 5.3.2(8): in allen maßgebenden Richtungen, jeweils einzeln). Das tut der Nachweis immer, auch wenn der Schalter Schiefstellung aus ist; dieser Schalter gilt nur für die Ergebnisse, und ist er an, rechnen auch diese jede Kombination in +x und −x.",
       "directionBothMechanica": "Richtung: beide. Mit eingeschaltetem Schalter Schiefstellung wird jede Kombination mit der Schiefstellung in +x und in −x gerechnet, als zwei Varianten mit der Richtung im Namen (EN 1993-1-1 5.3.2(2): die Imperfektion in der ungünstigsten Richtung; 5.3.2(8): in allen maßgebenden Richtungen, jeweils eine).",
+      "directions3d": "In 3D rechnet der GZT-Nachweis jede GZT-Kombination mit der Schiefstellung in vier Richtungen, jeweils eine: +X und −X mit φ_X, +Y und −Y mit φ_Y (EN 1993-1-1 §5.3.2(8)). Jede vertikale Last V erhält an ihrem Angriffspunkt eine horizontale Last φ·V (§5.3.2(7)). Das tut der Nachweis immer, auch wenn der Schalter Schiefstellung aus ist. Ist dieser Schalter an, werden auch die Ergebnisse so gerechnet, und dann jede Kombination, auch die GZG, wie in 2D: strenger als die Norm verlangt (EN 1992-1-1 §5.2(2)P und (3) ordnen die Imperfektion dem GZT zu), aber dieselbe Wahl in 2D und 3D.",
       "directions3dMechanica": "In 3D wirkt die Schiefstellung in vier Richtungen, jeweils eine: +X und −X mit φ_X, +Y und −Y mit φ_Y (EN 1993-1-1 §5.3.2(8)). Jede vertikale Last V erhält an ihrem Angriffspunkt eine horizontale Last φ·V (§5.3.2(7)). Ist der Schalter Schiefstellung an, werden die Ergebnisse so gerechnet, und dann jede Kombination, auch die GZG, wie in 2D: strenger als die Norm verlangt (EN 1992-1-1 §5.2(2)P und (3) ordnen die Imperfektion dem GZT zu), aber dieselbe Wahl in 2D und 3D."
     },
     "swayDirectionTitle3d": "Der GZT-Nachweis rechnet jede GZT-Kombination nacheinander mit der Schiefstellung in +X und −X (φ_X) und +Y und −Y (φ_Y) (EN 1993-1-1 §5.3.2(8)); mit angehaktem Kästchen Schiefstellung auch die Ergebnisse, und dann auch die GZG-Kombinationen, wie in 2D.",

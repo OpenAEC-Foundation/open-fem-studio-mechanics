@@ -17,6 +17,7 @@ import nlRibbon from "../src/i18n/locales/nl/ribbon.json";
 import enCommon from "../src/i18n/locales/en/common.json";
 import deCommon from "../src/i18n/locales/de/common.json";
 import frCommon from "../src/i18n/locales/fr/common.json";
+import "../src/openaec/openaec-tokens.css";
 import "../src/themes.css";
 import "../src/App.css";
 import OpenFem3DExplorer from "../src/components/openFem3d/OpenFem3DExplorer";
@@ -139,7 +140,7 @@ async function run() {
     }, defaultNS: "common", fallbackNS: "common", initImmediate: false,
   });
   const t = (k: string, o?: Record<string, unknown>) => i18next.t(k, o);
-  document.documentElement.setAttribute("data-theme", "light");
+  document.documentElement.setAttribute("data-oa-theme", "light");
   const beeld = /beeld=([\w-]+)/.exec(location.hash)?.[1];
   if (beeld) {
     document.body.style.cssText = "margin:0;background:var(--theme-bg)";
@@ -167,7 +168,7 @@ async function run() {
     klik(viewsTab());
     ok(viewsTab().classList.contains("active"), "Views niet actief");
     gelijk([...container.querySelectorAll("[data-open-fem3d-views] [data-view] .open-fem3d-views-naam")].map((e) => e.textContent),
-      ["Geometrie", "Belastingen", "Combinaties", "Dwarskracht Vz", "Reacties", "Spanningen"], "standaardviews");
+      ["Geometrie", "Belastingen", "Combinaties", "Dwarskracht Vz", "Reacties"], "standaardviews");
     ok(container.textContent!.includes(t("openFem3dViews.eigen")) && container.textContent!.includes(t("openFem3dVisibility.noViewSets")), "eigen views");
   });
 

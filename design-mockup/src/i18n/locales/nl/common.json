@@ -1,7 +1,8 @@
 {
   "resultView": {
     "busy": "Berekenen…",
-    "emptyCase": "{{name}}: geen werkzame belasting; geen gevalresultaat."
+    "emptyCase": "{{name}}: geen werkzame belasting; geen gevalresultaat.",
+    "checkForcesReused": "De resultaten zijn al deze berekening; de toets rekende niets extra."
   },
   "checkPanelControls": {
     "open": "Toetsing",
@@ -599,6 +600,7 @@
     },
     "check": {
       "title": "Toetsing",
+      "noCheckableTitle": "Geen toetsbare staven",
       "noCheckableBody": "Het model bevat geen staalprofielen (HEA/HEB/IPE/…) en geen houtklassen (C24, GL28h, …).",
       "seeInsightsErrors": "Zie Inzichten → Fouten.",
       "refused": "Toetsing geweigerd",
@@ -774,10 +776,14 @@
       "sideTopFlange": "bovenflens",
       "sideBottomFlange": "onderflens",
       "sideBothFlange": "boven- en onderflens",
+      "sideLeftFlange": "linkerflens (de toets noemt hem bovenflens)",
+      "sideRightFlange": "rechterflens (de toets noemt hem onderflens)",
       "sideBothStandingFlange": "linker- en rechterflens",
       "sideTopEdge": "bovenrand",
       "sideBottomEdge": "onderrand",
       "sideBothEdge": "boven- en onderrand",
+      "sideLeftEdge": "linkerrand (de toets noemt hem bovenrand)",
+      "sideRightEdge": "rechterrand (de toets noemt hem onderrand)",
       "sideBothStandingEdge": "linker- en rechterrand",
       "sideCompressed": "gedrukte rand",
       "chainTop": "Kipvelden als de bovenflens gedrukt is (mm)",
@@ -1044,6 +1050,7 @@
     "segmentTitle": "Gewenste segmentlengte in mm. Elke betonstaaf wordt in even lange segmenten geknipt die elk hun eigen secans-EI krijgen (5.8.6(6)). Korter = nauwkeuriger en trager; de applicatie vergroft niet uit zichzelf.",
     "segment": "segment",
     "creepTitle": "Eindwaarde van de kruipcoëfficiënt φ(∞,t₀) volgens art. 3.1.4, voor elke betonstaaf zonder eigen waarde bij de §5.8-gegevens. De kern verwerkt hem volgens 5.8.6(4) — alle rekwaarden maal (1 + φ_ef) — wat voor de beginhelling neerkomt op E_c,eff = E_cm/(1 + φ) van (7.20). LEEG = niet opgegeven: er wordt dan ZONDER kruip gerekend, de zakking komt te klein uit en dat is de onveilige kant. Laat φ(∞,t₀) volgens bijlage B berekenen met het vinkje ernaast; een hier opgegeven waarde gaat voor.",
+    "creepFeedsBoth": "Deze waarde voedt twee rekengangen: de BGT-stijfheid bij de fysisch niet-lineaire analyse (5.8.6(4)) én de kolomtoets bij elk analysetype (A in λ_lim volgens 5.8.3.1(1), φ_ef volgens (5.19)). Een staaf met een eigen φ(∞,t₀) in de §5.8-gegevens gaat vóór.",
     "emptyPlaceholder": "leeg",
     "noConcreteBars": "geen betonstaven met korf",
     "modelLarge": "model groot — zie segmentlengte",
@@ -1070,6 +1077,7 @@
     "swayOwnColumn": "φ losse kolom",
     "swayOwnColumnTitle": "Eigen scheefstand per losse kolom (issue #199, fase 3): een kolom met een vrije kop hangt nergens aan en middelt haar scheefstand met niets. In de UGT-toets krijgen haar lasten φ = max(φ_model, φ_eigen), met φ_eigen volgens de norm van haar materiaal, h = haar eigen hoogte en m = 1. Daarmee zit haar zijdelingse knik in de toetskrachten en geldt voor een stalen losse kolom de systeemlengte L in plaats van 2·L (NEN-EN 1993-1-1 5.2.2(7)b). De resultaten veranderen niet.",
     "timberEn1995": "Hout EN 1995",
+    "timberEn1995Title": "Hout in de UGT-toets volgens NEN-EN 1995-1-1 (issue #199, fase 4): de tweede-ordeberekening rekent de houten staven met E_d = E_mean/γ_M (2.2.2(1)P), elke gedrukte houten staaf krijgt de boogimperfectie e = 0,0025·l (5.4.4(2)), en een staande houten staaf met een vrij eind krijgt de systeemlengte L in plaats van 2·L. De resultaten veranderen niet.",
     "swayDirectionTitle": "Richting van de equivalente horizontale krachten: BEIDE. De UGT-toets rekent elke combinatie met de scheefstand in +x én in −x (EN 1993-1-1 5.3.2(2): in de meest ongunstige richting) en neemt per staaf de ongunstigste van de twee; met het vinkje Scheefstand aan rekenen ook de resultaten zo, en noemt de combinatienaam de richting. De hier opgeslagen voorkeursrichting ({{richting}}) bepaalt alleen welke variant het oorspronkelijke combinatienummer houdt.",
     "dialogTitle": "Belastinggevallen & combinaties",
     "casesTab": "Gevallen ({{aantal}})",
@@ -1196,7 +1204,9 @@
       },
       "heightManual": "h is handmatig opgegeven: {{h}} m.",
       "membersManual": "m is handmatig opgegeven: {{m}}.",
+      "directionBoth": "Richting: beide. De UGT-toets rekent elke combinatie met de scheefstand in +x én in −x, als twee varianten met de richting in de naam, en neemt per staaf de ongunstigste van de twee (EN 1993-1-1 5.3.2(2): de imperfectie in de meest ongunstige richting; 5.3.2(8): in alle relevante richtingen, één per keer). Dat doet de toets altijd, ook als de schakelaar Scheefstand uit staat; die schakelaar geldt alleen voor de resultaten, en met haar aan rekenen ook die elke combinatie in +x en −x.",
       "directionBothMechanica": "Richting: beide. Met de schakelaar Scheefstand aan rekent elke combinatie met de scheefstand in +x én in −x, als twee varianten met de richting in de naam (EN 1993-1-1 5.3.2(2): de imperfectie in de meest ongunstige richting; 5.3.2(8): in alle relevante richtingen, één per keer).",
+      "directions3d": "In 3D rekent de UGT-toets elke UGT-combinatie met de scheefstand in vier richtingen, één tegelijk: +X en −X met φ_X, +Y en −Y met φ_Y (EN 1993-1-1 §5.3.2(8)). Elke verticale last V krijgt op zijn eigen aangrijpingspunt een horizontale last φ·V (§5.3.2(7)). Dat doet de toets altijd, ook als de schakelaar Scheefstand uit staat. Met die schakelaar aan rekenen ook de resultaten zo, en dan elke combinatie, ook de BGT, zoals in 2D: strenger dan de norm vraagt (EN 1992-1-1 §5.2(2)P en (3) plaatsen de imperfectie in de UGT), maar dezelfde keuze in 2D en 3D.",
       "directions3dMechanica": "In 3D werkt de scheefstand in vier richtingen, één tegelijk: +X en −X met φ_X, +Y en −Y met φ_Y (EN 1993-1-1 §5.3.2(8)). Elke verticale last V krijgt op zijn eigen aangrijpingspunt een horizontale last φ·V (§5.3.2(7)). Met de schakelaar Scheefstand aan rekenen de resultaten zo, en dan elke combinatie, ook de BGT, zoals in 2D: strenger dan de norm vraagt (EN 1992-1-1 §5.2(2)P en (3) plaatsen de imperfectie in de UGT), maar dezelfde keuze in 2D en 3D."
     },
     "swayDirectionTitle3d": "De UGT-toets rekent elke UGT-combinatie om de beurt met de scheefstand in +X en −X (φ_X) en +Y en −Y (φ_Y) (EN 1993-1-1 §5.3.2(8)); met het vinkje Scheefstand aan ook de resultaten, en dan ook de BGT-combinaties, zoals in 2D.",

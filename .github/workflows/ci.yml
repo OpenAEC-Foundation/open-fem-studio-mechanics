@@ -82,6 +82,7 @@ jobs:
         working-directory: src-tauri
         run: |
           cargo build --release -p toetsbrug -p openaec-mcp-server -p open-fem-3d
+          cargo build --release -p openaec-native-fem --bin native-volume3d-concrete-damage --bin native-volume3d-finite-j2
           cargo build -p toetsbrug -p open-fem-3d -p frame3d-solver -p openaec-native-fem --bins
       - name: Install frontend dependencies
         working-directory: design-mockup

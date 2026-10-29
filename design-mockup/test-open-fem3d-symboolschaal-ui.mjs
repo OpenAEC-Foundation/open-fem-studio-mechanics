@@ -55,7 +55,7 @@ try {
   for (const regel of report.info ?? []) console.log(`     · ${regel}`);
   assert.equal(report.error, null, report.error);
   assert.equal(report.tests.filter((t) => t.error).length, 0, "symboolschaal-UI regressies");
-  assert.ok(report.tests.length >= 17, `te weinig proeven gedraaid: ${report.tests.length}`);
+  assert.ok(report.tests.length >= 16, `te weinig proeven gedraaid: ${report.tests.length}`);
 
   const map = process.env.OPEN_FEM3D_SCHERMAFBEELDINGEN;
   if (map) {

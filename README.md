@@ -151,6 +151,7 @@ npm run tauri:build   # installer; also builds the frontend and the MCP server
 ```bash
 cd src-tauri
 cargo build --release -p toetsbrug -p openaec-mcp-server -p open-fem-3d   # the JS tests call these binaries
+cargo build --release -p openaec-native-fem --bin native-volume3d-concrete-damage --bin native-volume3d-finite-j2
 cargo build -p toetsbrug -p open-fem-3d -p frame3d-solver -p openaec-native-fem --bins
 
 cd ../design-mockup

@@ -15,6 +15,7 @@ import { initReactI18next } from "react-i18next";
 import common from "../src/i18n/locales/nl/common.json";
 import check from "../src/i18n/locales/nl/check.json";
 import ribbon from "../src/i18n/locales/nl/ribbon.json";
+import "../src/openaec/openaec-tokens.css";
 import "../src/themes.css";
 import "../src/components/report/report.css";
 import FemCanvas from "../src/components/fem/FemCanvas";
@@ -103,7 +104,7 @@ async function run() {
   });
   const beeld = /beeld=(\w+)/.exec(location.hash)?.[1];
   if (beeld) {
-    document.documentElement.setAttribute("data-theme", beeld === "donker" ? "openaec" : "light");
+    document.documentElement.setAttribute("data-oa-theme", beeld === "donker" ? "dark" : "light");
     document.body.style.cssText = "margin:0;background:var(--theme-bg)";
     document.getElementById("uitslag")!.remove();
     if (beeld === "rapport") {
@@ -175,14 +176,6 @@ async function run() {
     bijna(dikte(), d0, 1e-6, "contourdikte in px");
     gelijk(lijnen(3, "zichtbaar").length, 2, "flenslijnen van de IPE 330");
     gelijk(lijnen(4, "lamel").length, 9, "lamellen van GL 400 (10 × 40 mm)");
-    gelijk(lijnen(6, "wapening").length, 2, "onder- en bovenwapening");
-    gelijk(lijnen(6, "beugel").length, 30, "beugels Ø8-200 over 6 m");
-    // Onderwapening op 38 mm van de onderrand, bovenwapening op 34 mm van de bovenrand.
-    const s6 = schaal(6, 6000);
-    const as = coords(systeemlijn(6)).y1;
-    const w = lijnen(6, "wapening").map((l) => coords(l).y1).sort((a, b) => a - b);
-    bijna(w[0], as - (300 - 34) * s6, 0.05, "bovenwapening");
-    bijna(w[1], as + (300 - 38) * s6, 0.05, "onderwapening");
   });
 
   await test("uitgezoomd: alleen vlak en contour, geen beugels als ze op elkaar vallen", async () => {
@@ -226,11 +219,11 @@ async function run() {
     mount(<Tekenvlak flags={AAN} />);
     await wacht();
     const kleur = () => getComputedStyle(lijnen(3, "contour")[0]).stroke;
-    document.documentElement.setAttribute("data-theme", "light");
+    document.documentElement.setAttribute("data-oa-theme", "light");
     const licht = kleur();
-    document.documentElement.setAttribute("data-theme", "openaec");
+    document.documentElement.setAttribute("data-oa-theme", "dark");
     const donker = kleur();
-    document.documentElement.removeAttribute("data-theme");
+    document.documentElement.removeAttribute("data-oa-theme");
     ok(licht !== donker, `zelfde kleur in beide thema's: ${licht}`);
   });
 

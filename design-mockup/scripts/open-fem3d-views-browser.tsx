@@ -176,7 +176,7 @@ async function run() {
     mount(<Proef />);
     klik(viewsTab());
     for (const id of ["geometrie", "belastingen"]) ok(!knop(`standaard:${id}`).disabled, `${id} uit`);
-    for (const id of ["combinaties", "vz", "reacties", "spanningen"]) {
+    for (const id of ["combinaties", "vz", "reacties"]) {
       const k = knop(`standaard:${id}`);
       ok(k.disabled, `${id} klikbaar`);
       gelijk(k.querySelector(".open-fem3d-views-sub")?.textContent, "Beschikbaar na Berekenen", `${id}: uitleg`);
@@ -207,7 +207,7 @@ async function run() {
     toegepast = []; maatgevendGevraagd = 0;
     mount(<Proef status={ALLES} />);
     klik(viewsTab());
-    for (const id of ["combinaties", "vz", "reacties", "spanningen"]) ok(!knop(`standaard:${id}`).disabled, `${id} grijs`);
+    for (const id of ["combinaties", "vz", "reacties"]) ok(!knop(`standaard:${id}`).disabled, `${id} grijs`);
     gelijk(maatgevendGevraagd, 0, "pas uitrekenen als het nodig is");
     klik(knop("standaard:combinaties"));
     gelijk([maatgevendGevraagd, toegepast[0].combinationId, toegepast[0].mode, zicht.deformation], [1, 42, "results", true], "combinatie");
@@ -218,7 +218,7 @@ async function run() {
   await test("in rapport: standaard alles aan; uitvinken en weer aanvinken wordt bewaard", async () => {
     mount(<Proef status={ALLES} />);
     klik(viewsTab());
-    for (const id of ["geometrie", "belastingen", "combinaties", "vz", "reacties", "spanningen"]) ok(vinkje(`standaard:${id}`).checked, `${id} niet aangevinkt`);
+    for (const id of ["geometrie", "belastingen", "combinaties", "vz", "reacties"]) ok(vinkje(`standaard:${id}`).checked, `${id} niet aangevinkt`);
     klik(vinkje("standaard:reacties"));
     klik(vinkje("standaard:geometrie"));
     gelijk(uitRapport, ["geometrie", "reacties"], "uit het rapport");
@@ -319,7 +319,7 @@ async function run() {
     // Zonder berekening: Geometrie en Belastingen wel, de resultaatviews met reden.
     mount(<OpenFem3DReport model={model} result={null} viewSets={[]} standaardViewsUitRapport={[]} />);
     const leeg = [...container.querySelectorAll<HTMLElement>("[data-rapport-view]")];
-    gelijk(leeg.map((f) => Boolean(f.querySelector("svg"))), [true, true, false, false, false, false], "beeld of reden");
+    gelijk(leeg.map((f) => Boolean(f.querySelector("svg"))), [true, true, false, false, false], "beeld of reden");
     gelijk(leeg[3].querySelector(".open-fem3d-report-view-leeg")?.textContent, "Beschikbaar na Berekenen", "reden");
   });
 
